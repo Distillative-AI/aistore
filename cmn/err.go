@@ -80,6 +80,12 @@ type (
 		ctx string
 	}
 
+	ErrBckNameConflict struct {
+		Name     string
+		Matches  []string
+		Creating bool
+	}
+
 	ErrBusy struct {
 		whereOrType string
 		what        string
@@ -242,11 +248,6 @@ type (
 	ErrNotRemoteBck struct {
 		bck *Bck
 		act string
-	}
-	ErrRangeNotSatisfiable struct {
-		err    error    // original (backend reported) error
-		ranges []string // RFC 7233
-		size   int64    // [0, size)
 	}
 
 	ErrTooManyRequests struct {
@@ -454,6 +455,30 @@ func (e *ErrInvalidBackendProvider) Error() string {
 func (*ErrInvalidBackendProvider) Is(err error) bool {
 	_, ok := err.(*ErrInvalidBackendProvider)
 	return ok
+}
+
+// ErrBckNameConflict
+
+func NewErrBckNameConflict(name string, matches []string, creating bool) *ErrBckNameConflict {
+	return &ErrBckNameConflict{Name: name, Matches: matches, Creating: creating}
+}
+
+func (e *ErrBckNameConflict) Error() string {
+	if e.Creating {
+		return fmt.Sprintf("cannot create bucket %q via S3 API: name already in use by %s",
+			e.Name, strings.Join(e.Matches, ", "))
+	}
+	return fmt.Sprintf("ambiguous bucket name %q: matches %s; "+
+		"S3 clients cannot disambiguate AIS bucket identities - use AIS URI syntax or expose a unique bucket name",
+		e.Name, strings.Join(e.Matches, ", "))
+}
+
+func IsErrBckNameConflict(err error) bool {
+	if _, ok := err.(*ErrBckNameConflict); ok {
+		return true
+	}
+	var e *ErrBckNameConflict
+	return errors.As(err, &e)
 }
 
 // ErrRemoteMetadataMismatch
@@ -1004,33 +1029,6 @@ func IsErrXactNonIC(err error) bool {
 	return ok
 }
 
-// ErrRangeNotSatisfiable
-// http.StatusRequestedRangeNotSatisfiable = 416 // RFC 9110, 15.5.17
-
-func NewErrRangeNotSatisfiable(err error, ranges []string, size int64) *ErrRangeNotSatisfiable {
-	if cos.IsTypedNil(err) {
-		err = nil
-	}
-	return &ErrRangeNotSatisfiable{err, ranges, size}
-}
-
-func (e *ErrRangeNotSatisfiable) Error() string {
-	if e.err == nil {
-		s := "object size = " + strconv.FormatInt(e.size, 10)
-		return fmt.Sprintf("%s, range%s %v not satisfiable", s, cos.Plural(len(e.ranges)), e.ranges)
-	}
-	return e.err.Error()
-}
-
-func IsErrRangeNotSatisfiable(err error) bool {
-	debug.Assert(err != nil)
-	if _, ok := err.(*ErrRangeNotSatisfiable); ok {
-		return true
-	}
-	var wrapped *ErrRangeNotSatisfiable
-	return errors.As(err, &wrapped)
-}
-
 // ErrTooManyRequests (429, 503)
 
 func NewErrTooManyRequests(err error, status int) *ErrTooManyRequests {
@@ -1375,7 +1373,7 @@ func WriteErr(w http.ResponseWriter, r *http.Request, err error, opts ...int /*[
 			status = http.StatusNotFound
 		case IsErrCapExceeded(err):
 			status = http.StatusInsufficientStorage
-		case IsErrRangeNotSatisfiable(err):
+		case cos.IsErrRangeNotSatisfiable(err):
 			status = http.StatusRequestedRangeNotSatisfiable
 		case isErrUnsupp(err), isErrNotImpl(err):
 			status = http.StatusNotImplemented
