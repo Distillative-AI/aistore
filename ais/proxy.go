@@ -600,7 +600,8 @@ func (p *proxy) easyURLHandler(w http.ResponseWriter, r *http.Request) {
 
 // +gen:payload apc.ActList={"action": "list", "value": {"prefix": "images/", "props": "name,size,checksum", "pagesize": 1000}}
 // +gen:payload apc.ActSummaryBck={"action": "summary-bck", "value": {"prefix": "images/", "cached": true}}
-// +gen:endpoint GET /v1/buckets/{bucket-name}[apc.QparamProvider=string,apc.QparamNamespace=string] action=[apc.ActList=apc.LsoMsg|apc.ActSummaryBck=apc.BsummCtrlMsg|apc.ActShowNBI=apc.ActMsg]
+// +gen:payload apc.ActSummaryShard={"action": "summary-shard", "value": {"prefix": "images/"}}
+// +gen:endpoint GET /v1/buckets/{bucket-name}[apc.QparamProvider=string,apc.QparamNamespace=string] action=[apc.ActList=apc.LsoMsg|apc.ActSummaryBck=apc.BsummCtrlMsg|apc.ActSummaryShard=apc.ShardSummMsg|apc.ActShowNBI=apc.ActMsg]
 // List bucket contents, compute a bucket summary, or show a bucket inventory
 func (p *proxy) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 	var (
@@ -643,8 +644,8 @@ func (p *proxy) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 	}
 
 	switch {
-	// TODO: add apc.ActSummaryShard next to ActSummaryBck: morph
-	// apc.ShardSummMsg, init one bucket, then call shard-summary proxy handler.
+	case msg.Action == apc.ActSummaryShard:
+		p.bgetShardSumm(w, r, qbck, msg, dpq)
 	case msg.Action == apc.ActSummaryBck:
 		p.bgetSumm(w, r, qbck, msg, dpq)
 	case msg.Action == apc.ActShowNBI:
@@ -696,6 +697,46 @@ func (p *proxy) bgetSumm(w http.ResponseWriter, r *http.Request, qbck *cmn.Query
 	}
 
 	p.bsummAct(w, r, qbck, msg, &summMsg)
+}
+
+func (p *proxy) bgetShardSumm(w http.ResponseWriter, r *http.Request, qbck *cmn.QueryBcks, msg *apc.ActMsg, dpq *dpq) {
+	if !qbck.IsBucket() {
+		err := cmn.NewErrNotImpl("shard-summary", "bucket queries")
+		p.writeErr(w, r, err)
+		return
+	}
+	var summMsg apc.ShardSummMsg
+	if err := cos.MorphMarshal(msg.Value, &summMsg); err != nil {
+		p.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, p.si, msg.Action, msg.Value, err)
+		return
+	}
+	summMsg.Prefix = cos.TrimPrefix(summMsg.Prefix)
+	if err := cos.ValidatePrefix("bad shard-summary request", summMsg.Prefix); err != nil {
+		p.writeErr(w, r, err)
+		return
+	}
+
+	bck := meta.CloneBck((*cmn.Bck)(qbck))
+	bckArgs := allocBctx()
+	{
+		bckArgs.p = p
+		bckArgs.w = w
+		bckArgs.r = r
+		bckArgs.msg = msg
+		bckArgs.perms = apc.AceObjLIST | apc.AceBckHEAD
+		bckArgs.bck = bck
+		bckArgs.dpq = dpq
+		bckArgs.createAIS = false
+		bckArgs.dontHeadRemote = true
+		bckArgs.dontAddRemote = true
+	}
+	bck, err := bckArgs.initAndTry()
+	freeBctx(bckArgs)
+	if err != nil {
+		return
+	}
+
+	p.shardSummAct(w, r, bck, msg, &summMsg)
 }
 
 func (p *proxy) bgetBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.QueryBcks, msg *apc.ActMsg, dpq *dpq) {
@@ -802,7 +843,7 @@ func (p *proxy) httpobjget(w http.ResponseWriter, r *http.Request, origURLBck ..
 		return
 	}
 
-	if err := cos.ValidOname(objName); err != nil {
+	if err := cos.ValidateWname(objName); err != nil {
 		p.statsT.IncBck(stats.ErrGetCount, bck.Bucket())
 		p.writeErr(w, r, err)
 		return
@@ -904,7 +945,7 @@ func (p *proxy) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiRe
 		objName = apireq.items[1]
 		netPub  = cmn.NetPublic
 	)
-	if err := cos.ValidOname(objName); err != nil {
+	if err := cos.ValidateWname(objName); err != nil {
 		p.statsT.IncWith(errcnt, vlabs)
 		p.writeErr(w, r, err)
 		return
@@ -953,7 +994,7 @@ func (p *proxy) httpobjdelete(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err := cos.ValidOname(objName); err != nil {
+	if err := cos.ValidateWname(objName); err != nil {
 		p.statsT.IncBck(stats.ErrDeleteCount, bck.Bucket())
 		p.writeErr(w, r, err)
 		return
@@ -2065,7 +2106,7 @@ func _checkObjMv(bck *meta.Bck, msg *apc.ActMsg, apireq *apiRequest) error {
 		return cmn.NewErrUnsuppErr(err)
 	}
 	objName, objNameTo := apireq.items[1], msg.Name
-	if err := cos.ValidOname(objName); err != nil {
+	if err := cos.ValidateWname(objName); err != nil {
 		return err
 	}
 	if err := cos.ValidateOname(objNameTo); err != nil {
@@ -2353,7 +2394,7 @@ func (p *proxy) httpobjpatch(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err := cos.ValidOname(objName); err != nil {
+	if err := cos.ValidateWname(objName); err != nil {
 		p.writeErr(w, r, err)
 		return
 	}

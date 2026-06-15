@@ -766,9 +766,14 @@ func (t *target) objectHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		apireq := apiReqAlloc(2, apc.URLPathObjects.L, true /*dpq*/)
 		if err := t.parseReq(w, r, apireq); err == nil {
-			lom := core.AllocLOM(apireq.items[1])
-			t.httpobjput(w, r, apireq, lom)
-			core.FreeLOM(lom)
+			objName := apireq.items[1]
+			if err := cos.ValidateWname(objName); err != nil {
+				t.writeErr(w, r, err)
+			} else {
+				lom := core.AllocLOM(objName)
+				t.httpobjput(w, r, apireq, lom)
+				core.FreeLOM(lom)
+			}
 		}
 		apiReqFree(apireq)
 	case http.MethodDelete:
@@ -813,14 +818,19 @@ func (t *target) httpobjget(w http.ResponseWriter, r *http.Request, apireq *apiR
 		return
 	}
 	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
-		if apireq.dpq.sys.ptime == "" /*isRedirect*/ && t.checkIntraCall(r.Header, false /*from primary*/) != nil {
+		if apireq.dpq.sys.ptime == "" /*isRedirect*/ && t.checkIntraCall(r, false /*from primary*/) != nil {
 			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
 				t.si, r.Method, r.RemoteAddr)
 			return
 		}
 	}
+	objName := apireq.items[1]
+	if err := cos.ValidateWname(objName); err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
+	lom := core.AllocLOM(objName)
 
-	lom := core.AllocLOM(apireq.items[1])
 	lom, err = t.getObject(w, r, apireq.dpq, apireq.bck, lom)
 	if err != nil {
 		t._erris(w, r, err, 0, apireq.dpq.silent)
@@ -982,6 +992,7 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 		t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected or replicated", t.si, r.Method)
 		return
 	}
+
 	cs := fs.Cap()
 	if errCap := cs.Err(); errCap != nil || cs.PctMax > int32(config.Space.CleanupWM) {
 		cs = t.oos(config)
@@ -1125,9 +1136,13 @@ func (t *target) httpobjdelete(w http.ResponseWriter, r *http.Request, apireq *a
 	if err := t.parseReq(w, r, apireq); err != nil {
 		return
 	}
-	objName := apireq.items[1]
 	if isRedirect(apireq.query) == "" {
 		t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected", t.si, r.Method)
+		return
+	}
+	objName := apireq.items[1]
+	if err := cos.ValidateWname(objName); err != nil {
+		t.writeErr(w, r, err)
 		return
 	}
 
@@ -1325,14 +1340,19 @@ func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *api
 	}
 	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
 		// validates that the request is internal (by a node in the same cluster)
-		if apireq.dpq.isRedirect() == "" && t.checkIntraCall(r.Header, false) != nil {
+		if apireq.dpq.isRedirect() == "" && t.checkIntraCall(r, false) != nil {
 			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
 				t.si, r.Method, r.RemoteAddr)
 			return
 		}
 	}
+	objName := apireq.items[1]
+	if err := cos.ValidateRname(objName); err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
 
-	lom := core.AllocLOM(apireq.items[1])
+	lom := core.AllocLOM(objName)
 	switch {
 	case apireq.dpq.get(apc.QparamProps) != "":
 		ecode, err = t.objHeadV2(r, w.Header(), apireq.dpq, apireq.bck, lom)
@@ -1500,7 +1520,7 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 		return
 	}
 	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
-		if isRedirect(apireq.query) == "" && t.checkIntraCall(r.Header, false) != nil {
+		if isRedirect(apireq.query) == "" && t.checkIntraCall(r, false) != nil {
 			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
 				t.si, r.Method, r.RemoteAddr)
 			return
@@ -1516,9 +1536,15 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 		t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, "set-custom", msg.Value, err)
 		return
 	}
+	objName := apireq.items[1]
+	if err := cos.ValidateWname(objName); err != nil {
+		t.writeErr(w, r, err)
+		return
+	}
 
-	lom := core.AllocLOM(apireq.items[1] /*objName*/)
+	lom := core.AllocLOM(objName)
 	defer core.FreeLOM(lom)
+
 	if err := lom.InitBck(apireq.bck); err != nil {
 		t.writeErr(w, r, err)
 		return

@@ -28,7 +28,7 @@ GetBatch uses **HTTP GET with a JSON request body**, which is:
 - Necessary for this API, as the list of requested objects can contain thousands of entries that would exceed URL length limits.
 - Semantically correct - the operation is idempotent (pure data retrieval with no server-side state changes).
 
-Rest of this document is structured as follows:
+The rest of this document is structured as follows:
 
 **Table of Contents**
 
@@ -39,7 +39,9 @@ Rest of this document is structured as follows:
 * [Go API Structure](#go-api-structure)
 * [Python Integrations](#python-integrations)
 * [Usage Examples](#usage-examples)
-* [Performance Characteristics](#performance-characteristics)
+* [Direct Access to Archived Data](#direct-access-to-archived-data)
+* [Performance and Access Patterns](#performance-and-access-patterns)
+* [Performance Tips](#performance-tips)
 * [Error Handling](#error-handling)
 * [Configuration](#configuration)
 * [Output Formats](#output-formats)
@@ -57,7 +59,7 @@ GetBatch is typically called from:
 2. Python via the [AIStore SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore/sdk/batch), and
 3. Third-party tooling such as [Lhotse](https://github.com/lhotse-speech/lhotse/blob/master/lhotse/ais/batch_loader.py).
 
-The respective Go and Python-based  usage examples follow below, in the sections that include:
+The respective Go and Python-based usage examples follow below, in the sections that include:
 
 * [Go API Structure](#go-api-structure)
 * [Python Integrations](#python-integrations)
@@ -94,12 +96,11 @@ The respective Go and Python-based  usage examples follow below, in the sections
 
 ## When NOT to Use GetBatch
 
-- **Single objects** => Use regular GET
-- **Small batches (<16 entries)** => Overhead not justified; use parallel GETs
-- **Order doesn't matter** => Use list-objects + concurrent GETs for better parallelism
-- **Real-time random access** => GetBatch optimizes for sequential streaming
+- Single objects => Use regular GET
+- Small batches (<16 entries) => Overhead not justified; use parallel GETs
+- Latency-critical single-item random access => Use regular GET or a purpose-built lookup path; GetBatch is optimized for amortized multi-entry retrieval.
 
-> Whether or not batch sizes can be deemed "small" will ultimately (obviously) depend on the workload and cluster; any specific numbers in this document must be considered a "rule of thumb" rather than direct prescription or limitation of any kind.
+> Whether a batch is "small" depends on the workload and cluster. Any specific numbers in this document should be treated as rules of thumb, not as hard limits.
 
 ---
 
@@ -148,8 +149,8 @@ Each entry in the `in` array can specify:
 | `uname` | string | Fully-qualified bucket specification, including bucket name, provider and namespace. |
 | `archpath` | string | Path to file within **input** archive (for TAR/ZIP/TGZ/LZ4 shards) |
 | `opaque` | []byte | Opaque user identifier (passed through to response to implement client-side logic of any kind) |
-| `start` | int64 | Range read start offset (future) |
-| `length` | int64 | Range read length (future) |
+| `start` | int64 | Range read start offset. When `archpath` is empty, the range applies to the object bytes as stored (a raw byte range); when `archpath` is set, it applies to the extracted archived file. A non-zero `start` requires a `length`. |
+| `length` | int64 | Range read length: `L>0` reads exactly `L` bytes; `-1` reads from `start` to the end (open-ended); `(start=0, length=0)` is the whole object. For a fixed-length range, `MossOut.size` equals `length`. |
 
 ### Response: [`apc.MossResp`](https://github.com/NVIDIA/aistore/blob/main/api/apc/ml.go)
 
@@ -288,7 +289,9 @@ loaded_cut_set = ais_batch_loader(cut_set)
 
 **See also:**
 
-A complete, runnable example for batch loading audios from AIStore with Lhotse is available in [here](https://github.com/lhotse-speech/lhotse/blob/master/examples/06-train-ais-batch.ipynb):
+A complete, runnable example for batch loading audio from AIStore with Lhotse is available here:
+
+* https://github.com/lhotse-speech/lhotse/blob/master/examples/06-train-ais-batch.ipynb
 
 **Archive extraction example:**
 
@@ -345,24 +348,21 @@ The [AIStore PyTorch Plugin](https://github.com/NVIDIA/aistore/tree/main/python/
 
 ## Usage Examples
 
-Note: `curl` examples in this section are **purely illustrative** - do not copy/paste.
+> In the `curl` examples below, replace `aistore-gateway` and the bucket/object names with your own.
 
 ### Example 1: Retrieve Plain Objects
 
 ```console
-curl -L -X GET http://aistore-gateway/v1/ml/moss/my-bucket \
+curl -L -X GET "http://aistore-gateway/v1/ml/moss/my-bucket?provider=ais" \
   -H "Content-Type: application/json" \
   -d '{
-    "action": "getbatch",
-    "value": {
-      "mime": ".tar",
-      "in": [
-        {"objname": "file-0001.bin"},
-        {"objname": "file-0002.bin"},
-        {"objname": "file-0003.bin"}
-      ],
-      "strm": true
-    }
+    "mime": ".tar",
+    "in": [
+      {"objname": "file-0001.bin"},
+      {"objname": "file-0002.bin"},
+      {"objname": "file-0003.bin"}
+    ],
+    "strm": true
   }' --output batch.tar
 ```
 
@@ -376,22 +376,18 @@ my-bucket/file-0003.bin
 ### Example 2: Extract Files from Shards
 
 ```console
-# Extract image_42.jpg from 100 distributed shards
-curl -L -X GET http://aistore-gateway/v1/ml/moss/shards \
+# Extract image_42.jpg from each distributed shard
+curl -L -X GET "http://aistore-gateway/v1/ml/moss/shards?provider=ais" \
   -H "Content-Type: application/json" \
   -d '{
-    "action": "getbatch",
-    "value": {
-      "mime": ".tar",
-      "in": [
-        {"objname": "shard-0000.tar", "archpath": "image_42.jpg"},
-        {"objname": "shard-0001.tar", "archpath": "image_42.jpg"},
-        ...
-        {"objname": "shard-0099.tar", "archpath": "image_42.jpg"}
-      ],
-      "onob": true,
-      "strm": true
-    }
+    "mime": ".tar",
+    "in": [
+      {"objname": "shard-0000.tar", "archpath": "image_42.jpg"},
+      {"objname": "shard-0001.tar", "archpath": "image_42.jpg"},
+      {"objname": "shard-0002.tar", "archpath": "image_42.jpg"}
+    ],
+    "onob": true,
+    "strm": true
   }' --output extracted.tar
 ```
 
@@ -399,8 +395,7 @@ Result: `extracted.tar` containing:
 ```
 shard-0000.tar/image_42.jpg
 shard-0001.tar/image_42.jpg
-...
-shard-0099.tar/image_42.jpg
+shard-0002.tar/image_42.jpg
 ```
 
 ### Example 3: Cross-Bucket Retrieval
@@ -408,18 +403,15 @@ shard-0099.tar/image_42.jpg
 > The request bucket (`default-bucket` in URL) is used when bucket is omitted in an in entry.
 
 ```console
-curl -L -X GET http://aistore-gateway/v1/ml/moss/default-bucket \
+curl -L -X GET "http://aistore-gateway/v1/ml/moss/default-bucket?provider=ais" \
   -H "Content-Type: application/json" \
   -d '{
-    "action": "getbatch",
-    "value": {
-      "in": [
-        {"objname": "config.json", "bucket": "configs"},
-        {"objname": "model.pt", "bucket": "models"},
-        {"objname": "data.csv", "bucket": "datasets"}
-      ],
-      "strm": true
-    }
+    "in": [
+      {"objname": "config.json", "bucket": "configs"},
+      {"objname": "model.pt", "bucket": "models"},
+      {"objname": "data.csv", "bucket": "datasets"}
+    ],
+    "strm": true
   }' --output multi-bucket.tar
 ```
 
@@ -428,19 +420,16 @@ Result: TAR containing objects from three different buckets in one request.
 ### Example 4: Handle Missing Data Gracefully
 
 ```console
-curl -L -X GET http://aistore-gateway/v1/ml/moss \
+curl -L -X GET "http://aistore-gateway/v1/ml/moss/training?provider=ais" \
   -H "Content-Type: application/json" \
   -d '{
-    "action": "getbatch",
-    "value": {
-      "in": [
-        {"objname": "exists-1.bin"},
-        {"objname": "missing.bin"},
-        {"objname": "exists-2.bin"}
-      ],
-      "coer": true,
-      "strm": false
-    }
+    "in": [
+      {"objname": "exists-1.bin"},
+      {"objname": "missing.bin"},
+      {"objname": "exists-2.bin"}
+    ],
+    "coer": true,
+    "strm": false
   }' --output result.tar
 ```
 
@@ -464,9 +453,119 @@ training/exists-2.bin          (2 MB)
 
 ---
 
-## Performance Characteristics
+### Example 5: Range Reads (Partial Object Retrieval)
 
-### Throughput by Workload Type
+Per-entry `start`/`length` fields request a byte range instead of the whole object. When
+`archpath` is empty the range applies to the object bytes as stored (a raw byte range); when
+`archpath` is set the range applies to the *extracted* archived file.
+
+Three forms are supported:
+- `(start=0, length=0)` - the entire object/file (no range)
+- `(start=N, length=L)` with `L>0` - exactly `L` bytes starting at offset `N` (`MossOut.size == L`)
+- `(start=N, length=-1)` - open-ended: from offset `N` to the end of the object/file
+
+A non-zero `start` requires a `length` (use `-1` to read to the end). Ranges that fall outside
+the object's bounds are reported as `ErrRangeNotSatisfiable`.
+
+```console
+curl -L -X GET "http://aistore-gateway/v1/ml/moss/my-bucket?provider=ais" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "in": [
+      {"objname": "large.bin", "start": 0, "length": 1024},
+      {"objname": "large.bin", "start": 4096, "length": 1024},
+      {"objname": "large.bin", "start": 4096, "length": -1},
+      {"objname": "shard.tar", "archpath": "sample.json", "start": 0, "length": 256}
+    ],
+    "strm": true
+  }' --output result.tar
+```
+
+With the Python SDK:
+
+```python
+batch = client.batch(bucket=bucket, streaming_get=False)
+batch.add("large.bin", start=0, length=1024)         # first 1 KiB
+batch.add("large.bin", start=4096, length=1024)      # 1 KiB at offset 4096
+batch.add("large.bin", start=4096, length=-1)        # open-ended: offset 4096 to EOF
+batch.add("shard.tar", archpath="sample.json", start=0, length=256)  # range over archived file
+
+for obj_info, data in batch.get():
+    assert len(data) == obj_info.size
+```
+
+---
+
+## Direct Access to Archived Data
+
+GetBatch can avoid sequential scans when the request provides enough information to locate the requested bytes directly.
+
+This matters most for large sharded datasets, where each shard is an archive such as TAR and each training sample is stored as an archived file inside the shard.
+
+There are two related cases:
+
+### Indexed archive extraction
+
+When archive shards are indexed, AIS can resolve an archived file by name and use the stored offset metadata to access it directly.
+
+For example, a request entry with both `objname` and `archpath`:
+
+```json
+{
+  "objname": "shard-000042.tar",
+  "archpath": "samples/000123.bin"
+}
+```
+
+selects `samples/000123.bin` inside `shard-000042.tar`.
+
+With a shard index available, AIS does not need to scan the archive sequentially from the beginning to find the requested file.
+
+### Range reads
+
+GetBatch also supports byte ranges via `start` and `length`.
+
+The range is interpreted relative to the thing being requested:
+
+* If `archpath` is empty, the range applies to the raw object bytes as stored in AIS.
+* If `archpath` is set, AIS first resolves the archived file named by `archpath`, and the range then applies to that archived file.
+
+In other words:
+
+```text
+objname only:
+    range applies to object bytes
+
+objname + archpath:
+    archpath selects the archived file
+    range applies inside that archived file
+```
+
+For example:
+
+```json
+{
+  "objname": "shard-000042.tar",
+  "archpath": "samples/000123.bin",
+  "start": 1048576,
+  "length": 262144
+}
+```
+
+returns 256 KiB starting at offset 1 MiB within `samples/000123.bin`, not within `shard-000042.tar`.
+
+### Why this matters
+
+Without direct access, retrieving a file from a large archive may require scanning entries from the beginning until the requested file is found.
+
+With indexing and/or client-provided range metadata, GetBatch can seek much closer to the requested data and read only the required bytes.
+
+For large shards, especially when requested files are located deep inside the archive, this can improve retrieval latency by orders of magnitude.
+
+
+---
+
+## Performance and Access Patterns
 
 > **Note:** Actual throughput will vary significantly based on object sizes, network topology, storage backend, CPU capability, and cluster configuration. Numbers below are purely indicative ranges rather than guaranteed performance targets.
 
@@ -490,15 +589,45 @@ training/exists-2.bin          (2 MB)
 - Limited by network bandwidth or disk I/O
 - No additional per-object overhead once streaming starts
 
-### Indexed archive extraction (shard index)
+### Shard index fast path
 
-When the same TAR shard appears in many batches — typical of sharded ML training datasets — linear scanning of the archive for each requested `archpath` entry becomes the dominant cost. The [shard index](https://docs.nvidia.com/aistore/relnotes/v4.5#shard-index) subsystem builds and persists a per-shard index of offsets/lengths so that `lom.NewArchpathReader` can seek directly to the requested file.
+See [Direct Access to Archived Data](#direct-access-to-archived-data) for the access semantics.
 
-GetBatch consults the index transparently on the read path (`xact/xs/moss.go` calls `NewArchpathReader`, which uses the fast path when an index exists). To prepare a bucket:
+To prepare a bucket, use the common `ais start JOB` command or `ais bucket shard-index` - the latter with additional capabilities:
 
-- `ais shard-index create <bucket>` builds indexes for existing shards.
+```console
+ais bucket shard-index --help
+NAME:
+   ais bucket shard-index - Manage TAR shard indexes for fast random access into archives.
+     Subcommands:
+     - build  - build a shard index for each TAR object in a bucket;
+     - summary - summarize TAR objects and their shard-index coverage.
+
+USAGE:
+   ais bucket shard-index command [arguments...]  [command options]
+
+COMMANDS:
+   build  Build a shard index for each TAR object in a bucket (for fast random access into archives).
+          Non-TAR objects are skipped; stale indexes (e.g., after re-upload) are automatically re-indexed.
+   e.g.:
+     - 'ais bucket shard-index build ais://nnn'                   - index all TAR shards in 'ais://nnn';
+     - 'ais bucket shard-index build ais://nnn --prefix shards/'  - only index TAR shards under 'shards/';
+     - 'ais bucket shard-index build ais://nnn --num-workers 16'  - run with 16 concurrent workers;
+     - 'ais bucket shard-index build ais://nnn --skip-verify'     - fast re-run: trust existing indexes without re-verifying;
+     - 'ais bucket shard-index build ais://nnn --wait'            - start and wait for the job to finish.
+
+   summary  Summarize TAR objects in a bucket and their shard-index coverage.
+            Only local in-cluster objects are summarized.
+   e.g.:
+     - 'ais bucket shard-index summary ais://nnn'                  - summarize all TAR shards in 'ais://nnn';
+     - 'ais bucket shard-index summary ais://nnn --prefix shards/' - summarize only TAR shards under 'shards/';
+     - 'ais bucket shard-index summary ais://nnn/shards/'          - same as above;
+     - 'ais bucket shard-index summary ais://nnn --refresh 1s'     - print periodic progress while summarizing.
+```
+
 - New shards are indexed on first read or via the indexing xaction.
-- Indexes live in the `ais://.sys-shardidx` system bucket and are removed automatically when the underlying shard object is deleted.
+- Indexes live in the system bucket called `ais://.sys-shardidx`.
+- Indexes are removed automatically when the underlying shard object(s) are deleted or updated.
 
 For batches that fan out across many archived files in different shards, this changes per-file extraction from O(archive size) to O(1) + read.
 
@@ -513,6 +642,46 @@ For batches that fan out across many archived files in different shards, this ch
 - Plain objects: minimal CPU (file I/O bound)
 - Compressed archives: moderate CPU (decompression)
 - Many small files: higher CPU (archive parsing overhead)
+
+---
+
+## Performance Tips
+
+For best performance, try to make each GetBatch request easy to assemble and cheap to read.
+
+### Use direct access when possible
+
+For large archive shards, avoid repeated sequential scans. See [Direct Access to Archived Data](#direct-access-to-archived-data).
+
+Use shard indexes when selecting archived files by `archpath`. Use range reads when the client already knows the byte offset and length of the required data.
+
+### Use colocation hints when the client knows the layout
+
+By default, GetBatch assumes that requested objects are distributed uniformly across the cluster.
+
+If the client knows that the batch is concentrated on a small number of targets or shards, set the colocation hint accordingly:
+
+* `0`: no colocation hint; suitable for uniformly distributed object names.
+* `1`: target-aware; use when requested objects are likely collocated on a small number of targets.
+* `2`: target- and shard-aware; use when requested `archpath` entries are likely concentrated in a small number of archive shards.
+
+The hint helps AIS to select a better designated target and can reduce cross-cluster data movement. Level `2` can also improve archive handle reuse when many requested files come from the same shard.
+
+### Prefer larger batches, but avoid unbounded requests
+
+GetBatch is designed to amortize request overhead across many entries. Very small batches may be faster as regular concurrent GETs, while very large batches can increase memory pressure, queueing, and retry cost.
+
+Treat batch size as workload-dependent and validate it under realistic cluster load.
+
+### Prefer uncompressed TAR for maximum throughput
+
+Compressed archive formats reduce network bytes but add CPU overhead for decompression.
+
+When storage and network bandwidth are not the bottleneck, plain `.tar` is usually the best output format for maximum throughput.
+
+### Prefetch or cold-GET remote data
+
+GetBatch operates on in-cluster data. For remote buckets, pre-load or prefetch before running.
 
 ---
 
@@ -696,7 +865,7 @@ target3          NeEra51oM       get-batch       ais://nnn       1813892        
                                 Total:                          5478964         7.84GiB ✓
 ```
 
-> CLI wll render `CtlMsg` output on multiple lines when it includes multiple aggregated messages.
+> CLI will render `CtlMsg` output on multiple lines when it includes multiple aggregated messages.
 
 ---
 
@@ -768,6 +937,8 @@ for moss_out, data in get_worker_partition(worker_id=0, num_workers=10, total_ob
 
 GetBatch works on **in-cluster data**: sharded (with shards of any kind — TAR, TAR.GZ, TAR.LZ4, ZIP), or plain monolithic objects, or chunked objects. As long as the requested data is stored on the cluster's target disks, GetBatch will assemble and return it.
 
+Per-entry **range reads** are supported for objects (chunked or monolithic) as well as for archived files: set `start`/`length` to retrieve a byte range instead of the whole object (see [Example 5](#example-5-range-reads-partial-object-retrieval)).
+
 For TAR shards, GetBatch reads files via the [shard index](https://docs.nvidia.com/aistore/relnotes/v4.5#shard-index) fast path when an index has been built for the shard — extracting an `archpath` entry becomes direct random access into the archive instead of a linear scan. The index is persisted in the `ais://.sys-shardidx` system bucket and is consulted transparently by both `GET` and GetBatch.
 
 ### Known limitations
@@ -784,16 +955,12 @@ Any event that mutates the cluster map (target restart, pod reschedule, scale-up
 
 Clients should retry GetBatch after a brief backoff once the rebalance completes. For long-running training pipelines, treat GetBatch failures during/after a membership event as expected and rely on the client-side retry path.
 
-**Range reads not yet implemented.**
-Per-entry `start`/`length` fields in `MossIn` are reserved for future use; supplying them currently returns `ErrNotImpl`.
-
 **Shard extraction is sequential within each archive.**
 When multiple files are requested from the same shard, they are extracted in sequence rather than in parallel. This is a performance limitation, not a correctness issue — and is largely mitigated when the [shard index](https://docs.nvidia.com/aistore/relnotes/v4.5#shard-index) is enabled, which converts each per-file lookup from a linear scan into direct random access.
 
 ### Roadmap
 
 - Self-healing shared-DM bundles across Smap version changes
-- Range read support for partial object retrieval
 - Multi-file parallel extraction from a single shard
 - Finer-grained work item abort controls
 

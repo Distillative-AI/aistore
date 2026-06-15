@@ -65,7 +65,7 @@ func (p *proxy) s3Handler(w http.ResponseWriter, r *http.Request) {
 			// list all buckets; NOTE: compare with `p.easyURLHandler` and see
 			// "list buckets for a given provider" comment there
 			// perms: apc.AceListBuckets
-			if err := p.access(r.Context(), r.Header, nil, apc.AceListBuckets); err != nil {
+			if err := p.access(r, nil, apc.AceListBuckets); err != nil {
 				s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 				return
 			}
@@ -178,7 +178,7 @@ func (p *proxy) bckNamesFromBMD(w http.ResponseWriter) {
 // +gen:endpoint PUT /s3/{bucket-name}
 // Create a new S3 bucket
 func (p *proxy) putBckS3(w http.ResponseWriter, r *http.Request, bucket string) {
-	if err := p.access(r.Context(), r.Header, nil, apc.AceCreateBucket); err != nil {
+	if err := p.access(r, nil, apc.AceCreateBucket); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
@@ -211,7 +211,7 @@ func (p *proxy) delBckS3(w http.ResponseWriter, r *http.Request, bucket string) 
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Context(), r.Header, bck, apc.AceDestroyBucket); err != nil {
+	if err := p.access(r, bck, apc.AceDestroyBucket); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
@@ -241,13 +241,12 @@ func (p *proxy) handleMptUpload(w http.ResponseWriter, r *http.Request, items []
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Context(), r.Header, bck, apc.AcePUT); err != nil {
+	if err := p.access(r, bck, apc.AcePUT); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
-	objName := s3.ObjName(items)
-	if err := cos.ValidOname(objName); err != nil {
-		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
+	objName, errN := s3.JoinValidateOname(w, r, items)
+	if errN != nil {
 		return
 	}
 
@@ -271,7 +270,7 @@ func (p *proxy) delMultipleObjs(w http.ResponseWriter, r *http.Request, bucket s
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Context(), r.Header, bck, apc.AceObjDELETE); err != nil {
+	if err := p.access(r, bck, apc.AceObjDELETE); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
@@ -291,8 +290,13 @@ func (p *proxy) delMultipleObjs(w http.ResponseWriter, r *http.Request, bucket s
 		evdMsg   = &apc.EvdMsg{}
 	)
 	for _, obj := range lst.Object {
+		if err := cos.ValidateOname(obj.Key); err != nil {
+			s3.WriteErr(w, r, s3.ErrInfo{Err: err})
+			return
+		}
 		objNames = append(objNames, obj.Key)
 	}
+
 	evdMsg.ObjNames = objNames
 	msg.Value = evdMsg
 
@@ -336,7 +340,7 @@ func (p *proxy) headBckS3(w http.ResponseWriter, r *http.Request, bucket string)
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Context(), r.Header, bck, apc.AceBckHEAD); err != nil {
+	if err := p.access(r, bck, apc.AceBckHEAD); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
@@ -360,7 +364,7 @@ func (p *proxy) listObjectsS3(w http.ResponseWriter, r *http.Request, bucket str
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Context(), r.Header, bck, apc.AceObjLIST); err != nil {
+	if err := p.access(r, bck, apc.AceObjLIST); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
@@ -513,7 +517,7 @@ func (p *proxy) copyObjS3(w http.ResponseWriter, r *http.Request, items []string
 	if bckSrc == nil {
 		return
 	}
-	if err := p.access(r.Context(), r.Header, bckSrc, apc.AceGET); err != nil {
+	if err := p.access(r, bckSrc, apc.AceGET); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
@@ -549,7 +553,7 @@ func (p *proxy) directPutObjS3(w http.ResponseWriter, r *http.Request, items []s
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Context(), r.Header, bck, apc.AcePUT); err != nil {
+	if err := p.access(r, bck, apc.AcePUT); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
@@ -557,9 +561,8 @@ func (p *proxy) directPutObjS3(w http.ResponseWriter, r *http.Request, items []s
 		s3.WriteErr(w, r, s3.ErrInfo{Err: errS3Obj})
 		return
 	}
-	objName := s3.ObjName(items)
-	if err := cos.ValidOname(objName); err != nil {
-		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
+	objName, errN := s3.JoinValidateOname(w, r, items)
+	if errN != nil {
 		return
 	}
 
@@ -585,7 +588,7 @@ func (p *proxy) getObjS3(w http.ResponseWriter, r *http.Request, items []string,
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Context(), r.Header, bck, apc.AceGET); err != nil {
+	if err := p.access(r, bck, apc.AceGET); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
@@ -597,9 +600,8 @@ func (p *proxy) getObjS3(w http.ResponseWriter, r *http.Request, items []string,
 		s3.WriteErr(w, r, s3.ErrInfo{Err: errS3Obj})
 		return
 	}
-	objName := s3.ObjName(items)
-	if err := cos.ValidOname(objName); err != nil {
-		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
+	objName, errN := s3.JoinValidateOname(w, r, items)
+	if errN != nil {
 		return
 	}
 
@@ -676,15 +678,16 @@ func (p *proxy) headObjS3(w http.ResponseWriter, r *http.Request, items []string
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Context(), r.Header, bck, apc.AceObjHEAD); err != nil {
+	if err := p.access(r, bck, apc.AceObjHEAD); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
-	objName := s3.ObjName(items)
-	if err := cos.ValidOname(objName); err != nil {
-		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
+
+	objName, errN := s3.JoinValidateOname(w, r, items)
+	if errN != nil {
 		return
 	}
+
 	smap := p.owner.smap.get()
 	tsi, err := smap.HrwName2T(bck.MakeUname(objName))
 	if err != nil {
@@ -715,13 +718,13 @@ func (p *proxy) delObjS3(w http.ResponseWriter, r *http.Request, items []string)
 	if bck == nil {
 		return
 	}
-	if err := p.access(r.Context(), r.Header, bck, apc.AceObjDELETE); err != nil {
+	if err := p.access(r, bck, apc.AceObjDELETE); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
-	objName := s3.ObjName(items)
-	if err := cos.ValidOname(objName); err != nil {
-		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
+
+	objName, errN := s3.JoinValidateOname(w, r, items)
+	if errN != nil {
 		return
 	}
 
