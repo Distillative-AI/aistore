@@ -58,7 +58,7 @@ func TestMain(m *testing.M) {
 	// file system
 	cos.CreateDir(testMountpath)
 	defer os.RemoveAll(testMountpath)
-	fs.TestNew(nil)
+	fs.NewTestMFS(nil)
 
 	// target
 	config := cmn.GCO.Get()
@@ -67,9 +67,9 @@ func TestMain(m *testing.M) {
 	t = newTarget(co)
 	t.initPhase1(config)
 	tid, _ := initTID(config)
-	t.si.Init(tid, apc.Target)
+	t.si.Init(tid, apc.Target, nil /*verifying key*/)
 
-	fs.Add(testMountpath, t.SID())
+	fs.AddTestMpath(testMountpath, t.SID())
 
 	t.htrun.initPhase2(config)
 	t.ups.t = t

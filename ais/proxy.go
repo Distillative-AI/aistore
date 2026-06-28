@@ -99,7 +99,11 @@ func (p *proxy) init(config *cmn.Config) {
 	// (b) load existing ID from config file stored under local config `confdir` (compare w/ target)
 	// (c) generate a new one (genDaemonID())
 	// - in that sequence
-	p.si.Init(initPID(config), apc.Proxy)
+	pid := initPID(config)
+
+	p.htrun.nodeSigningKey, _ = initProxySigningKey(pid, config)
+
+	p.si.Init(pid, apc.Proxy, p.htrun.nodeSigningKey.VerifyingKey)
 
 	memsys.Init(p.SID(), p.SID(), config)
 
@@ -175,6 +179,55 @@ func readProxyID(config *cmn.Config) (pid string) {
 		nlog.Errorln(err)
 	}
 	return pid
+}
+
+func initProxySigningKey(pid string, config *cmn.Config) (pair *cos.NodeSigningKey, generated bool) {
+	err := cos.ValidateDaemonID(pid)
+	cos.AssertNoErr(err) // FATAL
+
+	path := filepath.Join(config.ConfigDir, fname.ProxySigningKey)
+
+	pair, err = _loadProxySigningKey(path, pid)
+	switch {
+	case err != nil:
+		cos.ExitLog(err) // FATAL
+	case pair != nil:
+		fp, err := cos.NodeSigningKeyFingerprint(pair.VerifyingKey)
+		debug.AssertNoErr(err)
+		nlog.Infof("loaded node signing key for %s, verifying-key fp %s", meta.Pname(pid), fp)
+		return pair, false
+	}
+
+	// generate
+	pub, priv, err := cos.GenerateNodeSigningKey()
+	if err != nil {
+		cos.ExitLog(fmt.Errorf("failed to generate node signing key for %s: %w", meta.Pname(pid), err))
+	}
+	pair = cos.NewNodeSigningKey(priv, pub)
+
+	if err := os.WriteFile(path, pair.Bytes(pid), 0o600); err != nil {
+		cos.ExitLog(fmt.Errorf("failed to persist proxy signing key %q: %w", path, err))
+	}
+
+	fp, err := cos.NodeSigningKeyFingerprint(pair.VerifyingKey)
+	debug.AssertNoErr(err)
+	nlog.Infof("generated node signing key for %s, verifying-key fp %s", meta.Pname(pid), fp)
+	return pair, true
+}
+
+func _loadProxySigningKey(path, pid string) (*cos.NodeSigningKey, error) {
+	b, err := os.ReadFile(path)
+	if err == nil {
+		pair, err := cos.UnpackNodeSigningKey(pid, b)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy signing key %q: %w", path, err)
+		}
+		return pair, nil
+	}
+	if cos.IsNotExist(err) {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("failed to read proxy signing key %q: %w", path, err)
 }
 
 func (p *proxy) pready(smap *smapX, withRR bool /* also check readiness to rebalance */) error {
@@ -1188,7 +1241,6 @@ func (p *proxy) metasyncHandler(w http.ResponseWriter, r *http.Request) {
 		newRMD, msgRMD, errRMD              = p.extractRMD(payload, sender)
 		newEtlMD, msgEtlMD, errEtlMD        = p.extractEtlMD(payload, sender)
 		revokedTokens, msgTokens, errTokens = p.extractRevokedTokenList(payload, sender)
-		newCSK, msgCSK, errCSK              = p.extractCSK(payload, sender)
 	)
 
 	// 2. apply
@@ -1212,16 +1264,13 @@ func (p *proxy) metasyncHandler(w http.ResponseWriter, r *http.Request) {
 		nlog.Infoln("msync Rx token list from", sender, "msg:", msgTokens.String(), "num revoked:", len(revokedTokens.Tokens))
 		_ = p.authn.updateRevokedList(r.Context(), revokedTokens)
 	}
-	if errCSK == nil && newCSK != nil {
-		errCSK = p.receiveCSK(newCSK, msgCSK, sender)
-	}
 
 	// 3. respond
-	if errConf == nil && errSmap == nil && errBMD == nil && errRMD == nil && errTokens == nil && errEtlMD == nil && errCSK == nil {
+	if errConf == nil && errSmap == nil && errBMD == nil && errRMD == nil && errTokens == nil && errEtlMD == nil {
 		return
 	}
 	p.fillNsti(nsti)
-	retErr := err.message(errConf, errSmap, errBMD, errRMD, errEtlMD, errTokens, errCSK)
+	retErr := err.message(errConf, errSmap, errBMD, errRMD, errEtlMD, errTokens)
 	p.writeErr(w, r, retErr, http.StatusConflict)
 }
 

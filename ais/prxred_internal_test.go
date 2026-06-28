@@ -5,6 +5,8 @@
 package ais
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -15,6 +17,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/tools/tassert"
 )
 
 const (
@@ -40,18 +43,25 @@ func newTestProxy(t *testing.T, signVerifyEnabled bool) *proxy {
 	cmn.Rom.Set(&config.ClusterConfig)
 
 	p := &proxy{}
-	p.owner.csk.init()
-	p.owner.csk.store(&clusterKey{
-		secret:  []byte("0123456789abcdef"), // 16 bytes
-		ver:     42,
-		created: 1,
-	})
-	p.owner.csk.nonce.Store(100)
+
+	pub, priv, err := cos.GenerateNodeSigningKey()
+	if err != nil {
+		t.Fatalf("failed to generate keys: %v", err)
+	}
+	p.htrun.nodeSigningKey = cos.NewNodeSigningKey(priv, pub)
 
 	p.si = &meta.Snode{}
-	p.si.Init(testProxyID, apc.Proxy)
+	p.si.Init(testProxyID, apc.Proxy, pub)
 	p.si.PubNet.URL = "http://proxy:8080"
 	p.si.ControlNet.URL = "http://proxy:8080"
+
+	smap := newSmap()
+	smap.Pmap = meta.NodeMap{p.si.ID(): p.si}
+	smap.Primary = p.si
+	smap.Version = 1
+
+	p.owner.smap = newSmapOwner(config)
+	p.owner.smap.put(smap) // populate the atomic.Pointer so get() works
 
 	return p
 }
@@ -60,7 +70,7 @@ func newTestSnode(t *testing.T) *meta.Snode {
 	t.Helper()
 
 	si := &meta.Snode{}
-	si.Init(testDstID, apc.Target)
+	si.Init(testDstID, apc.Target, nil /*verifying key*/)
 	si.PubNet.URL = "http://dst:8080"
 	si.ControlNet.URL = "http://dst:8080"
 	return si
@@ -124,31 +134,31 @@ func requireRedirectParams(t *testing.T, q url.Values) {
 	}
 }
 
-func requireNoCSKParams(t *testing.T, q url.Values) {
+func requireNoSignVerifyParams(t *testing.T, q url.Values) {
 	t.Helper()
 
-	if q.Get(apc.QparamSmapVer) != "" || q.Get(apc.QparamNonce) != "" || q.Get(apc.QparamHMAC) != "" {
+	if q.Get(apc.QparamSmapVer) != "" || q.Get(apc.QparamNonce) != "" || q.Get(apc.QparamSig) != "" {
 		t.Fatalf("plain redirect must not contain sign/verify params, got %v", q)
 	}
 }
 
-func requireCSKParams(t *testing.T, q url.Values) {
+func requireSignVerifyParams(t *testing.T, q url.Values) {
 	t.Helper()
 
 	smapVer := q.Get(apc.QparamSmapVer)
 	nonce := q.Get(apc.QparamNonce)
-	sig := q.Get(apc.QparamHMAC)
+	sig := q.Get(apc.QparamSig)
 	if smapVer == "" || nonce == "" || sig == "" {
 		t.Fatalf("missing sign/verify params: %v", q)
 	}
-	if len(sig) != cskSigLen {
-		t.Fatalf("expected HMAC len %d, got %d", cskSigLen, len(sig))
+	if len(sig) != sigLen() {
+		t.Fatalf("expected signature len %d, got %d", sigLen(), len(sig))
 	}
-	if _, err := strconv.ParseInt(smapVer, cskBase, 64); err != nil {
-		t.Fatalf("%s=%q not valid base%d: %v", apc.QparamSmapVer, smapVer, cskBase, err)
+	if _, err := strconv.ParseInt(smapVer, svNumBase, 64); err != nil {
+		t.Fatalf("%s=%q not valid base%d: %v", apc.QparamSmapVer, smapVer, svNumBase, err)
 	}
-	if _, err := strconv.ParseUint(nonce, cskBase, 64); err != nil {
-		t.Fatalf("%s=%q not valid base%d: %v", apc.QparamNonce, nonce, cskBase, err)
+	if _, err := strconv.ParseUint(nonce, svNumBase, 64); err != nil {
+		t.Fatalf("%s=%q not valid base%d: %v", apc.QparamNonce, nonce, svNumBase, err)
 	}
 }
 
@@ -198,12 +208,15 @@ func TestRedurlPlain(t *testing.T) {
 			q := u.Query()
 			requireQueryValue(t, q, tc.wantKey, tc.wantVal)
 			requireRedirectParams(t, q)
-			requireNoCSKParams(t, q)
+			requireNoSignVerifyParams(t, q)
 		})
 	}
 }
 
 func TestRedurlSigned(t *testing.T) {
+	if cmn.IsV50Bridge() {
+		t.Skip("v5.0 bridge disables intra-cluster sign/verify")
+	}
 	tests := []struct {
 		name    string
 		method  string
@@ -241,64 +254,80 @@ func TestRedurlSigned(t *testing.T) {
 			q := u.Query()
 			requireQueryValue(t, q, tc.wantKey, tc.wantVal)
 			requireRedirectParams(t, q)
-			requireCSKParams(t, q)
+			requireSignVerifyParams(t, q)
 		})
 	}
 }
 
 func TestSignerVerifyRoundTrip(t *testing.T) {
+	if cmn.IsV50Bridge() {
+		t.Skip("v5.0 bridge disables intra-cluster sign/verify")
+	}
 	p, orig, u := makeRedirect(t, true /*signVerifyEnabled*/, http.MethodGet, "/v1/signed-verify", "q=ok", 888)
 
 	if !cmn.Rom.SignVerifyEnabled() {
 		t.Fatal("sign/verify must be enabled for verify test")
 	}
 
-	rOK := &http.Request{
-		Method:        orig.Method,
-		URL:           u,
-		Host:          u.Host,
-		ContentLength: orig.ContentLength,
+	// reconstruct the verifier from the request's own signed query params
+	// (pid, smap-ver, nonce, sig) — so the only variable across cases is the URL itself
+	verify := func(u *url.URL) (int, error) {
+		r := &http.Request{
+			Method:        orig.Method,
+			URL:           u,
+			Host:          u.Host,
+			ContentLength: orig.ContentLength,
+		}
+		q := r.URL.Query()
+		svgrp, err := svgrpFromQ(q)
+		if err != nil {
+			return 0, fmt.Errorf("parse sign/verify params: %w", err)
+		}
+		if svgrp == nil {
+			return 0, errors.New("expected sign/verify params, got nil")
+		}
+		sign := &signer{r: r, h: &p.htrun, smapVer: svgrp.smapVer, nonce: svgrp.nonce}
+		return sign.verify(q.Get(apc.QparamPID), svgrp.sig)
 	}
 
-	q := rOK.URL.Query()
-	pid := q.Get(apc.QparamPID)
-	cskgrp, err := cskFromQ(q)
-	if err != nil {
-		t.Fatalf("failed to parse sign/verify params: %v", err)
-	}
-	if cskgrp == nil {
-		t.Fatal("expected sign/verify params, got nil")
+	// 1. valid signed URL verifies
+	if status, err := verify(u); err != nil || status != 0 {
+		t.Fatalf("verify failed for valid signed URL: status=%d, err=%v, url=%q", status, err, u.String())
 	}
 
-	sign := &signer{r: rOK, h: &p.htrun}
-	status, err := sign.verify(pid, cskgrp)
-	if err != nil || status != 0 {
-		t.Fatalf("verify() failed for valid signed URL: status=%d, err=%v, url=%q", status, err, u.String())
-	}
-
+	// 2. tampered path => 401, and *only* because of the path: smap-ver and nonce
+	// are seeded from the same (path-tampered) query, so r.URL.Path is the sole
+	// differing input into svPayload
 	uBad := *u
 	uBad.Path = u.Path + "-tampered"
+	if status, err := verify(&uBad); err == nil || status != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for tampered path, got status=%d, err=%v", status, err)
+	}
+}
 
-	rBad := &http.Request{
-		Method:        orig.Method,
-		URL:           &uBad,
-		Host:          uBad.Host,
-		ContentLength: orig.ContentLength,
+func TestRedurlSignVerifyDisabledOnV50Bridge(t *testing.T) {
+	if !cmn.IsV50Bridge() {
+		t.Skip("v5.0 bridge-specific test")
 	}
 
-	q = rBad.URL.Query()
-	pid = q.Get(apc.QparamPID)
-	cskgrp, err = cskFromQ(q)
-	if err != nil {
-		t.Fatalf("failed to parse sign/verify params from tampered URL: %v", err)
-	}
-	if cskgrp == nil {
-		t.Fatal("expected sign/verify params from tampered URL, got nil")
-	}
+	_, _, u := makeRedirect(
+		t,
+		true, /* signVerifyEnabled: raw config bit */
+		http.MethodGet,
+		"/v1/objects/ais/bck/obj",
+		"a=1",
+		1, /* smapVer */
+	)
 
-	signBad := &signer{r: rBad, h: &p.htrun}
-	status, err = signBad.verify(pid, cskgrp)
-	if err == nil || status != http.StatusUnauthorized {
-		t.Fatalf("expected verify() to fail with 401 for tampered path, got status=%d, err=%v", status, err)
+	q := u.Query()
+
+	// Existing redirect params remain.
+	tassert.Fatalf(t, q.Get(apc.QparamPID) == testProxyID, "missing pid: %v", q)
+	tassert.Fatalf(t, q.Get(apc.QparamUnixTime) != "", "missing utm: %v", q)
+	tassert.Fatalf(t, q.Get("a") == "1", "missing preserved query param: %v", q)
+
+	// But v5.0 bridge must not append sign/verify params even when raw config enables it.
+	if q.Get(apc.QparamSmapVer) != "" || q.Get(apc.QparamNonce) != "" || q.Get(apc.QparamSig) != "" {
+		t.Fatalf("v5.0 bridge must not sign redirects, got query: %v", q)
 	}
 }
