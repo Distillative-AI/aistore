@@ -13,7 +13,7 @@ authors = [
 ]
 description = "AIStore Python loader for benchmarking and testing"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = "MIT"
 
 classifiers = [
@@ -22,6 +22,11 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
     "Topic :: System :: Benchmark",
 ]
@@ -32,10 +37,8 @@ dependencies = [
     "colorama>=0.4.6",
     "humanfriendly>=10.0",
     "pendulum>=3.1.0",
-    "setuptools<82",
     "tabulate>=0.9.0",
     "torch>=2.8.0",
-    "torchdata>=0.11.0",
 ]
 
 keywords = [

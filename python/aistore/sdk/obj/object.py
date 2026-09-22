@@ -137,7 +137,6 @@ class Object:
                 `Object` stores the name, bucket, and provider.
         """
         self.head("checksum,atime,version,copies,custom,location")
-        assert self._props is not None
         return self._props
 
     @property
@@ -166,7 +165,6 @@ class Object:
                    presence is returned automatically.
                    See: https://github.com/NVIDIA/aistore/blob/main/api/apc/lsmsg.go
                    If empty, returns default properties (name, size).
-
 
         Returns:
             ObjectAttributes: Parsed object attributes.
@@ -235,7 +233,7 @@ class Object:
             ValueError: If `byte_range` is used with `blob_download_config`.
             requests.RequestException: If an error occurs during the request.
             requests.ConnectionError: If there is a connection error.
-            requests.ConnectionTimeout: If the connection times out.
+            requests.ConnectTimeout: If the connection times out.
             requests.ReadTimeout: If the read operation times out.
         """
 
@@ -413,7 +411,7 @@ class Object:
         Raises:
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
             requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
+            requests.ConnectTimeout: Timed out connecting to AIStore
             requests.ReadTimeout: Timed out waiting response from AIStore
             AISError: Path does not exist on the AIS cluster storage
         """
@@ -440,12 +438,12 @@ class Object:
         Delete an object from a bucket.
 
         Returns:
-            None
+            requests.Response: Response from the delete request.
 
         Raises:
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
             requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
+            requests.ConnectTimeout: Timed out connecting to AIStore
             requests.ReadTimeout: Timed out waiting response from AIStore
             requests.exceptions.HTTPError(404): The object does not exist
         """
@@ -478,7 +476,7 @@ class Object:
         Raises:
             requests.RequestException: "There's an ambiguous exception that occurred while handling..."
             requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
+            requests.ConnectTimeout: Timed out connecting to AIStore
             requests.ReadTimeout: Timed out waiting response from AIStore
             requests.exceptions.HTTPError: Service unavailable
 
@@ -522,7 +520,7 @@ class Object:
         Raises:
             aistore.sdk.errors.AISError: All other types of errors with AIStore
             requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
+            requests.ConnectTimeout: Timed out connecting to AIStore
             requests.exceptions.HTTPError: Service unavailable
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
         """

@@ -234,7 +234,7 @@ func (lom *LOM) _cleanup() error {
 
 	// 3. remove shard index
 	if lom.HasShardIdx() {
-		if err := lom.rmShardIdx(); err != nil {
+		if err := lom.rmSidx(); err != nil {
 			errs = append(errs, fmt.Errorf("remove shard index: %w", err))
 		}
 	}
@@ -339,6 +339,10 @@ func (lom *LOM) RenameFinalize(wfqn string) error {
 			}
 			lom.setlmfl(lmflFntl)
 		}
+		// new content: PUT, cold GET, append, chunked completion
+		if lom.HasShardIdx() {
+			lom.dropSidx()
+		}
 		return nil
 	}
 	debug.AssertFunc(func() bool { return !cos.IsErrFntl(err) })
@@ -366,24 +370,25 @@ func (lom *LOM) NewArchpathReader(lh cos.LomReader, archpath, mime string) (csl 
 	}
 	debug.Func(func() { debug.Assert(mime != "", "unknown MIME for", lom.Cname(), "/", archpath) })
 
-	// Fast path: TAR with a stored shard index — seek directly to the file's
-	// data offset instead of a sequential TAR scan.
-	// Any miss (no index, stale, unreadable, or entry not indexed) falls through
-	// to the sequential scan below, which is the authoritative source.
+	// fast path
+	// any miss (no index, stale, unreadable, or entry not indexed) falls through
 	if mime == archive.ExtTar {
-		// TODO: IsStale degrades to size-only when archlom cksum is None — see
-		// "checksum" TODOs in ais/tgtobj.go and xact/xs/archive.go (fast-append).
-		idx, err := LoadShardIndex(lom)
+		entry, ok, err := lom.lookupShardIndex(archpath)
+		// verbose log
 		if err != nil && cmn.Rom.V(4, cos.ModCore) {
-			nlog.Warningln(lom.Cname(), "shard index unusable, falling back to scan:", err)
-		}
-		if err == nil && idx != nil {
-			if entry, ok := idx.Entries[archpath]; ok {
-				return cos.NewSectionHandle(lh, entry.DataOffset(), entry.Size, 0), nil
+			switch {
+			case errors.Is(err, archive.ErrShardIdxStale), errors.Is(err, archive.ErrShardIdxCorrupt):
+				nlog.Warningln(lom.Cname(), "shard index unusable, falling back to scan:", err)
+			default:
+				nlog.Warningln(lom.Cname(), "shard index read failed, falling back to scan:", err)
 			}
+		}
+		if err == nil && ok {
+			return cos.NewSectionHandle(lh, entry.DataOffset(), entry.Size, 0), nil
 		}
 	}
 
+	// slow path
 	var ar archive.Reader
 	ar, err = archive.NewReader(mime, lh, lom.Lsize())
 	if err != nil {

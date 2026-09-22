@@ -6,17 +6,18 @@ The `DsortFramework` class in the Python SDK enables you to define and manage dS
 
 ### Example Usage
 
-1. **Creating a DsortFramework from a JSON/YAML Specification File:**
+1. **Starting from a JSON/YAML Specification File:**
 
    ```python
-   from aistore.sdk.dsort import DsortFramework
+   from aistore.sdk import Client
 
-   # Create a DsortFramework instance from a specification file
-   dsort_framework = DsortFramework.from_file("path/to/spec.json")
-
-   # Start the dSort job
-   client.dsort().start(dsort_framework)
+   client = Client("http://your-aistore-url:8080")
+   client.dsort().start("path/to/spec.json")
    ```
+
+   Passing the path preserves all file settings, including `dry_run`, `max_mem_usage`,
+   and `ekm_file_sep`. `DsortFramework.from_file()` loads only fields represented by
+   that class.
 
 2. **Creating a DsortFramework Directly:**
 
@@ -45,8 +46,8 @@ The `DsortFramework` class in the Python SDK enables you to define and manage dS
 
     # Define the output format as ExternalKeyMap
     output_format = ExternalKeyMap()
-    output_format["output-shard-0"] = ObjectNames(objnames=["file1.txt", "file2.txt"])
-    output_format["output-shard-1"] = ObjectNames(objnames=["file3.txt", "file4.txt"])
+    output_format["output-shard-0"] = ObjectNames(names=["file1.txt", "file2.txt"])
+    output_format["output-shard-1"] = ObjectNames(names=["file3.txt", "file4.txt"])
 
     # Define the input shards group
     input_shards_group = DsortShardsGroup(
@@ -72,11 +73,8 @@ The `DsortFramework` class in the Python SDK enables you to define and manage dS
         output_shard_size="100KiB",
     )
 
-    # Convert the framework to a dictionary
-    dsort_spec = dsort_framework.to_spec()
-
     # Start the dSort job
-    client.dsort().start(dsort_spec)
+    client.dsort().start(dsort_framework)
    ```
 
    ```bash
@@ -110,13 +108,14 @@ The `DsortShardsGroup` class represents a set of shards (either input end or out
 ### Example Usage
 
 ```python
+from aistore.sdk.dsort import DsortShardsGroup
 from aistore.sdk.types import BucketModel
 from aistore.sdk.multiobj import ObjectNames, ObjectRange
 
 input_bucket = BucketModel(name="input_bucket", provider="aws")
 output_bucket = BucketModel(name="output_bucket", provider="aws")
 
-input_format = ObjectNames(objnames=["input-shard-1", "input-shard-2"])
+input_format = ObjectNames(names=["input-shard-1", "input-shard-2"])
 output_format = ObjectRange(prefix="output-shard-", min_index=0, max_index=99, pad_width=2)
 
 input_shards_group = DsortShardsGroup(
@@ -144,14 +143,15 @@ The `ExternalKeyMap` (EKM) class provides users with an interface to specify the
 ### Example Usage
 
 ```python
+from aistore.sdk.dsort import ExternalKeyMap
 from aistore.sdk.multiobj import ObjectNames
 
 # Create an instance of ExternalKeyMap
 ekm = ExternalKeyMap()
 
 # Add ObjectNames instances to the ExternalKeyMap with corresponding shard formats
-ekm["output-shard-0"] = ObjectNames(objnames=["file1.txt", "file2.txt"])
-ekm["output-shard-1"] = ObjectNames(objnames=["file3.txt", "file4.txt"])
+ekm["output-shard-0"] = ObjectNames(names=["file1.txt", "file2.txt"])
+ekm["output-shard-1"] = ObjectNames(names=["file3.txt", "file4.txt"])
 
 # Convert to dictionary representation
 print(ekm.as_dict())

@@ -70,7 +70,7 @@ func (t *target) verifyBckVerb(w http.ResponseWriter, r *http.Request, dpq *dpq)
 		return false
 	}
 
-	if ecode, err := t.checkIntra(r, false /*only primary*/); err != nil {
+	if ecode, err := t.checkIntra(r, smap, false /*only primary*/); err != nil {
 		t.writeErr(w, r, err, ecode)
 		return false
 	}
@@ -659,7 +659,7 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 		// Recreate bucket directories (now empty), since bck is still in BMD
 		errs := fs.CreateBucket(bck.Bucket(), false /*nilbmd*/)
 		if len(errs) > 0 {
-			debug.AssertNoErr(errs[0])
+			debug.Func(func() { debug.AssertNoErr(errs[0]) })
 			t.writeErr(w, r, errs[0]) // only 1 err is possible for 1 bck
 		}
 	case apc.ActDeleteObjects, apc.ActEvictObjects:

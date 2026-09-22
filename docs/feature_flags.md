@@ -1,6 +1,6 @@
 ## Feature flags
 
-`Feature flags` are represented as a 64-bit bitmask field in aistore cluster configuration denoting assorted (named) capabilities that can be individually enabled at runtime.
+`Feature flags` are represented as a 64-bit bitmask field in aistore cluster configuration denoting assorted (named) capabilities. Most take effect at runtime; flags marked **restart required** take effect only after the affected nodes restart.
 
 The features themselves are enumerated below. Not all feature flags - henceforth, "features" - are cluster-global.
 
@@ -52,7 +52,6 @@ The validation occurs both at the cluster level and when setting bucket properti
 
 | name | tags | comment |
 | --- | --- | ------- |
-| `Enforce-IntraCluster-Access` | `security` | Deprecated: use auth.intra_cluster to secure intra-cluster communications |
 | `Skip-Loading-VersionChecksum-MD(*)` | `perf,integrity-` | skip loading existing object's metadata, Version and Checksum (VC) in particular |
 | `Do-not-Auto-Detect-FileShare` | `promote,ops` | do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS |
 | `S3-API-via-Root` | `s3,compat,ops` | handle S3 requests via `aistore-hostname/` (whereby the default: `aistore-hostname/s3`) |
@@ -72,7 +71,7 @@ The validation occurs both at the cluster level and when setting bucket properti
 | `Trust-Crypto-Safe-Checksums` | `integrity+,overhead` | when checking whether objects are identical trust only cryptographically secure checksums |
 | `S3-ListObjectVersions` | `s3,overhead` | when versioning info is requested, use ListObjectVersions API (beware: extremely slow, versioned S3 buckets only) |
 | `Enable-Detailed-Prom-Metrics` | `telemetry,overhead` | include (bucket, xaction) Prometheus variable labels with every GET and PUT transaction |
-| `Force-Container-CPU-Mem` | `deploy` | force container-based CPU and memory metrics when automated environment detection fails; unlike all other feature flags, takes effect only at startup (not at runtime) |
+| `Force-Container-CPU-Mem` | `deploy` | force container-based CPU and memory metrics when automated environment detection fails (**restart required**) |
 | `Resume-Interrupted-MPU` | `mpu,ops` | resume interrupted multipart uploads from persisted partial manifests |
 | `Keep-Unknown-FQN` | `integrity?,ops` | do not delete unrecognized/invalid FQNs during space cleanup ('ais space-cleanup') |
 | `Load-Balance-GET` | `perf` | when bucket is n-way mirrored read object replica from the least-utilized mountpath |
@@ -80,13 +79,14 @@ The validation occurs both at the cluster level and when setting bucket properti
 | `Enable-Go-Runtime-Metrics` | `telemetry,ops,overhead` | publish a low-cardinality subset of Go runtime metrics (goroutines, GC, heap) via Prometheus |
 | `Dload-Allow-Private-Egress` | `security-` | allow downloader egress to private RFC1918/ULA addresses; loopback and link-local remain blocked |
 | `S3-Redirect-Rebuild` | `s3,compat,security-` | allow S3 clients that rebuild redirected requests instead of following the Location URI (forbidden when AuthN or intra-cluster signing is configured) |
+| `System-Reserved-KTLS` | `perf,net,ops,compat` | offload TLS transmit path to the kernel and enable Linux sendfile (reserved for internal use; may be redefined or removed at any time) (**restart required**) |
 
 ## Global features
 
 ```console
 $ ais config cluster features <TAB-TAB>
 
-Enforce-IntraCluster-Access            Do-not-Optimize-Listing-Virtual-Dirs   Force-Container-CPU-Mem
+Do-not-Optimize-Listing-Virtual-Dirs   Force-Container-CPU-Mem
 Skip-Loading-VersionChecksum-MD        Disable-Cold-GET                       Resume-Interrupted-MPU
 Do-not-Auto-Detect-FileShare           Streaming-Cold-GET                     Keep-Unknown-FQN
 S3-API-via-Root                        S3-Reverse-Proxy                       Load-Balance-GET
@@ -95,7 +95,7 @@ LZ4-Block-1MB                          Do-not-Delete-When-Rebalancing         En
 LZ4-Frame-Checksum                     Do-not-Set-Control-Plane-ToS           Dload-Allow-Private-Egress
 Do-not-Allow-Passing-FQN-to-ETL        Trust-Crypto-Safe-Checksums            S3-Redirect-Rebuild
 Ignore-LimitedCoexistence-Conflicts    S3-ListObjectVersions                  none
-S3-Presigned-Request                   Enable-Detailed-Prom-Metrics
+S3-Presigned-Request                   Enable-Detailed-Prom-Metrics           System-Reserved-KTLS
 ```
 
 For example:
@@ -109,7 +109,6 @@ features         Skip-Loading-VersionChecksum-MD
                  Load-Balance-GET
 
 FEATURE                              TAGS                   DESCRIPTION
-Enforce-IntraCluster-Access          security               Deprecated: use auth.intra_cluster to secure intra-cluster communications
 Skip-Loading-VersionChecksum-MD      perf,integrity-        (*) skip loading existing object's metadata, Version and Checksum (VC) in particular              <<< colored
 Do-not-Auto-Detect-FileShare         promote,ops            do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS
 S3-API-via-Root                      s3,compat,ops          handle s3 requests via `aistore-hostname/` (default: `aistore-hostname/s3`)                       <<< colored
@@ -137,6 +136,7 @@ Count-Object-NotFound-Stats          telemetry,ops          count GET(object) 40
 Enable-Go-Runtime-Metrics            telemetry,ops,overhead publish selected Go runtime metrics via Prometheus
 Dload-Allow-Private-Egress           security-              allow downloader egress to private RFC1918/ULA addresses; loopback and link-local remain blocked
 S3-Redirect-Rebuild                  s3,compat,security-    allow S3 clients that rebuild redirected requests instead of following the Location URI (forbidden when AuthN or intra-cluster signing is configured)
+System-Reserved-KTLS                 perf,net,ops,compat    offload TLS transmit path to the kernel and enable Linux sendfile (reserved for internal use; may be redefined or removed at any time)
 
 Cluster config updated
 ```
@@ -156,7 +156,6 @@ features         Skip-Loading-VersionChecksum-MD
                  Load-Balance-GET
 
 FEATURE                              TAGS                   DESCRIPTION
-Enforce-IntraCluster-Access          security               Deprecated: use auth.intra_cluster to secure intra-cluster communications
 Skip-Loading-VersionChecksum-MD      perf,integrity-        (*) skip loading existing object's metadata, Version and Checksum (VC) in particular               <<< colored
 Do-not-Auto-Detect-FileShare         promote,ops            do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS
 S3-API-via-Root                      s3,compat,ops          handle s3 requests via `aistore-hostname/` (default: `aistore-hostname/s3`)                        <<< colored
@@ -184,6 +183,7 @@ Count-Object-NotFound-Stats          telemetry,ops          count GET(object) 40
 Enable-Go-Runtime-Metrics            telemetry,ops,overhead publish selected Go runtime metrics via Prometheus
 Dload-Allow-Private-Egress           security-              allow downloader egress to private RFC1918/ULA addresses; loopback and link-local remain blocked
 S3-Redirect-Rebuild                  s3,compat,security-    allow S3 clients that rebuild redirected requests instead of following the Location URI (forbidden when AuthN or intra-cluster signing is configured)
+System-Reserved-KTLS                 perf,net,ops,compat    offload TLS transmit path to the kernel and enable Linux sendfile (reserved for internal use; may be redefined or removed at any time)
 ```
 
 The same in JSON:

@@ -1,6 +1,6 @@
 // Package meta: cluster-level metadata
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package meta
 
@@ -18,6 +18,14 @@ import (
 
 // A variant of consistent hash based on rendezvous algorithm by Thaler and Ravishankar,
 // aka highest random weight (HRW)
+//
+// Invariants:
+// - the result returned by the routines below depends on Smap state, not just membership:
+//   InMaintOrDecomm nodes are skipped
+//   (and at least in one case non-electable proxies are skipped as well)
+// - the `>=` below does not break ties deterministically (map iteration order decides) -
+//   a tie requires two identical 64-bit xxhash hashes and is extremely unlikely.
+//
 // See also: fs/hrw.go
 
 func (smap *Smap) HrwName2T(uname []byte) (*Snode, error) {
@@ -116,25 +124,39 @@ func (smap *Smap) HrwIC(uuid string) (pi *Snode, err error) {
 	return pi, err
 }
 
-// Returns a target for a given task. E.g. usage: list objects in a cloud bucket
-// (we want only one target to do it).
-func (smap *Smap) HrwTargetTask(uuid string) (si *Snode, err error) {
+// HRW over a given node map; skips unavailable nodes; returns nil when none qualifies.
+func hrwOver(nodes NodeMap, uuid string) (si *Snode) {
 	var (
 		maxH   uint64
 		digest = onexxh.Checksum64S(cos.UnsafeB(uuid), cos.MLCG32)
 	)
-	for _, tsi := range smap.Tmap {
-		if tsi.InMaintOrDecomm() {
+	for _, nsi := range nodes {
+		if nsi.InMaintOrDecomm() {
 			continue
 		}
-		cs := xoshiro256.Hash(tsi.digest() ^ digest)
+		cs := xoshiro256.Hash(nsi.digest() ^ digest)
 		if cs >= maxH {
 			maxH = cs
-			si = tsi
+			si = nsi
 		}
 	}
-	if si == nil {
+	return si
+}
+
+// return a (designated) target for a given task
+// (e.g. usage: list objects in a cloud bucket - we want one DT to do it)
+func (smap *Smap) HrwTargetTask(uuid string) (si *Snode, err error) {
+	if si = hrwOver(smap.Tmap, uuid); si == nil {
 		err = cmn.NewErrNoNodes(apc.Target, len(smap.Tmap))
+	}
+	return si, err
+}
+
+// return a proxy for a given task - e.g., the proxy to own a given list-objects
+// pagination (compare with HrwIC above: the latter selects from the IC members only)
+func (smap *Smap) HrwProxyTask(uuid string) (si *Snode, err error) {
+	if si = hrwOver(smap.Pmap, uuid); si == nil {
+		err = cmn.NewErrNoNodes(apc.Proxy, len(smap.Pmap))
 	}
 	return si, err
 }

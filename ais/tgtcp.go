@@ -126,7 +126,7 @@ func (t *target) recvCluMeta(cm *cluMeta, action, sender string) error {
 // [METHOD] /v1/daemon
 //
 
-func (t *target) daemonHandler(w http.ResponseWriter, r *http.Request) {
+func (t *target) daeCtrlHandler(w http.ResponseWriter, r *http.Request) {
 	t._dae(w, r, false /*isPub*/)
 }
 
@@ -137,6 +137,7 @@ func (t *target) daePubHandler(w http.ResponseWriter, r *http.Request) {
 func (t *target) _dae(w http.ResponseWriter, r *http.Request, isPub bool) {
 	debug.AssertFunc(func() bool { return reqIsPub(r) == isPub })
 
+	var smap *smapX // intra-control only; nil on the public (GET-only) path
 	if isPub {
 		if r.Method != http.MethodGet {
 			t.writeErrStatusf(w, r, http.StatusForbidden, "%s: %s %s is read-only on %s", t, r.Method, r.URL.Path, cmn.NetPublic)
@@ -146,15 +147,19 @@ func (t *target) _dae(w http.ResponseWriter, r *http.Request, isPub bool) {
 			t.writeErr(w, r, errDirectTargetAccess, http.StatusForbidden)
 			return
 		}
-	} else if !t.ensureIntraControl(w, r, false /* from primary */) {
-		return
+	} else {
+		smap = t.owner.smap.get()
+		if !t.ensureIntraControl(w, r, smap, false /* from primary */) {
+			return
+		}
 	}
 
 	switch r.Method {
 	case http.MethodGet:
 		t.httpdaeget(w, r)
 	case http.MethodPut:
-		t.httpdaeput(w, r)
+		debug.Assert(!isPub && smap != nil) // (isPub is GET-only - above)
+		t.httpdaeput(w, r, smap)
 	case http.MethodPost:
 		t.httpdaepost(w, r)
 	case http.MethodDelete:
@@ -164,19 +169,19 @@ func (t *target) _dae(w http.ResponseWriter, r *http.Request, isPub bool) {
 	}
 }
 
-func (t *target) httpdaeput(w http.ResponseWriter, r *http.Request) {
+func (t *target) httpdaeput(w http.ResponseWriter, r *http.Request, smap *smapX) {
 	apiItems, err := t.parseURL(w, r, apc.URLPathDae.L, 0, true)
 	if err != nil {
 		return
 	}
 	if len(apiItems) == 0 {
-		t.daeputMsg(w, r)
+		t.daeputMsg(w, r, smap)
 	} else {
 		t.daeputItems(w, r, apiItems)
 	}
 }
 
-func (t *target) daeputMsg(w http.ResponseWriter, r *http.Request) {
+func (t *target) daeputMsg(w http.ResponseWriter, r *http.Request, smap *smapX) {
 	msg, err := t.readActionMsg(w, r)
 	if err != nil {
 		return
@@ -230,25 +235,25 @@ func (t *target) daeputMsg(w http.ResponseWriter, r *http.Request) {
 		t.bps[provider] = bp
 		t.rlbps[provider] = &rlbackend{Backend: bp, t: t}
 	case apc.ActStartMaintenance:
-		if !t.ensureIntraControl(w, r, true /* from primary */) {
+		if !t.ensureIntraControl(w, r, smap, true /* from primary */) {
 			return
 		}
 		t.statsT.SetFlag(cos.NodeAlerts, cos.MaintenanceMode)
 		t.termKaliveX(msg.Action, true)
 	case apc.ActShutdownCluster, apc.ActShutdownNode:
-		if !t.ensureIntraControl(w, r, true /* from primary */) {
+		if !t.ensureIntraControl(w, r, smap, true /* from primary */) {
 			return
 		}
 		t.statsT.SetFlag(cos.NodeAlerts, cos.MaintenanceMode)
 		t.termKaliveX(msg.Action, false)
 		t.shutdown(msg.Action)
 	case apc.ActRmNodeUnsafe:
-		if !t.ensureIntraControl(w, r, true /* from primary */) {
+		if !t.ensureIntraControl(w, r, smap, true /* from primary */) {
 			return
 		}
 		t.termKaliveX(msg.Action, true)
 	case apc.ActDecommissionCluster, apc.ActDecommissionNode:
-		if !t.ensureIntraControl(w, r, true /* from primary */) {
+		if !t.ensureIntraControl(w, r, smap, true /* from primary */) {
 			return
 		}
 		var opts apc.ActValRmNode
@@ -1209,7 +1214,8 @@ func (t *target) metasyncHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	if !t.ensureIntraControl(w, r, true /* from primary */) {
+	smap := t.owner.smap.get()
+	if !t.ensureIntraControl(w, r, smap, true /* from primary */) {
 		return
 	}
 	switch r.Method {
@@ -1245,7 +1251,7 @@ func (t *target) metasyncPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t.warnMsync(r, t.owner.smap.get())
+	t.warnMsync(r, t.owner.smap.get()) // (the latest: executes under regstate lock)
 
 	// 1. extract
 	var (
@@ -1382,7 +1388,7 @@ func (t *target) metasyncPost(w http.ResponseWriter, r *http.Request) {
 //
 
 // pub-net: external watchdog and bootstrap cluster-info
-func (t *target) healthHandler(w http.ResponseWriter, r *http.Request) {
+func (t *target) healthPubHandler(w http.ResponseWriter, r *http.Request) {
 	if t.regstate.disabled.Load() && daemon.cli.target.standby {
 		if cmn.Rom.V(4, cos.ModAIS) {
 			nlog.Warningln("[health]", t.String(), "standing by...")
@@ -1457,7 +1463,7 @@ func (t *target) healthCtrlHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := t.checkIntra(r, false /*only primary*/); err != nil {
+	if _, err := t.checkIntra(r, smap, false /*only primary*/); err != nil {
 		if cmn.Rom.V(4, cos.ModAIS) {
 			nlog.Warningln("[health]", t.String(),
 				"rejected intra-control request:", err)

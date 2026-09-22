@@ -20,6 +20,7 @@ HEADER_ACCEPT = "Accept"
 HEADER_USER_AGENT = "User-Agent"
 HEADER_CONTENT_TYPE = "Content-Type"
 HEADER_CONTENT_LENGTH = "Content-Length"
+HEADER_TRANSFER_ENCODING = "Transfer-Encoding"
 HEADER_CONTENT_ENCODING = "Content-Encoding"
 HEADER_LOCATION = "Location"
 HEADER_CONNECTION = "Connection"
@@ -250,6 +251,7 @@ DUIS = (
 AWS_DEFAULT_REGION = "us-east-1"
 
 # Time constants
+GO_ZERO_TIME = "0001-01-01T00:00:00Z"
 NANOSECONDS_IN_SECOND = 1_000_000_000
 
 DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s: %(message)s"

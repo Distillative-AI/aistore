@@ -229,7 +229,9 @@ func (lom *LOM) unpack(buf []byte, mdSize int64, populate bool) (md *lmeta, _ er
 }
 
 func (lom *LOM) PersistMain(isChunked bool) error {
-	debug.Assertf(lom.bid() == lom.Bprops().BID || lom.bid() == 0, "defunct %s: %x vs %x", lom, lom.bid(), lom.Bprops().BID)
+	debug.Func(func() {
+		debug.Assertf(lom.bid() == lom.Bprops().BID || lom.bid() == 0, "defunct %s: %x vs %x", lom, lom.bid(), lom.Bprops().BID)
+	})
 	debug.Func(func() {
 		debug.Assertf(lom.IsLocked() == apc.LockWrite, "%s must be wlocked (have %d)", lom.String(), lom.IsLocked())
 	})
@@ -242,7 +244,7 @@ func (lom *LOM) PersistMain(isChunked bool) error {
 		if err := u.removeCompleted(true /*except first*/); err != nil {
 			nlog.Errorln("failed to remove", u._utag(lom.Cname()), "err:", err) // proceeding anyway
 		}
-		debug.Assert(u.flags&flCompleted != 0, u._utag(lom.Cname()), " not marked 'completed'")
+		debug.Func(func() { debug.Assert(u.flags&flCompleted != 0, u._utag(lom.Cname()), " not marked 'completed'") })
 	}
 
 	atime := lom.AtimeUnix()
@@ -307,7 +309,9 @@ func (lom *LOM) Persist() error {
 }
 
 func (lom *LOM) persistMdOnCopies() (copyFQN string, err error) {
-	debug.Assertf(lom.bid() == lom.Bprops().BID || lom.bid() == 0, "defunct %s: %x vs %x", lom, lom.bid(), lom.Bprops().BID)
+	debug.Func(func() {
+		debug.Assertf(lom.bid() == lom.Bprops().BID || lom.bid() == 0, "defunct %s: %x vs %x", lom, lom.bid(), lom.Bprops().BID)
+	})
 	buf := lom.pack()
 	// replicate across copies
 	for copyFQN = range lom.md.copies {
@@ -356,11 +360,16 @@ func (md *lmeta) clearDirty()   { md.atimefs &= ^lomDirtyMask }
 func (md *lmeta) isDirty() bool { return md.atimefs&lomDirtyMask == lomDirtyMask }
 
 func (md *lmeta) pushrt() []uint64 {
-	return []uint64{uint64(md.Atime), md.atimefs, uint64(md.lid)}
+	var hrw uint64
+	if md.isHRW() {
+		hrw = 1
+	}
+	return []uint64{uint64(md.Atime), md.atimefs, uint64(md.lid), hrw}
 }
 
 func (md *lmeta) poprt(saved []uint64) {
 	md.Atime, md.atimefs, md.lid = int64(saved[0]), saved[1], lomBID(saved[2])
+	md.setHRW(saved[3] != 0)
 }
 
 func (md *lmeta) unpack(buf []byte) error {
@@ -505,7 +514,24 @@ func (md *lmeta) unpack(buf []byte) error {
 	if seen&haveSize != haveSize {
 		return errors.New(badLmeta + " #103")
 	}
-	return md._setCksum(cksumType, cksumValue, seen&haveCksumT != 0, seen&haveCksumV != 0)
+	if err := md._setCksum(cksumType, cksumValue, seen&haveCksumT != 0, seen&haveCksumV != 0); err != nil {
+		return err
+	}
+
+	// clear in-memory state that's absent from the lmeta on-disk; preserve runtime-only HRW bit
+	if seen&haveVer == 0 {
+		md.Ver = nil
+	}
+	if seen&haveCustom == 0 {
+		md.CustomMD = nil
+	}
+	if seen&haveCopies == 0 {
+		md.copies = nil
+	}
+	if seen&haveFlags == 0 {
+		md.flags &= lmflHRW
+	}
+	return nil
 }
 
 func (md *lmeta) _setCksum(cksumT, cksumV string, haveT, haveV bool) error {

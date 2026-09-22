@@ -311,7 +311,7 @@ func (*s3bp) ListObjects(ctx context.Context, bck *meta.Bck, msg *apc.LsoMsg, ls
 			}
 			if key := *(vers.Key); key == en.Name {
 				v, ok := h.EncodeVersion(vers.VersionId)
-				debug.Assert(ok, en.Name+": "+*(vers.VersionId))
+				debug.Func(func() { debug.Assert(ok, en.Name+": "+*(vers.VersionId)) })
 				en.Version = v
 				num++
 			}
@@ -419,6 +419,9 @@ func (*s3bp) HeadObj(_ context.Context, lom *core.LOM, oreq *http.Request) (oa *
 		if cksumValue, ok := headOutput.Metadata[cos.S3MetadataChecksumVal]; ok {
 			oa.SetCksum(cksumType, cksumValue)
 		}
+	}
+	for k, v := range h.EncodeMetadata(headOutput.Metadata) {
+		oa.SetCustomKey(k, v)
 	}
 
 	// unlike other custom attrs, "Content-Type" is not getting stored w/ LOM

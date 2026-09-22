@@ -132,24 +132,43 @@ func (s *Stream) abortPending(err error, completions bool) {
 // refcount to invoke the has-been-sent callback only once
 // and *always* close the reader (sic!)
 func (s *Stream) doCmpl(obj *Obj, err error) {
-	var rc int64
-	if obj.prc != nil {
-		rc = obj.prc.Dec()
-		debug.Assert(rc >= 0)
+	var (
+		rc    int64
+		cbErr = err
+	)
+	if obj.cmpl != nil && err != nil {
+		obj.cmpl.err.CompareAndSwap(nil, &err)
 	}
+
+	// Close before decrementing the shared refcount: since each destination closes
+	// its own reader _before_ its Dec, rc == 0 implies that every destination reader
+	// has been released. (The one exception below is a reader that was already closed.)
 	if obj.Reader != nil {
 		if err != nil && cmn.IsFileAlreadyClosed(err) {
 			nlog.Errorf("%s %s: %v", s, obj, err)
 		} else {
-			cos.Close(obj.Reader) // otherwise, always closing
+			cos.Close(obj.Reader)
 		}
 	}
+
+	if obj.cmpl != nil {
+		rc = obj.cmpl.refs.Dec()
+		debug.Assert(rc >= 0)
+		if rc == 0 {
+			// last destination: every other one has already stored its error
+			// (CAS strictly precedes Dec) - the load below must observe any stored error
+			if perr := obj.cmpl.err.Load(); perr != nil {
+				cbErr = *perr
+			}
+		}
+	}
+
 	// SCQ completion callback
 	if rc == 0 {
 		if obj.SentCB != nil {
-			obj.SentCB(&obj.Hdr, obj.Reader, obj.CmplArg, err)
+			obj.SentCB(&obj.Hdr, obj.Reader, obj.CmplArg, cbErr)
 		} else if s.sentCB != nil {
-			s.sentCB(&obj.Hdr, obj.Reader, obj.CmplArg, err)
+			s.sentCB(&obj.Hdr, obj.Reader, obj.CmplArg, cbErr)
 		}
 	}
 	freeSend(obj)

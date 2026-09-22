@@ -191,7 +191,7 @@ func (t *target) rgetstats(backend core.Backend, cname, xkind string, size, lat 
 func (t *target) GetColdBlob(params *core.BlobParams, oa *cmn.ObjAttrs) (xctn core.Xact, err error) {
 	debug.Assert(params.Lom != nil)
 	debug.Assert(params.Msg != nil)
-	_, xctn, err = t.blobdl(params, oa, nil /*object headers*/)
+	_, xctn, err = t.blobdlBackground(params, oa)
 	return xctn, err
 }
 
@@ -221,8 +221,10 @@ func (t *target) GetFromNeighbor(params *core.GfnParams) (*http.Response, error)
 	query.Set(apc.QparamIsGFNRequest, "true")
 	if params.ArchPath != "" {
 		// (compare w/ t.getObject)
-		debug.Assertf(!strings.HasPrefix(params.ArchPath, lom.ObjName),
-			"expecting archpath _in_ archive, got (%q, %q)", params.ArchPath, lom.ObjName)
+		debug.Func(func() {
+			debug.Assertf(!strings.HasPrefix(params.ArchPath, lom.ObjName),
+				"expecting archpath _in_ archive, got (%q, %q)", params.ArchPath, lom.ObjName)
+		})
 		query.Set(apc.QparamArchpath, params.ArchPath)
 	}
 

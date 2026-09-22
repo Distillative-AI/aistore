@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 
 import unittest
@@ -9,6 +9,7 @@ import tarfile
 
 from aistore.sdk.batch.extractor.tar_stream_extractor import TarStreamExtractor
 from aistore.sdk.batch.types import MossReq, MossIn, MossOut, MossResp
+from aistore.sdk.const import GB_MISSING_FILES_DIR
 
 
 # pylint: disable=duplicate-code
@@ -74,7 +75,9 @@ class TestTarStreamExtractor(unittest.TestCase):
         self.assertEqual(moss_out.bucket, "test-bucket")
 
         # Verify tarfile was opened correctly - use ANY for BytesIO comparison
-        mock_tar_open.assert_called_once_with(fileobj=ANY, mode="r|*")
+        mock_tar_open.assert_called_once_with(
+            fileobj=ANY, mode="r|*", bufsize=64 * 1024
+        )
 
     @patch("tarfile.open")
     def test_skip_non_file_entries(self, mock_tar_open):
@@ -396,7 +399,7 @@ class TestTarStreamExtractor(unittest.TestCase):
 
     @patch("tarfile.open")
     def test_extraction_with_opaque(self, mock_tar_open):
-        """Test that opaque data flows through from MossResp."""
+        """Preserve opaque bytes in multipart and streaming metadata."""
         # Create MossReq
         moss_req = MossReq(
             moss_in=[
@@ -445,6 +448,21 @@ class TestTarStreamExtractor(unittest.TestCase):
         moss_out, _ = result[0]
         self.assertEqual(moss_out.opaque, b"user-tracking-id")
 
+        moss_req.streaming_get = True
+        for encoded, opaque in (
+            ("dXNlci1pZC0xMjM=", b"user-id-123"),
+            ("+/8=", b"\xfb\xff"),
+            (None, None),
+        ):
+            with self.subTest(opaque=opaque):
+                moss_req.moss_in[0] = moss_req.moss_in[0].model_copy(
+                    update={"opaque": encoded}
+                )
+                result = list(
+                    self.tar_extractor.extract(self.mock_response, BytesIO(), moss_req)
+                )
+                self.assertEqual(result[0][0].opaque, opaque)
+
     @patch("tarfile.open")
     def test_empty_tar_file(self, mock_tar_open):
         """Test handling of empty tar files."""
@@ -466,3 +484,44 @@ class TestTarStreamExtractor(unittest.TestCase):
         self.assertEqual(len(result), 0)
         # Verify response was closed at the end
         self.mock_response.close.assert_called_once()
+
+    @patch("tarfile.open")
+    def test_missing_entry_error_message(self, mock_open):
+        """Infer streaming errors from markers and preserve supplied server errors."""
+        request = self.moss_req
+        request.only_obj_name = False
+        request.moss_in[1] = request.moss_in[1].model_copy(
+            update={"obj_name": f"{GB_MISSING_FILES_DIR}/empty.txt"}
+        )
+        archive = mock_open.return_value.__enter__.return_value
+        names = [
+            f"{GB_MISSING_FILES_DIR}/test-bucket/missing.txt",
+            f"test-bucket/{GB_MISSING_FILES_DIR}/empty.txt",
+        ]
+        # Local shard-load failure, local file failure, and forwarded file failure.
+        request.extend(
+            [request.moss_in[0].model_copy(update={"archpath": "/file.txt"})] * 3
+        )
+        names.extend([names[0], names[0] + "/file.txt", names[0] + "//file.txt"])
+        members = [Mock() for _ in names]
+        for member, name in zip(members, names):
+            member.name = name
+            member.isfile.return_value = True
+        archive.__iter__.return_value = members
+        archive.extractfile.side_effect = lambda _: BytesIO()
+        results = list(self.tar_extractor.extract(Mock(), BytesIO(), request))
+        self.assertEqual(
+            [out.err_msg for out, _ in results],
+            ["Batch entry failed on the server", None]
+            + ["Batch entry failed on the server"] * 3,
+        )
+        request.streaming_get = False
+        metadata = MossResp(out=[out for out, _ in results])
+        for out in metadata.out:
+            if out.err_msg:
+                out.err_msg = "server error details"
+        results = list(self.tar_extractor.extract(Mock(), BytesIO(), request, metadata))
+        self.assertEqual(
+            [out.err_msg for out, _ in results],
+            ["server error details", None] + ["server error details"] * 3,
+        )

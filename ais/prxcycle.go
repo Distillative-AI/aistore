@@ -349,7 +349,7 @@ func (p *proxy) mcastMaintPostReb(msg *apc.ActMsg, nodes meta.Nodes, tnames []st
 
 	sids := make([]string, 0, len(nodes))
 	for _, si := range nodes {
-		debug.Assert(si.IsTarget(), si.StringEx())
+		debug.Func(func() { debug.Assert(si.IsTarget(), si.StringEx()) })
 		sids = append(sids, si.ID())
 	}
 	nlog.Infoln(p.String(), tag, msg.String(), tnames)
@@ -1028,7 +1028,7 @@ func (p *proxy) httpcludel(w http.ResponseWriter, r *http.Request, isPub bool) {
 		return
 	}
 
-	if ecode, err := p.checkIntra(r, false /*only primary*/); err != nil {
+	if ecode, err := p.checkIntra(r, smap, false /*only primary*/); err != nil {
 		err = fmt.Errorf("%w (action %q)", err, apc.ActSelfRemove)
 		p.writeErr(w, r, err, ecode)
 		return

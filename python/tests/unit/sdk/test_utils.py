@@ -80,6 +80,7 @@ class TestUtils(unittest.TestCase):
         mock_file = Mock()
         mock_file.stat.return_value = Mock(st_size=test_case[0])
         self.assertEqual(test_case[1], get_file_size(mock_file))
+        mock_file.stat.assert_called_once()
 
     @patch("aistore.sdk.utils.logging.getLogger")
     def test_get_logger_adds_local_handler_when_only_ancestor_has_one(
@@ -174,9 +175,7 @@ class TestUtils(unittest.TestCase):
         mock_xxhash.return_value.intdigest.return_value = 987654321
         name = "test_object"
         result = get_digest(name)
-        mock_xxhash.assert_called_once_with(
-            seed=XX_HASH_SEED, input=name.encode("utf-8")
-        )
+        mock_xxhash.assert_called_once_with(name.encode("utf-8"), seed=XX_HASH_SEED)
         self.assertEqual(result, 987654321)
 
     def test_get_provider_from_request(self):

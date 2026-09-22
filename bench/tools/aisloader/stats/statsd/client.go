@@ -1,6 +1,6 @@
 // Package statsd provides a client to send basic statd metrics (timer, counter and gauge) to listening UDP StatsD server.
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package statsd
 
@@ -150,7 +150,7 @@ func (c *Client) Send(bucket string, aggCnt int64, metrics ...Metric) {
 // NOTE: ignoring potential race vs client.Close() - disregarding write errors, if any
 func (c *Client) SendSGL(sgl *memsys.SGL) {
 	l := sgl.Len()
-	debug.Assert(l < sgl.Slab().Size(), l, " vs slab ", sgl.Slab().Size())
+	debug.Func(func() { debug.Assert(l < sgl.Slab().Size(), l, " vs slab ", sgl.Slab().Size()) })
 	if !c.opened || l == 0 {
 		return
 	}

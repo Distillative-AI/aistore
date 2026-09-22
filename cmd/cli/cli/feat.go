@@ -25,7 +25,7 @@ const (
 )
 
 var clusterFeatDesc = [...]string{
-	"Deprecated: use auth.intra_cluster to secure intra-cluster communications",
+	"reserved", // bit 0 reserved since v5.1
 	"skip loading existing object's metadata, Version and Checksum (VC) in particular (advanced usage only)",
 	"do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS",
 	"handle s3 requests via `aistore-hostname/` (default: `aistore-hostname/s3`)",
@@ -45,7 +45,7 @@ var clusterFeatDesc = [...]string{
 	"when checking whether objects are identical trust only cryptographically secure checksums",
 	"when versioning info is requested, use ListObjectVersions API (beware: extremely slow, versioned S3 buckets only)",
 	"include (bucket, xaction) Prometheus variable labels with every GET and PUT transaction",
-	"system-reserved (do not set: the flag may be redefined or removed at any time)",
+	"force container-based CPU and memory metrics when automated environment detection fails (restart required)",
 	"resume interrupted multipart uploads from persisted partial manifests",
 	"do not delete unrecognized/invalid FQNs during space cleanup ('ais space-cleanup')",
 	"when bucket is n-way mirrored read object replica from the least-utilized mountpath",
@@ -53,14 +53,13 @@ var clusterFeatDesc = [...]string{
 	"publish selected Go runtime metrics via Prometheus",
 	"allow downloader egress to private RFC1918/ULA addresses; loopback and link-local remain blocked",
 	"allow S3 clients that rebuild redirected requests instead of following the Location URI (forbidden when AuthN or intra-cluster signing is configured)",
-	"offload TLS transmit path to the kernel and enable Linux sendfile(2)",
+	"offload TLS transmit path to the kernel and enable Linux sendfile (reserved for internal use; may be redefined or removed at any time)",
 
 	// apc.ResetToken ("none") ===========
 }
 
 // best-effort tags to group features in help output
 var featTags = map[string]string{
-	"Enforce-IntraCluster-Access":          "security",
 	"Skip-Loading-VersionChecksum-MD":      "perf,integrity-",
 	"Do-not-Auto-Detect-FileShare":         "promote,ops",
 	"S3-API-via-Root":                      "s3,compat,ops",
@@ -80,7 +79,7 @@ var featTags = map[string]string{
 	"Trust-Crypto-Safe-Checksums":          "integrity+,overhead",
 	"S3-ListObjectVersions":                "s3,overhead",
 	"Enable-Detailed-Prom-Metrics":         "telemetry,overhead",
-	"System-Reserved":                      "ops",
+	"Force-Container-CPU-Mem":              "deploy",
 	"Resume-Interrupted-MPU":               "mpu,ops",
 	"Keep-Unknown-FQN":                     "integrity?,ops",
 	"Load-Balance-GET":                     "perf",
@@ -88,7 +87,7 @@ var featTags = map[string]string{
 	"Enable-Go-Runtime-Metrics":            "telemetry,ops,overhead",
 	"Dload-Allow-Private-Egress":           "security-",
 	"S3-Redirect-Rebuild":                  "s3,compat,security-",
-	"Sendfile-Over-HTTPS":                  "perf,net,ops,compat",
+	"System-Reserved-KTLS":                 "perf,net,ops,compat",
 }
 
 // common (cluster, bucket) feature-flags (set, show) helper
@@ -100,6 +99,9 @@ func printFeatVerbose(c *cli.Context, flags feat.Flags, scopeBucket bool) error 
 
 func _flattenFeat(flags feat.Flags, scopeBucket bool) (flat nvpairList) {
 	for i, f := range feat.Cluster {
+		if i == 0 { // bit 0 reserved since v5.1
+			continue
+		}
 		if scopeBucket && !feat.IsBucketScope(f) {
 			continue
 		}

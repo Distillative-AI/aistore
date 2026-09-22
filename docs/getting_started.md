@@ -256,11 +256,12 @@ $ make aisloader # build aisloader tool
 
 $ aisloader -bucket=ais://abc -duration 2m -numworkers=8 -minsize=1K -maxsize=1K -pctput=100 --cleanup=false # run aisloader for 2 minutes (8 workers, 1KB size, 100% write, no cleanup)
 ```
+**NOTE:** `aisloader` does PUT requests on AIStore with 1 KiB objects. In the local playground, AIStore stores these objects in mountpaths under `/tmp`, potentially exhausting the file system's inodes. If this happens, rerun Step 2 to reset the playground, then rerun the benchmark with larger objects for a shorter duration.
 
 #### Step 4: Run iostat (or use any of the multiple [documented](/docs/monitoring-prometheus.md) ways to monitor AIS performance)
 
 ```console
-$ iostat -dxm 10 sda sdb
+$ iostat -dxm 10 <disk_name>
 ```
 
 #### Running Local Playground with emulated disks
@@ -294,7 +295,13 @@ index c5e0e4fae..46085e19c 100755
 * Step 2: deploy a single target with two loopback devices (1GB size each):
 
 ```console
-$ make kill clean cli deploy <<< $'1\n1\n4\ny\ny\nn\n1G\n'
+$ TEST_LOOPBACK_SIZE=1G make kill cli deploy <<< $'1\n1\n2'
+```
+
+or more conveniently,
+
+```console
+$ ./scripts/clean_deploy.sh --target-cnt 1 --proxy-cnt 1 --mountpath-cnt 2 --loopback 1G
 ```
 
 or, same:
@@ -766,6 +773,8 @@ In addition, to build [AuthN](/docs/authn.md), [CLI](/docs/cli.md), and/or [aisl
 * `make aisloader`
 
 respectively. With each of these `make`s, you can also use `MODE=debug` - debug mode is universally supported.
+
+> For **(experimental)** [Delve](https://github.com/go-delve/delve) debugging of a local playground cluster, see [deploy/dev/local/debugging.md](/deploy/dev/local/debugging.md).
 
 ### Containerized Deployments: Host Resource Sharing
 

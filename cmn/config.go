@@ -413,7 +413,7 @@ type (
 		MaxHostBusy   cos.Duration `json:"max_host_busy"`     // 2-phase transactions and more
 		Startup       cos.Duration `json:"startup_time"`      // primary wait for joins at (primary's) startup; indirectly, cluster startup
 		JoinAtStartup cos.Duration `json:"join_startup_time"` // (join cluster at startup) timeout; (2 * Startup) when zero
-		SendFile      cos.Duration `json:"send_file_time"`    // large file or blob and/or slow network
+		SendFile      cos.Duration `json:"send_file_time"`    // global maximum for large-size data flows, including blob chunk reads
 		// intra-cluster EC streams; default SharedStreamsDflt; never timeout when negative
 		EcStreams cos.Duration `json:"ec_streams_time,omitempty"`
 		// object metadata timeout; for training apps an approx. duration of 2 (two) epochs
@@ -2090,7 +2090,7 @@ const (
 	MaxMonolithicSize    = cos.TiB
 	minMaxMonolithicSize = cos.GiB
 
-	ChunkSizeMin  = cos.KiB
+	ChunkSizeMin  = 32 * cos.KiB
 	ChunkSizeDflt = cos.GiB
 	ChunkSizeMax  = 5 * cos.GiB
 
@@ -2607,8 +2607,14 @@ func (c *AuthConf) NodeJoinNonceWindow() time.Duration {
 	return c.IntraCluster.NonceWindow.D()
 }
 
-// Starting with v5.0, direct access to AIS targets is rejected when either AuthN
-// or intra-cluster request signing is configured: both require proxy mediation.
+// Starting with v5.0, RequiresProxyMediation reports whether unmarked requests arriving
+// directly on a target's public listener must be rejected. It returns true when either
+// client authentication or intra-cluster request signing is configured.
+//
+// This narrows the scope of an unsafe legacy capability; it is not data-plane
+// authentication. client_auth_required and intra_cluster.request_auth protect distinct
+// boundaries, neither implies the other, and all four combinations are valid.
+//
 // Note that auth.intra_cluster.node_join_secret_path is deliberately NOT part of this.
 func (c *AuthConf) RequiresProxyMediation() bool {
 	return c.ClientAuthRequired || c.IntraRequestAuthConfigured()
@@ -3014,8 +3020,10 @@ func (c *FSPConf) MarshalJSON() ([]byte, error) {
 }
 
 func (c *FSPConf) Validate(contextConfig *Config) error {
-	debug.Assertf(slices.Contains([]string{apc.Proxy, apc.Target}, contextConfig.role),
-		"unexpected node type: %q", contextConfig.role)
+	debug.Func(func() {
+		debug.Assertf(slices.Contains([]string{apc.Proxy, apc.Target}, contextConfig.role),
+			"unexpected node type: %q", contextConfig.role)
+	})
 
 	// Don't validate in testing environment.
 	if contextConfig.TestingEnv() || contextConfig.role != apc.Target {

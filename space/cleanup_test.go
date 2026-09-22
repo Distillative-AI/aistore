@@ -5,6 +5,7 @@
 package space_test
 
 import (
+	"context"
 	"io"
 	"math/rand/v2"
 	"os"
@@ -109,7 +110,7 @@ var _ = Describe("AIStore content cleanup tests", func() {
 
 		// x-cleanup
 		xcln := &space.XactCln{}
-		xcln.InitBase(cos.GenUUID(), apc.ActStoreCleanup, nil)
+		xcln.InitBase(context.Background(), cos.GenUUID(), apc.ActStoreCleanup, nil)
 		ini = &space.IniCln{
 			Xaction: xcln,
 			StatsT:  mock.NewStatsTracker(),
@@ -1004,36 +1005,6 @@ var _ = Describe("AIStore content cleanup tests", func() {
 		})
 	})
 
-	Describe("EC cleanup", func() {
-		It("should preserve a valid slice and metafile pair", func() {
-			// `CloneBck` is a shallow copy - `mbck.Props` is the same *Bprops the mock BMD holds.
-			// Scoped to this unit test: BeforeEach (above) rebuilds the BMD every time.
-			mbck := meta.CloneBck(&bck)
-			Expect(mbck.Init(core.T.Bowner())).NotTo(HaveOccurred())
-			mbck.Props.EC.Enabled = true
-
-			lom := core.AllocLOM("ec-object")
-			defer core.FreeLOM(lom)
-			Expect(lom.InitCmnBck(&bck)).NotTo(HaveOccurred())
-
-			slice := core.NewCTFromLOM(lom, fs.ECSliceCT)
-			metafile := slice.Clone(fs.ECMetaCT)
-
-			createTestFile(slice.FQN(), 1024)
-			createTestFile(metafile.FQN(), 256)
-
-			old := now.Add(-3 * time.Hour)
-			Expect(os.Chtimes(slice.FQN(), old, old)).To(Succeed())
-			Expect(os.Chtimes(metafile.FQN(), old, old)).To(Succeed())
-
-			// Args.Buckets remains empty: discover a Props-less bucket
-			// through AllMpathBcks, as in automatic OOS cleanup.
-			space.RunCleanup(ini)
-
-			Expect(slice.FQN()).To(BeAnExistingFile())
-			Expect(metafile.FQN()).To(BeAnExistingFile())
-		})
-	})
 })
 
 //

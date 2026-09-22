@@ -1,5 +1,4 @@
 import os
-import sys
 import unittest
 import time
 import threading
@@ -15,6 +14,8 @@ from aistore.sdk.const import (
     HEADER_NODE_URL,
     HEADER_DIRECT_PUT_LENGTH,
     HEADER_CONTENT_LENGTH,
+    HEADER_CONNECTION,
+    HEADER_TRANSFER_ENCODING,
     ETL_WS_PIPELINE,
 )
 from aistore.sdk.etl.webserver.http_multi_threaded_server import HTTPMultiThreadedServer
@@ -22,6 +23,7 @@ from aistore.sdk.etl.webserver.flask_server import FlaskServer
 from aistore.sdk.etl.webserver.fastapi_server import FastAPIServer
 from aistore.sdk.etl.webserver.utils import parse_etl_pipeline
 from aistore.sdk.errors import InvalidPipelineError
+from tests.const import TEST_TIMEOUT
 
 CLEANUP_DELAY = 0.1  # Minimal delay for cleanup operations
 
@@ -301,7 +303,6 @@ class TestPipelineParsing(TestPipelineBase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Invalid pipeline", response.text)
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_fastapi_server_invalid_pipeline_validation(self):
         """Test FastAPI server properly validates malformed pipeline headers."""
@@ -318,6 +319,44 @@ class TestPipelineParsing(TestPipelineBase):
 
 class TestMultiServerPipelineIntegration(TestPipelineBase):
     """Integration tests with actual servers running on different ports."""
+
+    @pytest.mark.etl
+    def test_http_chunked_put_rejected(self):
+        """Reject a real chunked upload before transformation."""
+        etl = MockHTTPETLServer()
+        self.addCleanup(etl.session.close)
+        with HTTPServer(("127.0.0.1", 0), etl.RequestHandler) as server:
+            server.etl_server = etl
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_port}/test"
+                with requests.Session() as client:
+                    client.trust_env = False
+                    with patch.object(
+                        etl, "transform", wraps=etl.transform
+                    ) as transform:
+                        with client.put(
+                            url, data=iter([b"hello"]), timeout=TEST_TIMEOUT
+                        ) as response:
+                            self.assertEqual(
+                                response.request.headers[HEADER_TRANSFER_ENCODING],
+                                "chunked",
+                            )
+                            self.assertEqual(response.status_code, 501)
+                            self.assertEqual(
+                                response.headers[HEADER_CONNECTION], "close"
+                            )
+                        transform.assert_not_called()
+                    with client.put(
+                        url, data=b"hello", timeout=TEST_TIMEOUT
+                    ) as response:
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(response.content, b"HELLO")
+            finally:
+                server.shutdown()
+                thread.join(timeout=TEST_TIMEOUT)
+                self.assertFalse(thread.is_alive())
 
     @pytest.mark.etl
     def test_http_to_http_pipeline_chain(self):
@@ -451,7 +490,6 @@ class TestMultiServerPipelineIntegration(TestPipelineBase):
             "http://localhost:19023/target", result, headers={}
         )
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_fastapi_to_fastapi_pipeline_chain(self):
         """Test pipeline forwarding between multiple FastAPI servers."""
@@ -478,7 +516,6 @@ class TestMultiServerPipelineIntegration(TestPipelineBase):
         self.assertEqual(response.content, result)
         self.assertEqual(response.headers.get(HEADER_CONTENT_LENGTH), str(len(result)))
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_fastapi_to_target_pipeline_chain(self):
         """Test pipeline forwarding between FastAPI servers ending with a target server."""
@@ -546,7 +583,6 @@ class TestMultiServerPipelineIntegration(TestPipelineBase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, result)
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_three_way_mixed_pipeline(self):
         """Test HTTP -> Flask -> FastAPI pipeline."""
@@ -593,7 +629,6 @@ class TestMultiServerPipelineIntegration(TestPipelineBase):
         self.assertIn(b"/nonexistent", response.content)
         self.assertIn(b"ConnectionError", response.content)
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_long_pipeline_chain(self):
         """Test a longer pipeline with 5 servers."""
@@ -689,7 +724,6 @@ class TestMultiServerPipelineIntegration(TestPipelineBase):
 class TestWebSocketPipelineIntegration(TestPipelineBase):
     """Test WebSocket ETL pipeline integration with various server types."""
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_websocket_to_http_pipeline(self):
         """Test WebSocket client connecting to FastAPI server with HTTP pipeline."""
@@ -715,7 +749,6 @@ class TestWebSocketPipelineIntegration(TestPipelineBase):
             )
             self.assertEqual(result, expected)
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_websocket_to_flask_pipeline(self):
         """Test WebSocket client connecting to FastAPI server with Flask pipeline."""
@@ -741,7 +774,6 @@ class TestWebSocketPipelineIntegration(TestPipelineBase):
             )
             self.assertEqual(result, expected)
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_websocket_to_fastapi_pipeline(self):
         """Test WebSocket client connecting to FastAPI server with FastAPI pipeline."""
@@ -767,7 +799,6 @@ class TestWebSocketPipelineIntegration(TestPipelineBase):
             )
             self.assertEqual(result, expected)
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_websocket_to_target_direct_pipeline(self):
         """Test WebSocket client connecting to FastAPI server with direct target pipeline."""
@@ -803,7 +834,6 @@ class TestWebSocketPipelineIntegration(TestPipelineBase):
                     headers={HEADER_CONTENT_LENGTH: str(len(expected_data))},
                 )
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_websocket_multi_stage_pipeline(self):
         """Test WebSocket with multi-stage pipeline (HTTP->Flask->FastAPI)."""
@@ -833,7 +863,6 @@ class TestWebSocketPipelineIntegration(TestPipelineBase):
 
             self.assertEqual(result, expected)
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_websocket_pipeline_error_handling(self):
         """Test WebSocket error handling when pipeline target fails."""
@@ -854,7 +883,6 @@ class TestWebSocketPipelineIntegration(TestPipelineBase):
             # Should receive error message
             self.assertIn("0", result)  # Error indicated by 0 length
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_websocket_invalid_pipeline_format(self):
         """Test WebSocket with invalid pipeline format."""
@@ -875,7 +903,6 @@ class TestWebSocketPipelineIntegration(TestPipelineBase):
             # Should receive error message about invalid pipeline
             self.assertIn("Invalid pipeline", result)
 
-    @unittest.skipIf(sys.version_info < (3, 9), "requires Python 3.9 or higher")
     @pytest.mark.etl
     def test_websocket_no_pipeline_fallback(self):
         """Test WebSocket behavior without pipeline (fallback to direct response)."""

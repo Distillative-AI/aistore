@@ -5,6 +5,7 @@
 package load
 
 import (
+	"runtime"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn"
@@ -71,9 +72,39 @@ func (a *Advice) ShouldCheck(n int64) bool {
 	return n&a.Batch == a.Batch
 }
 
-// recompute throttling recommendation; note:
-// disk requires config and, optionally, mountpath
+// throttle the caller once per batch:
+// - refresh the recommendation (a.k.a. load advice)
+// - sleep if advised and return true
+// - otherwise, optionally yield (runtime.Gosched) and return false
+func (a *Advice) Throttle(n int64, yield ...bool) bool {
+	if !a.ShouldCheck(n) {
+		return false
+	}
+	a.Refresh()
+	if a.Sleep > 0 {
+		time.Sleep(a.Sleep)
+		return true
+	}
+	if len(yield) > 0 && yield[0] {
+		runtime.Gosched()
+	}
+	return false
+}
+
+// - refresh, and:
+// - critical memory pressure also triggers free-to-OS
+// - disk requires config and, optionally, mountpath
 func (a *Advice) Refresh() {
+	a.refresh(true /*allowFreeToOS*/)
+}
+
+// same as above, except: not allowing free-to-OS
+// (for callers that must release owned memory first)
+func (a *Advice) RefreshNoGC() {
+	a.refresh(false /*allowFreeToOS*/)
+}
+
+func (a *Advice) refresh(allowFreeToOS bool) {
 	var (
 		mi  *fs.Mountpath
 		cfg *cmn.DiskConf
@@ -81,7 +112,7 @@ func (a *Advice) Refresh() {
 	if a.flags&FlDsk != 0 {
 		mi, cfg = a.extra.Mi, a.extra.Cfg
 	}
-	a.loads = refresh(a.flags, mi, cfg)
+	a.loads = refresh(a.flags, mi, cfg, allowFreeToOS)
 
 	// reset optimistically
 	a.Sleep = 0

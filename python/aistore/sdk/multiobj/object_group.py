@@ -43,6 +43,9 @@ class ObjectGroup(AISSource):
         obj_names (list[str], optional): List of object names to include in this collection
         obj_range (ObjectRange, optional): Range defining which object names in the bucket should be included
         obj_template (str, optional): String argument to pass as template value directly to api
+
+    Raises:
+        ValueError: If the selection is empty or more than one selection is provided.
     """
 
     def __init__(
@@ -60,6 +63,8 @@ class ObjectGroup(AISSource):
             raise ValueError(
                 "ObjectGroup accepts one and only one of: obj_names, obj_range, or obj_template"
             )
+        if (obj_names is not None and not obj_names) or obj_template == "":
+            raise ValueError("Object selection must not be empty")
         if obj_range and not isinstance(obj_range, ObjectRange):
             raise TypeError("obj_range must be of type ObjectRange")
 
@@ -145,7 +150,7 @@ class ObjectGroup(AISSource):
         Raises:
             aistore.sdk.errors.AISError: All other types of errors with AIStore
             requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
+            requests.ConnectTimeout: Timed out connecting to AIStore
             requests.exceptions.HTTPError: Service unavailable
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
             requests.ReadTimeout: Timed out receiving response from AIStore
@@ -169,7 +174,7 @@ class ObjectGroup(AISSource):
         Raises:
             aistore.sdk.errors.AISError: All other types of errors with AIStore
             requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
+            requests.ConnectTimeout: Timed out connecting to AIStore
             requests.exceptions.HTTPError: Service unavailable
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
             requests.ReadTimeout: Timed out receiving response from AIStore
@@ -208,7 +213,7 @@ class ObjectGroup(AISSource):
         Raises:
             aistore.sdk.errors.AISError: All other types of errors with AIStore
             requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
+            requests.ConnectTimeout: Timed out connecting to AIStore
             requests.exceptions.HTTPError: Service unavailable
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
             requests.ReadTimeout: Timed out receiving response from AIStore
@@ -264,7 +269,7 @@ class ObjectGroup(AISSource):
         Raises:
             aistore.sdk.errors.AISError: All other types of errors with AIStore
             requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
+            requests.ConnectTimeout: Timed out connecting to AIStore
             requests.exceptions.HTTPError: Service unavailable
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
             requests.ReadTimeout: Timed out receiving response from AIStore
@@ -273,13 +278,14 @@ class ObjectGroup(AISSource):
             List[str]: List of job IDs that can be used to check the status of the operation
 
         """
+        object_selection = self._obj_collection.get_value()
         if dry_run:
             logger = logging.getLogger(f"{__name__}.copy")
             logger.info(
                 "Copy dry-run. Running with dry_run=False will copy the following objects from bucket '%s' to '%s': %s",
                 f"{self.bck.get_path()}",
                 f"{to_bck.get_path()}",
-                list(self._obj_collection),
+                object_selection,
             )
         copy_msg = CopyBckMsg(
             prepend=prepend, dry_run=dry_run, force=force, latest=latest, sync=sync
@@ -288,7 +294,7 @@ class ObjectGroup(AISSource):
         value = TCMultiObj(
             to_bck=to_bck.as_model(),
             tc_msg=TCBckMsg(copy_msg=copy_msg),
-            object_selection=self._obj_collection.get_value(),
+            object_selection=object_selection,
             continue_on_err=continue_on_error,
             num_workers=num_workers,
         ).as_dict()
@@ -341,7 +347,7 @@ class ObjectGroup(AISSource):
         Raises:
             aistore.sdk.errors.AISError: All other types of errors with AIStore
             requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
+            requests.ConnectTimeout: Timed out connecting to AIStore
             requests.exceptions.HTTPError: Service unavailable
             requests.RequestException: "There was an ambiguous exception that occurred while handling..."
             requests.ReadTimeout: Timed out receiving response from AIStore
@@ -350,12 +356,13 @@ class ObjectGroup(AISSource):
             Job ID (as str) that can be used to check the status of the operation
 
         """
+        object_selection = self._obj_collection.get_value()
         if dry_run:
             logger = logging.getLogger(f"{__name__}.transform")
             logger.info(
                 "Transform dry-run. Running with dry_run=False will apply ETL '%s' to objects %s",
                 etl_name,
-                list(self._obj_collection),
+                object_selection,
             )
 
         copy_msg = CopyBckMsg(
@@ -367,7 +374,7 @@ class ObjectGroup(AISSource):
         value = TCMultiObj(
             to_bck=to_bck.as_model(),
             tc_msg=TCBckMsg(ext=ext, transform_msg=transform_msg, copy_msg=copy_msg),
-            object_selection=self._obj_collection.get_value(),
+            object_selection=object_selection,
             continue_on_err=continue_on_error,
             num_workers=num_workers,
         ).as_dict()

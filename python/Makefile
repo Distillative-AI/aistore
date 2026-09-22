@@ -5,7 +5,6 @@ PYTEST = $(PYTHON) -m pytest
 PIP ?= pip3
 PYAISLOADER_TEST_TYPE ?= short
 
-BOTO_UNIT_TEST_COUNT := $(shell ls -1 tests/unit/botocore_patch/test*py | wc -l)
 export AWS_SESSION_TOKEN := testing
 # will be fetched from CI pipeline secrets
 # export AWS_REGION := us-east-1
@@ -33,10 +32,9 @@ dev_deps:
 botocore_deps:
 	$(PIP) install --upgrade -r aistore/botocore_patch/botocore_requirements $(BOTO_VERSION_ARGS) --quiet
 
-# pylint/astroid need Python >=3.10 and are only needed for linting, so they're
-# kept out of common_requirements - common_deps runs under every supported
-# Python version (3.8+) across the test matrix, and pylint==4.0.7 would break
-# `pip install` outright on 3.8/3.9.
+# pylint/astroid are only needed for linting, so they're kept out of
+# common_requirements - common_deps runs under every supported Python version
+# across the test matrix and shouldn't pay for lint-only dependencies.
 .PHONY: lint_deps
 lint_deps:
 	$(PIP) install -r aistore/lint_requirements --quiet
@@ -68,15 +66,11 @@ python_sdk_unit_tests: common_deps
 
 .PHONY: mcp_deps
 mcp_deps:
-	@$(PYTHON) -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" 2>/dev/null && \
-		$(PIP) install "mcp[cli]>=1.4.1,<2" --quiet || \
-		echo "Skipping mcp install (requires Python >= 3.10)"
+	$(PIP) install "mcp[cli]>=1.4.1,<2" --quiet
 
 .PHONY: python_mcp_unit_tests
 python_mcp_unit_tests: common_deps mcp_deps
-	@$(PYTHON) -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" 2>/dev/null && \
-		$(PYTEST) -v tests/unit/mcp || \
-		echo "Skipping MCP tests (requires Python >= 3.10)"
+	$(PYTEST) -v tests/unit/mcp
 
 # Run tests with `extended` marker with `AIS_STRESS_TEST` to control increased object count, size, etc.
 .PHONY: python_sdk_extended_tests
@@ -100,8 +94,12 @@ python_s3_compat_test: s3_test_deps
 python_botocore_tests: common_deps botocore_deps python_botocore_unit_tests python_botocore_integration_tests
 
 .PHONY: python_botocore_unit_tests
+# xdist imports every test file in each worker, including the botocore patches.
+# Use a fresh process per file so unpatched tests keep the original botocore behavior.
 python_botocore_unit_tests: common_deps botocore_deps
-	$(PYTEST) -v -n $(BOTO_UNIT_TEST_COUNT) --dist loadfile  tests/unit/botocore_patch
+	@for test_file in tests/unit/botocore_patch/test*.py; do \
+		$(PYTEST) -v "$$test_file" || exit $$?; \
+	done
 
 .PHONY: python_botocore_integration_tests
 python_botocore_integration_tests: common_deps botocore_deps
@@ -173,4 +171,4 @@ python_sdk_coverage: python_sdk_unit_coverage python_sdk_integration_coverage
 	@coverage combine .coverage.unit .coverage.int
 	@coverage html -d htmlcov
 	@coverage xml -o coverage.xml
-	@echo "Overall SDK coverage report: python/htmlcov/index.html
+	@echo "Overall SDK coverage report: python/htmlcov/index.html"

@@ -76,6 +76,7 @@ type (
 		req        *http.Request
 		w          http.ResponseWriter
 		ctx        context.Context // context used when getting object from remote backend (access creds)
+		ktls       ktlsState       // connection-scoped TX state, if any
 		t          *target         // this
 		lom        *core.LOM       // obj
 		dpq        *dpq
@@ -102,6 +103,7 @@ type (
 		partialCksum *cos.CksumHash
 		nodeID       string
 		workFQN      string
+		tie          string
 	}
 	apndOI struct {
 		r       io.ReadCloser // content reader
@@ -728,7 +730,9 @@ do: // retry uplock or ec-recovery, the latter only once
 		}
 		goto fin // ok, done
 	case cold:
-		// have remote backend - use it
+		// discard stale metadata and restore any shortened name before the backend GET.
+		// cold PUT's RenameFinalize shortens it again for local storage if needed.
+		goi.lom.Reset()
 	case goi.latestVer:
 		// apc.QparamLatestVer or 'versioning.validate_warm_get'
 		res := goi.lom.CheckRemoteMD(true /* rlocked */, false /*synchronize*/, goi.req)
@@ -766,7 +770,7 @@ do: // retry uplock or ec-recovery, the latter only once
 		// try upgrading rlock => wlock
 		if !goi.lom.UpgradeLock() {
 			if uplock == nil {
-				uplock = goi.uplock(cmn.GCO.Get())
+				uplock = newUplock(cmn.GCO.Get(), goi.ltime)
 				nlog.Warningln(uplockWarn, goi.lom.String())
 			}
 			if err := uplock.do(goi.lom); err != nil {
@@ -1321,7 +1325,7 @@ func (goi *getOI) setwhdr(whdr http.Header, cksum *cos.Cksum, size int64) {
 	}
 
 	// when applicable, retire the kTLS-armed connection _after_ this response
-	ktlsTxRetire(goi.req, whdr, size)
+	ktlsRetire(goi.ktls, whdr, size)
 }
 
 // in particular, setup reader and writer and set headers
@@ -1333,7 +1337,7 @@ func (goi *getOI) _txreg(fqn string, lmfh cos.LomReader, whdr http.Header) (err 
 	// Tx
 	if goi.canSendfile(lmfh) {
 		// NOTE: net.sendFile unwraps io.LimitedReader before the syscall,
-		// so the wrap is free; ktlsTxConn.ReadFrom requires it (see ais/ktls)
+		// so the wrap is free; ktlsConn.ReadFrom requires it (see ais/ktls)
 		err = goi.sendfile(&io.LimitedReader{R: lmfh, N: size}, fqn, size, false /*committed*/)
 	} else {
 		buf, slab := goi.t.gmm.AllocSize(min(size, memsys.MaxPageSlabSize))
@@ -1366,7 +1370,7 @@ func (goi *getOI) _txarch(fqn string, lmfh cos.LomReader, whdr http.Header) erro
 		whdr.Set(cos.HdrContentLength, strconv.FormatInt(size, 10))
 
 		// see also: goi.setwhdr()
-		ktlsTxRetire(goi.req, whdr, size)
+		ktlsRetire(goi.ktls, whdr, size)
 
 		buf, slab := goi.t.gmm.AllocSize(_txsize(size))
 		err = goi.transmit(csl, buf, fqn, size, false /*committed*/)
@@ -1390,7 +1394,7 @@ func (goi *getOI) _txarch(fqn string, lmfh cos.LomReader, whdr http.Header) erro
 
 	// (compare w/ goi.setwhdr) - size is not known until ReadUntil completes
 	// TODO: might be too conservative for .tar; might be not enough for .tgz et al. compressed
-	ktlsTxRetire(goi.req, whdr, lom.Lsize())
+	ktlsRetire(goi.ktls, whdr, lom.Lsize())
 
 	rcb := _newRcb(goi.w)
 	whdr.Set(cos.HdrContentType, cos.ContentTar)
@@ -1451,7 +1455,7 @@ func (goi *getOI) canSendfile(lmfh cos.LomReader) bool {
 	if goi.lom.IsChunked() {
 		return false
 	}
-	if !canSendfileRequest(goi.req, cmn.Rom.UseHTTPS()) {
+	if !canSendfileConn(goi.ktls, cmn.Rom.UseHTTPS()) {
 		return false
 	}
 
@@ -1465,8 +1469,8 @@ func (goi *getOI) canSendfile(lmfh cos.LomReader) bool {
 }
 
 // TODO: keeping it separate only for unit tests
-func canSendfileRequest(r *http.Request, useHTTPS bool) bool {
-	return !useHTTPS || (r != nil && isKTLSTx(r.Context()))
+func canSendfileConn(state ktlsState, useHTTPS bool) bool {
+	return !useHTTPS || (state != nil && state.isArmed())
 }
 
 func (goi *getOI) _txerr(err error, fqn string, written, size int64, committed bool) error {
@@ -1655,7 +1659,8 @@ func (a *apndOI) apnd(buf []byte) (packedHdl string, err error) {
 		workFQN = a.hdl.workFQN
 	)
 	if workFQN == "" {
-		workFQN = a.lom.GenFQN(fs.WorkCT, fs.WorkfileAppend)
+		a.hdl.tie = cos.GenTie()
+		workFQN = a.lom.GenFQN(fs.WorkCT, fs.WorkfileAppend, a.hdl.tie)
 		a.lom.Lock(false)
 		if a.lom.Load(false /*cache it*/, false /*locked*/) == nil {
 			_, a.hdl.partialCksum, err = cos.CopyFile(a.lom.FQN, workFQN, buf, a.lom.CksumType())
@@ -1684,7 +1689,7 @@ func (a *apndOI) apnd(buf []byte) (packedHdl string, err error) {
 		return "", err
 	}
 
-	packedHdl = a.pack(workFQN)
+	packedHdl = a.pack()
 
 	// stats (TODO: add `stats.FlushCount` for symmetry)
 	lat := time.Now().UnixNano() - a.started
@@ -1703,7 +1708,6 @@ func (a *apndOI) flush() (int, error) {
 	if a.hdl.workFQN == "" {
 		return 0, fmt.Errorf("failed to finalize append-file operation: empty source in the %+v handle", a.hdl)
 	}
-
 	// finalize checksum
 	debug.Assert(a.hdl.partialCksum != nil)
 	a.hdl.partialCksum.Finalize()
@@ -1722,6 +1726,7 @@ func (a *apndOI) flush() (int, error) {
 			OverwriteDst: true,
 			DeleteSrc:    true, // NOTE: always overwrite and remove
 		},
+		SrcMustExist: true,
 	}
 	return a.t.Promote(&params)
 }
@@ -1734,34 +1739,57 @@ func (a *apndOI) parse(packedHdl string) error {
 	if err != nil {
 		return err
 	}
-	a.hdl.partialCksum = cos.NewCksumHash(items[2])
+	if items[0] != a.t.SID() {
+		return fmt.Errorf("invalid APPEND handle: %q is not %s", items[0], a.t.SID())
+	}
+	if !cos.ValidTie(items[1]) {
+		return fmt.Errorf("invalid APPEND handle: bad work tie-breaker %q", items[1])
+	}
+	if err := cos.ValidateCksumType(items[2]); err != nil {
+		return fmt.Errorf("invalid APPEND handle: %w", err)
+	}
 	buf, err := base64.StdEncoding.DecodeString(items[3])
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid APPEND handle: %w", err)
 	}
-	if err := a.hdl.partialCksum.H.(encoding.BinaryUnmarshaler).UnmarshalBinary(buf); err != nil {
-		return err
+	partialCksum := cos.NewCksumHash(items[2])
+	unmarshaler, ok := partialCksum.H.(encoding.BinaryUnmarshaler)
+	if !ok {
+		return fmt.Errorf("invalid APPEND handle: cannot resume %q", items[2])
+	}
+	if err := unmarshaler.UnmarshalBinary(buf); err != nil {
+		return fmt.Errorf("invalid APPEND handle: %w", err)
 	}
 
+	a.hdl.partialCksum = partialCksum
 	a.hdl.nodeID = items[0]
-	a.hdl.workFQN = items[1]
+	a.hdl.tie = items[1]
+	a.hdl.workFQN = a.lom.GenFQN(fs.WorkCT, fs.WorkfileAppend, a.hdl.tie)
 	return nil
 }
 
-func (a *apndOI) pack(workFQN string) string {
+func (a *apndOI) pack() string {
 	buf, err := a.hdl.partialCksum.H.(encoding.BinaryMarshaler).MarshalBinary()
 	debug.AssertNoErr(err)
 	cksumTy := a.hdl.partialCksum.Type()
 	cksumBinary := base64.StdEncoding.EncodeToString(buf)
-	return a.t.SID() + appendHandleSepa + workFQN + appendHandleSepa + cksumTy + appendHandleSepa + cksumBinary
+	return a.t.SID() + appendHandleSepa + a.hdl.tie + appendHandleSepa + cksumTy +
+		appendHandleSepa + cksumBinary
 }
 
 //
 // COPY (object | reader)
 //
 
+// error context for copy/transform (TCB, TCO) destination name validation
+const badTcRequest = "bad copy/transform request"
+
 // main method
 func (coi *coi) do(t *target, dm *bundle.DM, lom *core.LOM) (res xs.CoiRes) {
+	// destination is concatenated onto a mountpath (reject traversal)
+	if err := cos.ValidateOname(coi.ObjnameTo); err != nil {
+		return xs.CoiRes{Err: fmt.Errorf("%s: %w", badTcRequest, err)}
+	}
 	if coi.ETLArgs == nil {
 		coi.ETLArgs = &core.ETLArgs{}
 	}
@@ -2354,11 +2382,11 @@ func (t *target) putMirror(lom *core.LOM) {
 
 const uplockWarn = "conflict getting remote"
 
-func (goi *getOI) uplock(c *cmn.Config) (u *_uplock) {
+func newUplock(c *cmn.Config, ltime int64) (u *_uplock) {
 	u = &_uplock{sleep: cmn.ColdGetConflictMin}
 
 	// jitter
-	j := (goi.ltime & 0x7) - 3
+	j := (ltime & 0x7) - 3
 	jitter := time.Millisecond * time.Duration(j<<1)
 	u.sleep += jitter
 

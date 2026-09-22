@@ -42,12 +42,14 @@ type (
 		Cksum           *cos.Cksum  // checksum to validate
 		Config          *cmn.Config // during xaction
 		Xact            Xact        // responsible xaction
+		SrcMustExist    bool        // when true, a missing SrcFQN is an error and not a no-op
 		apc.PromoteArgs             // all of the above
 	}
 
 	BlobParams struct {
-		Lom *LOM
-		Msg *apc.BlobMsg
+		Lom     *LOM
+		Msg     *apc.BlobMsg
+		Context context.Context // optional; defaults to context.Background()
 
 		BlobThreshold int64 // minimum remote object size (bytes); zero disables threshold selection
 

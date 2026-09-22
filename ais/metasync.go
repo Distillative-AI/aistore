@@ -1,6 +1,6 @@
 // Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -88,9 +88,8 @@ const (
 	revsConfTag  = "Conf"
 	revsTokenTag = "token"
 	revsEtlMDTag = "EtlMD"
-	revsCSKTag   = "csk" // obsolete & removed in 5.0; keeping for an unlikely mixed-version case
 
-	revsMaxTags   = 7         // NOTE
+	revsMaxTags   = 6         // NOTE
 	revsActionTag = "-action" // prefix revs tag
 )
 

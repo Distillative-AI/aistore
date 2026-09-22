@@ -29,6 +29,11 @@ import (
 	jsoniter "github.com/json-iterator/go"
 )
 
+const (
+	maxDeleteXMLSize     = 8 * cos.MiB // 1000 entries: 6x-escaped 1KiB key, 1KiB version ID, XML tags
+	maxVersioningXMLSize = 4 * cos.KiB // Status and optional MFADelete only; ample XML headroom
+)
+
 var (
 	errS3Req    = errors.New("invalid s3 request")
 	errS3Obj    = errors.New("missing or empty object name")
@@ -37,6 +42,11 @@ var (
 
 // [METHOD] /s3
 func (p *proxy) s3Handler(w http.ResponseWriter, r *http.Request) {
+	if !p.cluStartedWithRetry() {
+		err := errors.New(http.StatusText(http.StatusServiceUnavailable))
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusServiceUnavailable})
+		return
+	}
 	if cmn.Rom.V(5, cos.ModS3) {
 		nlog.Infoln("s3Handler", p.String(), r.Method, r.URL)
 	}
@@ -275,10 +285,9 @@ func (p *proxy) delMultipleObjs(w http.ResponseWriter, r *http.Request, bucket s
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
-	decoder := xml.NewDecoder(r.Body)
 	lst := &s3.Delete{}
-	if err := decoder.Decode(lst); err != nil {
-		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
+	if ecode, err := s3.DecodeBodyXML(r, lst, maxDeleteXMLSize, "multi-object delete body"); err != nil {
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: ecode})
 		return
 	}
 	if len(lst.Object) == 0 {
@@ -364,17 +373,16 @@ func (p *proxy) listObjectsS3(w http.ResponseWriter, r *http.Request, bucket str
 	if bck == nil {
 		return
 	}
+	smap := p.owner.smap.get()
+	if err := smap.validate(); err != nil {
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusServiceUnavailable})
+		return
+	}
+	c := &lsoCtx{w: w, r: r, p: p, bck: bck, smap: smap}
 	if err := p.access(r, bck, apc.AceObjLIST); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
-	amsg := &apc.ActMsg{Action: apc.ActList}
-
-	// currently, always forwarding
-	if p.forwardCP(w, r, amsg, lsotag+" "+bck.String()) {
-		return
-	}
-
 	// e.g. <LastModified>2009-10-12T17:50:30.000Z</LastModified>
 	lsmsg := &apc.LsoMsg{TimeFormat: time.RFC3339, Flags: apc.LsIsS3}
 
@@ -382,7 +390,6 @@ func (p *proxy) listObjectsS3(w http.ResponseWriter, r *http.Request, bucket str
 	// NOTE (s3 api limitation): hard-coded props w/ apc.GetPropsCustom always included
 	//
 	lsmsg.AddProps(apc.GetPropsSize, apc.GetPropsChecksum, apc.GetPropsAtime, apc.GetPropsCustom)
-	amsg.Value = lsmsg
 
 	// as per API_ListObjectsV2.html, optional:
 	// - "max-keys"
@@ -396,21 +403,55 @@ func (p *proxy) listObjectsS3(w http.ResponseWriter, r *http.Request, bucket str
 	// - ListObjects "v1" ("marker"/"NextMarker")
 	maxKeys, err := s3.FillLsoMsg(q, lsmsg, bck.MaxPageSize())
 	if err != nil {
+		p.statsT.IncBck(stats.ErrListCount, bck.Bucket())
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusBadRequest, Code: s3.ErrCodeInvalidArgument})
 		return
 	}
 
+	// decode x-lso UUID and original continuation token, while keeping the client-sent token
+	// for the response (see below)
+	token := lsmsg.ContinuationToken
+	lsmsg.UUID, lsmsg.ContinuationToken = s3.DecodeToken(token)
+	c.lsmsg, c.s3tok = lsmsg, &token
+
 	// via NBI
 	if err := _setupNBI(r.Header, lsmsg); err != nil {
-		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
+		c.writeErr(err)
 		return
 	}
 
-	// "max-keys=0" is valid (list nothing)
-	var lst *cmn.LsoRes
+	// Zero-size S3 requests echo the wire token without starting a listing.
 	if maxKeys > 0 {
-		if lst, err = p.lsPageS3(bck, amsg, lsmsg, r.Header); err != nil {
-			s3.WriteErr(w, r, s3.ErrInfo{Err: err})
+		var psi *meta.Snode
+		psi, err = c.owner()
+		if err != nil {
+			c.writeErr(err)
+			return
+		}
+		if psi != nil {
+			c.forwardLSO(psi)
+			return
+		}
+	}
+	c.s3Page()
+}
+
+// execute lsPageS3 locally or on behalf of a peer (compare with lsoCtx.nativePage)
+func (c *lsoCtx) s3Page() {
+	var (
+		p       = c.p
+		bck     = c.bck
+		lsmsg   = c.lsmsg
+		token   = *c.s3tok
+		maxKeys = lsmsg.PageSize
+		lst     *cmn.LsoRes
+	)
+	// when max-keys is omitted, s3.FillLsoMsg defaults it to min(bck.MaxPageSize(), 1000);
+	// when max-keys is present and is 0 (zero) - skip this next-page block, but still return ListBucketResult w/ bucket name, etc.
+	if maxKeys > 0 {
+		var err error
+		if lst, err = c.lsPageS3(); err != nil {
+			c.writeErr(err)
 			return
 		}
 		if cmn.Rom.V(5, cos.ModS3) {
@@ -418,20 +459,24 @@ func (p *proxy) listObjectsS3(w http.ResponseWriter, r *http.Request, bucket str
 		}
 	}
 
-	// NOTE:
-	// - the following few lines of code translate (using additional memory) list-objects
+	// Note:
+	// - resp.FromLsoResult translates (using additional memory) list-objects
 	//   results into S3 format, and then use xml encoding to serialize the entire thing;
-	// - compare with native Go-based API that utilizes message pack encoding with
-	//   (certainly) no translations;
+	// - compare with native Go-based API that optimally utilizes message pack encoding with
+	//   no translations;
 	// - the implication: if, when working with very large remote datasets, list-objects performance
-	//   becomes an issue - consider using native API.
+	//   may become an issue - consider using native API.
 
-	resp := s3.NewListObjectResult(bucket, maxKeys)
-	resp.FromLsoResult(lst, lsmsg.ContinuationToken)
+	resp := s3.NewListObjectResult(bck.Name, maxKeys)
+	resp.FromLsoResult(lst, token)
+
+	// encode x-lso UUID and next continuation token
+	resp.NextContinuationToken = s3.EncodeToken(lsmsg.UUID, resp.NextContinuationToken)
+
 	sgl := p.gmm.NewSGL(0)
 	resp.MustMarshal(sgl)
-	w.Header().Set(cos.HdrContentType, cos.ContentXML)
-	sgl.WriteTo2(w)
+	c.w.Header().Set(cos.HdrContentType, cos.ContentXML)
+	sgl.WriteTo2(c.w)
 	sgl.Free()
 
 	// GC
@@ -467,9 +512,10 @@ func _setupNBI(hdr http.Header, lsmsg *apc.LsoMsg) error {
 	return nil
 }
 
-func (p *proxy) lsPageS3(bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg, hdr http.Header) (*cmn.LsoRes, error) {
+func (c *lsoCtx) lsPageS3() (*cmn.LsoRes, error) {
+	p, bck, lsmsg := c.p, c.bck, c.lsmsg
 	beg := mono.NanoTime()
-	page, err := p.lsPage(bck, amsg, lsmsg, hdr, p.owner.smap.get())
+	page, err := c.lsPage()
 	if err != nil {
 		return nil, err
 	}
@@ -477,8 +523,8 @@ func (p *proxy) lsPageS3(bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg, hdr
 	// NBI (native bucket inventory) is the only flow that can overshoot the requested page size:
 	// per the `apc.LsNBI` note, each target delivers an approximate share of `PageSize` (local
 	// chunking, minimum bounds, slight overfetch) and `finLsoNBI` merges those shares as-is.
-	if n := int(lsmsg.PageSize); len(page.Entries) > n {
-		debug.Assert(lsmsg.IsFlagSet(apc.LsNBI), len(page.Entries), n)
+	if n := int(lsmsg.PageSize); n > 0 && len(page.Entries) > n {
+		debug.AssertFunc(func() bool { return lsmsg.IsFlagSet(apc.LsNBI) }, len(page.Entries), n)
 		if lsmsg.IsFlagSet(apc.LsNBI) {
 			clear(page.Entries[n:])
 			page.Entries = page.Entries[:n]
@@ -797,10 +843,9 @@ func (p *proxy) putBckVersioningS3(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	decoder := xml.NewDecoder(r.Body)
 	vconf := &s3.VersioningConfiguration{}
-	if err := decoder.Decode(vconf); err != nil {
-		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
+	if ecode, err := s3.DecodeBodyXML(r, vconf, maxVersioningXMLSize, "bucket versioning body"); err != nil {
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: ecode})
 		return
 	}
 	enabled := vconf.Enabled()
@@ -832,13 +877,21 @@ func (p *proxy) initByNameOnly(w http.ResponseWriter, r *http.Request, bucket st
 	return bck
 }
 
-// [strict sign-verify] both redirect channels carry the signed URL:
-// - 307 Location: redurl signed via p.redurl (`svgrp` params);
-// - XML <Endpoint>: full redurl, XML-escaped (`&` => `&amp;`).
 // NOTE:
-//   - included python/aistore/botocore_patch follows the Location header verbatim (never parses <Endpoint>),
-//     so patched botocore/boto3 needs no change; the escaped <Endpoint> serves other XML-reading S3 clients.
-//   - the helper MAY execute reverse-proxy if configured
+// 1. AuthN and intra-cluster signing do NOT require feat.S3ReverseProxy (see below) -
+//    signed redirects let AIS targets verify proxy admission (while data flows directly client <=> target).
+//    Clients must preserve redirected Location;  body-carrying requests (e.g., PUT(object))
+//    also require replay support (net/http.GetBody).
+//    Enable reverse proxy IFF the client or deployment requires it.
+//
+// 2. python/aistore/botocore_patch follows the Location header verbatim (never parses <Endpoint>)
+//    so patched botocore/boto3 needs no change; the escaped <Endpoint> serves other XML-reading S3 clients.
+//
+// 3. when intra-cluster sign/verify enabled the proxy returns the signed target URL in both the HTTP Location header
+//    and the XML <Endpoint> field. Both include the signature needed by the target to verify the redirected request.
+//
+// See docs/s3compat.md for redirect compatibility and feature flags.
+
 func (p *proxy) s3Redirect(w http.ResponseWriter, r *http.Request, si *meta.Snode, smap *smapX, redurl, bucket string) {
 	// Deprecated: reverse-proxy S3 API call to a designated target
 	if cmn.Rom.Features().IsSet(feat.S3ReverseProxy) {
@@ -887,11 +940,8 @@ func (p *proxy) s3Redirect(w http.ResponseWriter, r *http.Request, si *meta.Snod
 // stamp/sign via intra headers - svReq.payload() excludes query/host/scheme,
 // so the URL rewrite below cannot invalidate the signature
 func (p *proxy) s3ReverseRequest(w http.ResponseWriter, r *http.Request, si *meta.Snode, smap *smapX) {
-	parsedURL, err := url.Parse(si.URL(cmn.NetIntraData))
-	debug.AssertNoErr(err)
-
 	p.setIntraHdrs(r, smap, si != nil)
-	p.reverseRequest(w, r, si.ID(), parsedURL)
+	p.reverseRequest(w, r, si.ID(), si.URL(cmn.NetIntraData), p.rpErrHandlerS3)
 }
 
 // escape `&` for XML content; signed redurl query separators

@@ -1,6 +1,6 @@
 // Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -33,7 +33,7 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		respErr    error
 		statusCode int
 	)
-	if !t.ensureIntraControl(w, r, false /* from primary */) {
+	if !t.ensureIntraControl(w, r, nil /*smap*/, false /* from primary */) {
 		return
 	}
 
@@ -55,7 +55,7 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 			dlb              = dload.Body{}
 			progressInterval = dload.DownloadProgressInterval
 		)
-		debug.Assertf(cos.IsValidUUID(xid) && cos.IsValidUUID(jobID), "%q, %q", xid, jobID)
+		debug.Func(func() { debug.Assertf(cos.IsValidUUID(xid) && cos.IsValidUUID(jobID), "%q, %q", xid, jobID) })
 		if err := cmn.ReadJSON(w, r, &dlb); err != nil {
 			return
 		}
@@ -166,7 +166,7 @@ func (t *target) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		xid := r.URL.Query().Get(apc.QparamUUID)
-		debug.Assertf(cos.IsValidUUID(xid), "%q", xid)
+		debug.Func(func() { debug.Assertf(cos.IsValidUUID(xid), "%q", xid) })
 		xdl, err := renewdl(xid, nil)
 		if err != nil {
 			t.writeErr(w, r, err, http.StatusInternalServerError)

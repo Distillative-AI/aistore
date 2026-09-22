@@ -857,6 +857,9 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 	return res
 }
 
+// clear intra-cluster headers
+// - this caller's identity must fully replace the orig. sender's, if any
+// - case in point: relay via forwardLSO (+ general protection)
 // stamp intra-cluster sender headers
 // - caller must ensure the destination is on intra-net
 // - see also namesake t.setIntraHdrs - a helper for external packages to call their own in another target
@@ -864,6 +867,20 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 // - r.URL.Path is done and won't change
 // - ditto, r.Body and ContentLength
 func (h *htrun) setIntraHdrs(req *http.Request, smap *smapX, peerPresent bool) {
+	if len(req.Header) > 0 {
+		// skip stdlib textproto.CanonicalMIMEHeaderKey overhead
+		delete(req.Header, apc.HdrSenderNonce)
+		delete(req.Header, apc.HdrSenderSig)
+
+		if smap.vstr == "" {
+			delete(req.Header, apc.HdrSenderIsPrimary)
+			delete(req.Header, apc.HdrSenderSmapVer)
+		} else if !smap.IsPrimary(h.si) {
+			delete(req.Header, apc.HdrSenderIsPrimary)
+		}
+	}
+
+	// apc.HdrSenderID and apc.HdrSenderName are always set (below)
 	if smap.vstr != "" {
 		if smap.IsPrimary(h.si) {
 			req.Header.Set(apc.HdrSenderIsPrimary, "true")
@@ -2651,8 +2668,8 @@ func (h *htrun) ensureSameSmap(hdr http.Header, smap *smapX) (int, error) {
 }
 
 // convenience helper to additionally write error => response writer
-func (h *htrun) ensureIntraControl(w http.ResponseWriter, r *http.Request, onlyPrimary bool) bool {
-	ecode, err := h.checkIntra(r, onlyPrimary)
+func (h *htrun) ensureIntraControl(w http.ResponseWriter, r *http.Request, smap *smapX, onlyPrimary bool) bool {
+	ecode, err := h.checkIntra(r, smap, onlyPrimary)
 	if err != nil {
 		h.writeErr(w, r, err, ecode)
 		return false
@@ -2673,7 +2690,8 @@ func _netEq(got, exp reqNet) bool {
 	return false
 }
 
-func (h *htrun) checkIntra(r *http.Request, onlyPrimary bool, nets ...reqNet) (int, error) {
+// `smap` is optional: when nil, get it from the owner
+func (h *htrun) checkIntra(r *http.Request, smap *smapX, onlyPrimary bool, nets ...reqNet) (int, error) {
 	expNet := reqNetCtrl
 	if len(nets) > 0 {
 		expNet = nets[0]
@@ -2691,8 +2709,10 @@ func (h *htrun) checkIntra(r *http.Request, onlyPrimary bool, nets ...reqNet) (i
 	}
 
 	// lookup sender
-	smap := h.owner.smap.get()
-	if smap == nil || !smap.isValid() {
+	if smap == nil {
+		smap = h.owner.smap.get()
+	}
+	if !smap.isValid() {
 		if h.ClusterStarted() {
 			return http.StatusServiceUnavailable, fmt.Errorf("%s: invalid %s post cluster startup", h, smap.StringEx())
 		}

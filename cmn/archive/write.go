@@ -1,7 +1,7 @@
 // Package archive: write, read, copy, append, list primitives
 // across all supported formats
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package archive
 
@@ -135,8 +135,10 @@ func (tw *tarWriter) init(w io.Writer, cksum *cos.CksumHashSize, opts *Opts) {
 	if opts != nil {
 		tw.format = opts.TarFormat
 	}
-	debug.Assert(tw.format == tar.FormatUnknown || tw.format == tar.FormatUSTAR ||
-		tw.format == tar.FormatPAX || tw.format == tar.FormatGNU, tw.format.String())
+	debug.Func(func() {
+		debug.Assert(tw.format == tar.FormatUnknown || tw.format == tar.FormatUSTAR ||
+			tw.format == tar.FormatPAX || tw.format == tar.FormatGNU, tw.format.String())
+	})
 
 	tw.tw = tar.NewWriter(tw.wmul)
 }

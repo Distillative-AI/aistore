@@ -42,6 +42,8 @@ import (
 
 const (
 	lsotag = "list-objects"
+
+	badArchRequest = "bad archive request"
 )
 
 type (
@@ -63,7 +65,7 @@ type (
 		ic         ic
 		authn      *authManager
 		metasyncer *metasyncer
-		lstca      lstca
+		lstcoReg   lstcoReg
 		rproxy     reverseProxy
 		ec         ecToggle
 
@@ -256,18 +258,19 @@ func (p *proxy) initRecvHandlers() {
 	networkHandlers = append(networkHandlers,
 		// (pub + control): apc.Reverse
 		networkHandler{r: apc.Reverse, h: p.revPubHandler, net: accessNetPublic},
-		networkHandler{r: apc.Reverse, h: p.revHandler, net: accessNetIntraControl},
+		networkHandler{r: apc.Reverse, h: p.revCtrlHandler, net: accessNetIntraControl},
 
 		// (pub + control): apc.Cluster
 		networkHandler{r: apc.Cluster, h: p.cluPubHandler, net: accessNetPublic},
-		networkHandler{r: apc.Cluster, h: p.cluHandler, net: accessNetIntraControl},
+		networkHandler{r: apc.Cluster, h: p.cluCtrlHandler, net: accessNetIntraControl},
 
 		// (pub + control): apc.Daemon
 		networkHandler{r: apc.Daemon, h: p.daePubHandler, net: accessNetPublic},
-		networkHandler{r: apc.Daemon, h: p.daeHandler, net: accessNetIntraControl},
+		networkHandler{r: apc.Daemon, h: p.daeCtrlHandler, net: accessNetIntraControl},
+		networkHandler{r: apc.Buckets, h: p.bckPubHandler, net: accessNetPublic},
+		networkHandler{r: apc.Buckets, h: p.bckCtrlHandler, net: accessNetIntraControl},
 
-		// pub-net handlers: cluster must be started
-		networkHandler{r: apc.Buckets, h: p.bucketHandler, net: accessNetPublic},
+		// pub-net handlers
 		networkHandler{r: apc.Objects, h: p.objectHandler, net: accessNetPublic},
 		networkHandler{r: apc.Download, h: p.dloadHandler, net: accessNetPublic},
 		networkHandler{r: apc.ETL, h: p.etlHandler, net: accessNetPublic},
@@ -475,7 +478,8 @@ func (p *proxy) _parseReqTry(w http.ResponseWriter, r *http.Request, bckArgs *bc
 }
 
 // verb /v1/buckets/
-func (p *proxy) bucketHandler(w http.ResponseWriter, r *http.Request) {
+
+func (p *proxy) bckPubHandler(w http.ResponseWriter, r *http.Request) {
 	if !p.cluStartedWithRetry() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -586,7 +590,7 @@ func (p *proxy) easyURLHandler(w http.ResponseWriter, r *http.Request) {
 		} else if !strings.Contains(r.URL.RawQuery, apc.QparamProvider) {
 			r.URL.RawQuery += "&" + apc.QparamProvider + "=" + provider
 		}
-		p.bucketHandler(w, r)
+		p.bckPubHandler(w, r)
 		return
 	}
 	// num items: 2
@@ -622,7 +626,7 @@ func (p *proxy) easyURLHandler(w http.ResponseWriter, r *http.Request) {
 	if objName != "" {
 		p.objectHandler(w, r)
 	} else {
-		p.bucketHandler(w, r)
+		p.bckPubHandler(w, r)
 	}
 }
 
@@ -787,12 +791,8 @@ func (p *proxy) bgetBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.Qu
 }
 
 func (p *proxy) bgetObjects(w http.ResponseWriter, r *http.Request, qbck *cmn.QueryBcks, msg *apc.ActMsg, dpq *dpq) {
-	// NOTE -- TODO: currently, always forwarding
 	if !qbck.IsBucket() {
-		p.writeErrf(w, r, "bad list-objects request: %q is not a bucket (is a bucket query?)", qbck.String())
-		return
-	}
-	if p.forwardCP(w, r, msg, lsotag+" "+qbck.String()) {
+		p.writeErrf(w, r, "%s: %q is not a bucket (is a bucket query?)", apc.BadLsoRequest, qbck.String())
 		return
 	}
 
@@ -805,9 +805,14 @@ func (p *proxy) bgetObjects(w http.ResponseWriter, r *http.Request, qbck *cmn.Qu
 		return
 	}
 	lsmsg.Prefix = cos.TrimPrefix(lsmsg.Prefix)
-	if err := cos.ValidatePrefix("bad list-objects request", lsmsg.Prefix); err != nil {
+	if err := cos.ValidatePrefix(apc.BadLsoRequest, lsmsg.Prefix); err != nil {
 		p.statsT.IncBck(stats.ErrListCount, bck.Bucket())
 		p.writeErr(w, r, err)
+		return
+	}
+	if lsmsg.PageSize < 0 {
+		p.statsT.IncBck(stats.ErrListCount, bck.Bucket())
+		p.writeErrf(w, r, "%s: negative page size %d", apc.BadLsoRequest, lsmsg.PageSize)
 		return
 	}
 
@@ -835,7 +840,7 @@ func (p *proxy) bgetObjects(w http.ResponseWriter, r *http.Request, qbck *cmn.Qu
 		return
 	}
 
-	p.listObjects(w, r, bck, msg /*amsg*/, &lsmsg)
+	p.listObjects(w, r, bck, &lsmsg)
 }
 
 // +gen:endpoint GET /v1/objects/{bucket-name}/{object-name}[apc.QparamProvider=string,apc.QparamNamespace=string,apc.QparamLatestVer=bool]
@@ -1192,7 +1197,7 @@ func (p *proxy) metasyncHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !p.ensureIntraControl(w, r, true /* from primary */) {
+	if !p.ensureIntraControl(w, r, smap, true /* from primary */) {
 		return
 	}
 
@@ -1315,8 +1320,9 @@ func (p *proxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 		admitted = true
 	}
 	// prr is public on pub-net, but must be admitted when received via intra-control
+	smap := p.owner.smap.get()
 	if prr && _reqNet(r) == reqNetCtrl {
-		if ecode, err := p.checkIntra(r, false /*only primary*/); err != nil {
+		if ecode, err := p.checkIntra(r, smap, false /*only primary*/); err != nil {
 			p.writeErr(w, r, err, ecode)
 			return
 		}
@@ -1331,7 +1337,6 @@ func (p *proxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	smap := p.owner.smap.get()
 	if err := smap.validate(); err != nil {
 		if !p.ClusterStarted() {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -1394,7 +1399,7 @@ func (p *proxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 
 func (p *proxy) _health(w http.ResponseWriter, r *http.Request, plainPing bool) bool {
 	if _reqNet(r) == reqNetCtrl {
-		if ecode, err := p.checkIntra(r, false /*only primary*/); err != nil {
+		if ecode, err := p.checkIntra(r, nil /*smap*/, false /*only primary*/); err != nil {
 			if plainPing {
 				if cmn.Rom.V(4, cos.ModAIS) {
 					nlog.Warningln("[health]", p.String(), "rejected intra-control request:", err)
@@ -1487,6 +1492,10 @@ func (p *proxy) httpbckput(w http.ResponseWriter, r *http.Request) {
 			if bckTo, err = bckToArgs.initAndTry(); err != nil {
 				return
 			}
+		}
+		if err := cos.ValidateOname(archMsg.ArchName); err != nil {
+			p.writeErr(w, r, fmt.Errorf("%s: %w", badArchRequest, err))
+			return
 		}
 		//
 		// NOTE: strict enforcement of the standard & supported file extensions
@@ -1696,16 +1705,16 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 		//         this one does not
 
 		if !apc.IsFltPresent(fltPresence) && (bckFrom.IsCloud() || bckFrom.IsRemoteAIS()) {
-			lstcx := &lstcx{
+			c := &lstcoCtx{
 				p:       p,
 				bckFrom: bckFrom,
 				bckTo:   bckTo,
 				amsg:    msg,
 				config:  cmn.GCO.Get(),
 			}
-			lstcx.tcomsg.TCBMsg = *tcbmsg
+			c.tcomsg.TCBMsg = *tcbmsg
 			nlog.Infoln("x-tco:", bckFrom.String(), "=>", bckTo.String(), "[", tcbmsg.Prefix, tcbmsg.LatestVer, tcbmsg.Sync, "]")
-			xid, err = lstcx.do()
+			xid, err = c.do()
 		} else {
 			nlog.Infoln("x-tcb:", bckFrom.String(), "=>", bckTo.String(), "[", tcbmsg.Prefix, tcbmsg.LatestVer, tcbmsg.Sync, "]")
 			xid, err = p.tcb(bckFrom, bckTo, msg, tcbmsg.DryRun)
@@ -1785,6 +1794,7 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 		}
 	case apc.ActRechunk:
 		// re-chunk bucket objects according to provided args
+		warnRechunkOverride(msg, bck)
 		if xid, err = p.bcastBckAction(r.Method, bucket, msg, query); err != nil {
 			p.writeErr(w, r, err)
 			return
@@ -1831,6 +1841,23 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 		debug.Assertf(xact.IsValidUUID(xid) || strings.IndexByte(xid, ',') > 0, "%q: %q", msg.Action, xid)
 	})
 	writeXid(w, xid)
+}
+
+// v5.1: per-request overrides of the bucket's chunks config are deprecated
+// (removal planned for v5.2; see docs/relnotes/5.1.md, "Deprecated APIs")
+func warnRechunkOverride(msg *apc.ActMsg, bck *meta.Bck) {
+	var (
+		args   apc.RechunkMsg
+		chunks = &bck.Props.Chunks
+	)
+	if err := cos.MorphMarshal(msg.Value, &args); err != nil {
+		return // targets will reject it
+	}
+	if (args.ChunkSize > 0 && args.ChunkSize != int64(chunks.ChunkSize)) || args.ObjSizeLimit != int64(chunks.ObjSizeLimit) {
+		nlog.Warningln(msg.Action, bck.Cname(""), "- deprecated per-request override of bucket's chunks config:",
+			"chunk_size", cos.IEC(args.ChunkSize, 0), "vs", cos.IEC(int64(chunks.ChunkSize), 0)+",",
+			"objsize_limit", cos.IEC(args.ObjSizeLimit, 0), "vs", cos.IEC(int64(chunks.ObjSizeLimit), 0))
+	}
 }
 
 // initTrySysBck initializes (or creates) a system bucket in BMD.
@@ -2568,7 +2595,7 @@ func (p *proxy) bcastBckAction(method, bucket string, msg *apc.ActMsg, query url
 //
 
 // [METHOD] /v1/daemon
-func (p *proxy) daeHandler(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) daeCtrlHandler(w http.ResponseWriter, r *http.Request) {
 	p._dae(w, r, false /*isPub*/)
 }
 
@@ -2730,6 +2757,7 @@ func (p *proxy) httpdaeput(w http.ResponseWriter, r *http.Request) {
 		p.daeputItems(w, r, apiItems)
 		return
 	}
+
 	// action-message
 	query := r.URL.Query()
 	msg, err := p.readActionMsg(w, r)
@@ -2737,26 +2765,49 @@ func (p *proxy) httpdaeput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// primary?
+	// (I) node/cluster lifecycle
 	switch msg.Action {
 	case apc.ActStartMaintenance, apc.ActDecommissionCluster, apc.ActDecommissionNode, apc.ActShutdownNode, apc.ActShutdownCluster:
 		smap := p.owner.smap.get()
-		if !smap.isPrimary(p.si) {
-			break
-		}
-		if msg.Action == apc.ActShutdownCluster {
-			force := cos.IsParseBool(query.Get(apc.QparamForce))
-			if force {
-				break
+		isPrimary := smap.isPrimary(p.si)
+		if isPrimary {
+			if msg.Action != apc.ActShutdownCluster || !cos.IsParseBool(query.Get(apc.QparamForce)) {
+				err = fmt.Errorf("primary %s: invalid action %q (node-level operation on primary?), %s",
+					p, msg.Action, smap.StringEx())
+				p.writeErr(w, r, err)
+				return
 			}
+		} else if !p.ensureIntraControl(w, r, smap, true /* from primary */) {
+			return
 		}
-		err = fmt.Errorf("primary %s: invalid action %q (node-level operation on primary?), %s", p, msg.Action, smap.StringEx())
-		p.writeErr(w, r, err)
+
+		switch msg.Action {
+		case apc.ActStartMaintenance:
+			p.termKalive(msg.Action)
+		case apc.ActDecommissionCluster, apc.ActDecommissionNode:
+			var opts apc.ActValRmNode
+			if err := cos.MorphMarshal(msg.Value, &opts); err != nil {
+				p.writeErr(w, r, err)
+				return
+			}
+			p.termKalive(msg.Action)
+			p.decommission(msg.Action, &opts)
+		case apc.ActShutdownNode:
+			p.termKalive(msg.Action)
+			p.shutdown(msg.Action)
+		case apc.ActShutdownCluster:
+			if !isPrimary {
+				p.Stop(&errNoUnregister{msg.Action})
+				return
+			}
+			_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+		}
 		return
 	}
 
+	// (II) miscellaneous
 	switch msg.Action {
-	case apc.ActSetConfig: // set-config #2 - via action message
+	case apc.ActSetConfig:
 		p.setDaemonConfigMsg(w, r, msg, query)
 	case apc.ActResetConfig:
 		if err := p.owner.config.resetDaemonConfig(); err != nil {
@@ -2767,41 +2818,6 @@ func (p *proxy) httpdaeput(w http.ResponseWriter, r *http.Request) {
 	case apc.ActResetStats:
 		errorsOnly := msg.Value.(bool)
 		p.statsT.ResetStats(errorsOnly)
-
-	case apc.ActStartMaintenance:
-		if !p.ensureIntraControl(w, r, true /* from primary */) {
-			return
-		}
-		p.termKalive(msg.Action)
-	case apc.ActDecommissionCluster, apc.ActDecommissionNode:
-		if !p.ensureIntraControl(w, r, true /* from primary */) {
-			return
-		}
-		var opts apc.ActValRmNode
-		if err := cos.MorphMarshal(msg.Value, &opts); err != nil {
-			p.writeErr(w, r, err)
-			return
-		}
-		p.termKalive(msg.Action)
-		p.decommission(msg.Action, &opts)
-	case apc.ActShutdownNode:
-		if !p.ensureIntraControl(w, r, true /* from primary */) {
-			return
-		}
-		p.termKalive(msg.Action)
-		p.shutdown(msg.Action)
-	case apc.ActShutdownCluster:
-		smap := p.owner.smap.get()
-		isPrimary := smap.isPrimary(p.si)
-		if !isPrimary {
-			if !p.ensureIntraControl(w, r, true /* from primary */) {
-				return
-			}
-			p.Stop(&errNoUnregister{msg.Action})
-			return
-		}
-		// (see "force" above)
-		_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
 	case apc.LoadX509:
 		p.daeLoadX509(w, r)
 	default:

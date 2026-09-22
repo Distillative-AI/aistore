@@ -134,7 +134,7 @@ func newPrefetch(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.Prefetch
 	if err != nil {
 		return nil, err
 	}
-	r.InitBase(xargs.UUID, kind, bck)
+	r.InitBase(context.Background(), xargs.UUID, kind, bck)
 	r.latestVer = bck.VersionConf().ValidateWarmGet || msg.LatestVer
 
 	r.bp = core.T.Backend(bck)
@@ -266,7 +266,7 @@ func (r *prefetch) getCold(lom *core.LOM) (ecode int, err error) {
 	started := mono.NanoTime()
 
 	// either a) LoadLatest => UncacheDel (not-latest) or b) not-found
-	debug.Assert(lom.GetCustomMD() == nil, lom.Cname())
+	debug.Func(func() { debug.Assert(lom.GetCustomMD() == nil, lom.Cname()) })
 
 	if ecode, err = r.bp.GetObj(r.ctx, lom, cmn.OwtGetPrefetchLock, nil /*origReq*/); err != nil {
 		return ecode, err
@@ -298,7 +298,8 @@ func (r *prefetch) Snap() (snap *core.Snap) {
 func (r *prefetch) blobdl(lom *core.LOM, oa *cmn.ObjAttrs) (int, error) {
 	// pass user preferences through; blobFactory.Start tunes them once
 	params := &core.BlobParams{
-		Lom: core.AllocLOM(lom.ObjName),
+		Lom:     core.AllocLOM(lom.ObjName),
+		Context: r.Context(),
 		Msg: &apc.BlobMsg{
 			ChunkSize:  r.msg.BlobChunkSize,
 			NumWorkers: r.msg.BlobNumWorkers,

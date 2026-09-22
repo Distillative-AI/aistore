@@ -190,15 +190,16 @@ class TestBatch(unittest.TestCase):
         self.assertIn("length=-10", str(context.exception))
 
     def test_batch_add_with_opaque(self):
-        """Test adding object with opaque user data."""
-        batch = Batch(self.mock_request_client, bucket=self.mock_bucket)
-        batch.add("tracked.txt", opaque=b"user-id-123")
-
-        self.assertEqual(len(batch), 1)
-        moss_in = batch.request.moss_in[0]
-        self.assertEqual(moss_in.obj_name, "tracked.txt")
-        # Opaque should be base64 encoded
-        self.assertIsNotNone(moss_in.opaque)
+        """Encode tracking bytes as standard Base64 in the request JSON."""
+        for opaque, encoded in (
+            (b"user-id-123", "dXNlci1pZC0xMjM="),
+            (b"\xfb\xff", "+/8="),
+            (None, None),
+        ):
+            with self.subTest(opaque=opaque):
+                batch = Batch(self.mock_request_client, bucket=self.mock_bucket)
+                batch.add("tracked.txt", opaque=opaque)
+                self.assertEqual(batch.request.dict()["in"][0].get("opaque"), encoded)
 
     def test_batch_add_chaining(self):
         """Test method chaining with add()."""
@@ -294,9 +295,7 @@ class TestBatch(unittest.TestCase):
                     bck=kwargs.get("bck") or self.mock_bucket.name,
                     provider=kwargs.get("provider") or default_provider,
                     opaque=(
-                        base64.urlsafe_b64encode(opaque).decode("utf-8")
-                        if opaque
-                        else None
+                        base64.b64encode(opaque).decode("utf-8") if opaque else None
                     ),
                     archpath=kwargs.get("archpath") or None,
                     start=kwargs.get("start") or None,
@@ -373,6 +372,65 @@ class TestBatch(unittest.TestCase):
         self.assertEqual(result[0][1], b"content1")
         self.assertEqual(result[1][0].obj_name, "file2.txt")
         self.assertEqual(result[1][1], b"content2")
+
+    def test_get_batch_tar_buffer_size(self):
+        """Forward the per-call TAR buffer size while preserving batch clearing."""
+        batch = Batch(
+            self.mock_request_client,
+            objects=["file1.txt"],
+            bucket=self.mock_bucket,
+        )
+        request_snapshot = batch.request.model_copy()
+        response = self.mock_request_client.request.return_value
+
+        with patch.object(batch.extractor, "extract", return_value=iter(())) as extract:
+            result = batch.get(tar_buffer_size=128 * 1024)
+
+            self.assertIs(result, extract.return_value)
+            extract.assert_called_once_with(
+                response,
+                response.raw,
+                request_snapshot,
+                None,
+                buffer_size=128 * 1024,
+            )
+        self.mock_request_client.request.assert_called_once()
+        self.assertEqual(len(batch), 0)
+
+    def test_get_batch_invalid_tar_buffer_size(self):
+        """Reject invalid sizes before sending a request or clearing the batch."""
+        for size in (0, -1, 1.5, "65536", True, False):
+            with self.subTest(tar_buffer_size=size):
+                batch = Batch(
+                    self.mock_request_client,
+                    objects=["file1.txt"],
+                    bucket=self.mock_bucket,
+                )
+                request_snapshot = batch.request.model_copy()
+
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    batch.get(tar_buffer_size=size)
+
+                self.mock_request_client.request.assert_not_called()
+                self.assertEqual(batch.request, request_snapshot)
+
+    def test_get_batch_tar_buffer_size_unsupported_mode(self):
+        """Reject buffer overrides when TAR extraction will not run."""
+        for output_format, raw in ((".zip", False), (".tar", True), (".zip", True)):
+            with self.subTest(output_format=output_format, raw=raw):
+                batch = Batch(
+                    self.mock_request_client,
+                    objects=["file1.txt"],
+                    bucket=self.mock_bucket,
+                    output_format=output_format,
+                )
+                request_snapshot = batch.request.model_copy()
+
+                with self.assertRaisesRegex(ValueError, "requires TAR extraction"):
+                    batch.get(raw=raw, tar_buffer_size=64 * 1024)
+
+                self.mock_request_client.request.assert_not_called()
+                self.assertEqual(batch.request, request_snapshot)
 
     @patch("aistore.sdk.batch.batch.get_extractor")
     @patch("aistore.sdk.batch.batch.MultipartDecoder")
@@ -1082,6 +1140,22 @@ class TestBatch(unittest.TestCase):
         self.assertEqual(len(batch.request.moss_in), 2)
         self.assertEqual(batch.request.moss_in[0].obj_name, "file1.txt")
         self.assertEqual(batch.request.moss_in[1].obj_name, "file2.txt")
+
+    @patch("aistore.sdk.batch.batch.get_extractor")
+    def test_pending_result_keeps_request_metadata(self, mock_get_extractor):
+        """Pending results survive reordering and a later clearing get()."""
+        mock_get_extractor.return_value.extract.side_effect = (
+            lambda _response, _stream, request, _metadata: (
+                request.moss_in[i].obj_name for i in range(2)
+            )
+        )
+        batch = Batch(self.mock_request_client, ["first", "second"], self.mock_bucket)
+        pending = batch.get(clear_batch=False)
+        batch.requests_list.reverse()
+        clearing = batch.get()
+        batch.add("third")
+        self.assertEqual(list(pending), ["first", "second"])
+        self.assertEqual(list(clearing), ["second", "first"])
 
     @patch("aistore.sdk.batch.batch.get_extractor")
     def test_get_clear_batch_false_allows_accumulation(self, mock_get_extractor):

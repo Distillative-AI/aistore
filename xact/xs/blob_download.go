@@ -43,6 +43,9 @@ import (
 // 5. used-memory accounting: a work item releases the whole per-worker share
 //    (chunk SGL + one copy buffer), but the buffer belongs to a worker and workers
 //    are not pinned to items
+// 6. write starvation: blob-downloader currently take the write-lock across the entire xaction lifetime;
+//    this can starve other write operations
+// 7. `target.blobdlLocked` currently duplicate the lock upgrade logic with `GOI` - refactor and consolidate
 
 const (
 	BlobParentGET      = "GET"
@@ -53,11 +56,8 @@ const (
 
 // default tunables (can override via apc.BlobMsg)
 const (
-	dfltChunkSize = 4 * cos.MiB
-	minChunkSize  = memsys.DefaultBufSize // ~312MiB maximum object size
-	maxChunkSize  = 64 * cos.MiB          // ~625GiB maximum object size; up to 2GiB streaming SGLs
-
-	dfltChunkReadTimeout = time.Minute // default for apc.BlobMsg.ChunkReadTimeout
+	dfltChunkSize         = 4 * cos.MiB
+	maxStreamingChunkSize = 64 * cos.MiB // ~625GiB maximum object size; up to 2GiB streaming SGLs
 
 	minBlobDlPrefetch = cos.MiB // size threshold for x-prefetch
 
@@ -85,8 +85,6 @@ type (
 
 	XactBlobDl struct {
 		bp       core.Backend
-		ctx      context.Context
-		cancel   context.CancelFunc
 		pending  blobPending      // map[roff => work item]
 		args     *core.BlobParams // including the resulting LOM and control message (apc.BlobMsg)
 		config   *cmn.Config
@@ -161,8 +159,8 @@ var (
 )
 
 var (
-	errBlobDlAdmission  = errors.New("blob download admission rejected")
-	errBlobDlChunkLimit = errors.New("blob download exceeds manifest chunk limit")
+	errBlobDlAdmission  = errors.New(apc.ActBlobDl + " admission rejected")
+	errBlobDlChunkLimit = errors.New(apc.ActBlobDl + " exceeds manifest chunk limit")
 )
 
 // IsErrBlobDlAdmission reports whether blob download was rejected before starting.
@@ -191,9 +189,16 @@ func isErrBlobDlColdFallback(err error) bool {
 //   - finalize() runs only after range-read I/O has stopped;
 //   - on success it completes the manifest; on error/abort it aborts it.
 //
+// Lock ownership contract: the caller must hold the LOM write lock and transfers
+// ownership with this call. A registered xaction releases the lock exactly once
+// after success, runtime failure, or abort; if none is registered, RenewBlobDl
+// releases it before returning.
 // =====================================================================================
 func RenewBlobDl(xid string, params *core.BlobParams, oa *cmn.ObjAttrs) xreg.RenewRes {
-	debug.Assert(oa != nil)
+	debug.Func(func() {
+		debug.Assert(params.Lom.IsLocked() == apc.LockWrite)
+		debug.Assert(oa != nil)
+	})
 	var (
 		lom = params.Lom
 		pre = &XactBlobDl{args: params} // preliminary ("keep filling" below)
@@ -211,6 +216,7 @@ func RenewBlobDl(xid string, params *core.BlobParams, oa *cmn.ObjAttrs) xreg.Ren
 	if params.Msg.FullSize > 0 && params.Msg.FullSize != pre.fullSize {
 		name := xact.Cname(apc.ActBlobDl, xid) + "/" + lom.Cname()
 		err := fmt.Errorf("%s: user-specified size %d, have %d", name, params.Msg.FullSize, pre.fullSize)
+		lom.Unlock(true)
 		return xreg.RenewRes{Err: err}
 	}
 
@@ -220,7 +226,12 @@ func RenewBlobDl(xid string, params *core.BlobParams, oa *cmn.ObjAttrs) xreg.Ren
 		pre.chunkSize = dfltChunkSize
 	}
 
-	return xreg.RenewBucketXact(apc.ActBlobDl, lom.Bck(), xreg.Args{UUID: xid, Custom: pre})
+	rns := xreg.RenewBucketXact(apc.ActBlobDl, lom.Bck(), xreg.Args{UUID: xid, Custom: pre})
+	if !rns.IsNew() {
+		// This candidate will never run: renewal either failed or reused another xaction.
+		lom.Unlock(true)
+	}
+	return rns
 }
 
 //
@@ -239,11 +250,13 @@ func (*blobFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 func (p *blobFactory) Start() (err error) {
 	// reuse the same args-carrying structure and keep initializing
 	r := p.pre
+	p.xctn = r
 
 	lom := r.args.Lom
+	debug.Func(func() { debug.Assert(lom.IsLocked() == apc.LockWrite) })
 	r.cname = lom.Cname()
 	bck := lom.Bck()
-	r.InitBase(p.Args.UUID, p.Kind(), bck)
+	r.InitBase(r.args.Context, p.Args.UUID, p.Kind(), bck)
 
 	r.bp = core.T.Backend(bck)
 
@@ -324,17 +337,10 @@ func (p *blobFactory) Start() (err error) {
 		r.pending = make(blobPending, r.numWorkers)
 	}
 
-	tout := r.args.Msg.ChunkReadTimeout.D()
-	r.timeout = cos.Ternary(tout > 0, tout, dfltChunkReadTimeout)
-	r.ctx, r.cancel = context.WithCancel(context.Background())
+	r.setChunkReadTimeout()
 
 	// 7. claim last, after all checks and validations above
-	if err := r.claimMem(&mem, sglCost, bufCost); err != nil {
-		return err
-	}
-
-	p.xctn = r
-	return nil
+	return r.claimMem(&mem, sglCost, bufCost)
 }
 
 func (*blobFactory) Kind() string     { return apc.ActBlobDl }
@@ -366,7 +372,13 @@ func (r *XactBlobDl) Run(wg *sync.WaitGroup) {
 		lom = r.args.Lom
 		now = mono.NanoTime()
 	)
-	nlog.Infoln(r.String())
+	debug.Func(func() {
+		debug.Assertf(lom.IsLocked() == apc.LockWrite,
+			"%s must be w-locked (have %d)", lom.Cname(), lom.IsLocked())
+	})
+	if cmn.Rom.V(5, cos.ModXs) {
+		nlog.Infoln(r.String())
+	}
 	if wg != nil {
 		wg.Done() // signal that xaction has started
 	}
@@ -383,20 +395,11 @@ func (r *XactBlobDl) Run(wg *sync.WaitGroup) {
 		err = r.runWorkers()
 	}
 
-	if r.cancel != nil {
-		r.cancel()
-	}
 	r.finalize(err, lom, now)
 }
 
 func (r *XactBlobDl) Abort(err error) bool {
-	if !r.Base.Abort(err) {
-		return false
-	}
-	if r.cancel != nil {
-		r.cancel()
-	}
-	return true
+	return r.Base.Abort(err)
 }
 
 func (r *XactBlobDl) estMemCost() (sglCost, bufCost int64) {
@@ -424,11 +427,14 @@ func (r *XactBlobDl) memErr(memLoad load.Load, streaming bool, sglCost, bufCost 
 		return fmt.Errorf("%w: %s: all downloads rejected under %s memory pressure",
 			errBlobDlAdmission, r.Name(), load.Text[memLoad])
 	case memLoad == load.High && streaming:
-		return fmt.Errorf("%w: %s: streaming downloads rejected under %s memory pressure (estimated SGL/copy-buffer cost: %s/%s)",
-			errBlobDlAdmission, r.Name(), load.Text[memLoad], cos.IEC(sglCost, 0), cos.IEC(bufCost, 0))
-	default:
-		return nil
+		warn := fmt.Sprintf("streaming download under %s memory pressure (estimated SGL/copy-buffer cost: %s/%s)",
+			load.Text[memLoad], cos.IEC(sglCost, 0), cos.IEC(bufCost, 0))
+		if !cmn.Rom.TestingEnv() {
+			return fmt.Errorf("%w: %s: %s", errBlobDlAdmission, r.Name(), warn)
+		}
+		nlog.Warningln(warn, "- proceeding anyway")
 	}
+	return nil
 }
 
 // same view of "free" that memsys grades pressure against (cf. memsys.memFree):
@@ -499,15 +505,27 @@ func (r *XactBlobDl) releaseWIMem(wi *blobWI) {
 // setChunkSize applies the default and clamps the requested size to supported bounds.
 // Start validates manifest fit and memory-pressure admission for the effective size.
 func (r *XactBlobDl) setChunkSize() {
+	maxChunkSize := int64(cmn.ChunkSizeMax) // cache-only: no chunk-sized SGL
+	if r.args.RespWriter != nil {
+		maxChunkSize = maxStreamingChunkSize
+	}
 	switch {
 	case r.chunkSize == 0:
 		r.chunkSize = dfltChunkSize
-	case r.chunkSize < minChunkSize:
-		nlog.Warningln("chunk size", cos.IEC(r.chunkSize, 1), "is below permitted minimum", cos.IEC(minChunkSize, 0))
-		r.chunkSize = minChunkSize
+	case r.chunkSize < cmn.ChunkSizeMin:
+		nlog.Warningln("chunk size", cos.IEC(r.chunkSize, 1), "is below permitted minimum", cos.IEC(cmn.ChunkSizeMin, 0))
+		r.chunkSize = cmn.ChunkSizeMin
 	case r.chunkSize > maxChunkSize:
 		nlog.Warningln("chunk size", cos.IEC(r.chunkSize, 1), "exceeds permitted maximum", cos.IEC(maxChunkSize, 0))
 		r.chunkSize = maxChunkSize
+	}
+}
+
+func (r *XactBlobDl) setChunkReadTimeout() {
+	r.timeout = r.args.Msg.ChunkReadTimeout.D()
+	// SendFile is both the default and the global maximum for a chunk read.
+	if limit := r.config.Timeout.SendFile.D(); r.timeout <= 0 || r.timeout > limit {
+		r.timeout = limit
 	}
 }
 
@@ -591,8 +609,10 @@ func (r *XactBlobDl) runWorkers() error {
 			if done.roff != r.woff {
 				debug.Assertf(done.roff > r.woff, "out-of-order chunk's offset should be greater than the current write offset: %d vs %d",
 					done.roff, r.woff)
-				debug.Assertf((done.roff-r.woff)%r.chunkSize == 0, "out-of-order chunk's offset should be a multiple of chunk size: %d, %d",
-					done.roff-r.woff, r.chunkSize)
+				debug.Func(func() {
+					debug.Assertf((done.roff-r.woff)%r.chunkSize == 0, "out-of-order chunk's offset should be a multiple of chunk size: %d, %d",
+						done.roff-r.woff, r.chunkSize)
+				})
 
 				debug.AssertFunc(func() bool { return r.pending[done.roff] == nil },
 					"out-of-order chunk should not be already in the pending map")
@@ -634,9 +654,8 @@ cleanup:
 		if done != nil {
 			done.cleanup()
 		}
-		if r.cancel != nil {
-			r.cancel()
-		}
+		// Cancel sibling range reads before waiting; Finish cannot run yet.
+		r.CancelContext()
 	}
 
 	close(r.workCh)
@@ -648,16 +667,20 @@ cleanup:
 
 // finalize handles post-download work-items: checksum, stats, cleanup
 func (r *XactBlobDl) finalize(err error, lom *core.LOM, startTime int64) {
+	debug.Func(func() {
+		debug.Assertf(lom.IsLocked() == apc.LockWrite,
+			"%s must be w-locked (have %d)", lom.Cname(), lom.IsLocked())
+	})
 	if err == nil {
 		if r.fullSize != r.woff {
 			err = fmt.Errorf("%s: exp size %d != %d off", r.Name(), r.fullSize, r.woff)
 			debug.AssertNoErr(err)
 		} else {
-			debug.Assertf(len(r.pending) == 0, "%s: pending work-items should be all drained, got %d", r.Name(), len(r.pending))
+			debug.Func(func() {
+				debug.Assertf(len(r.pending) == 0, "%s: pending work-items should be all drained, got %d", r.Name(), len(r.pending))
+			})
 
-			lom.Lock(true)
 			err = r._fini(lom)
-			lom.Unlock(true)
 		}
 	}
 
@@ -686,6 +709,7 @@ func (r *XactBlobDl) finalize(err error, lom *core.LOM, startTime int64) {
 	}
 
 	r.cleanup()
+	lom.Unlock(true)
 	r.Finish()
 }
 
@@ -768,7 +792,9 @@ func (r *XactBlobDl) write(sgl *memsys.SGL, size int64) (err error) {
 			}
 			return err
 		}
-		debug.Assertf(written == size, "%s: expected written size=%d, got %d (at woff %d)", r.Name(), size, written, r.woff)
+		debug.Func(func() {
+			debug.Assertf(written == size, "%s: expected written size=%d, got %d (at woff %d)", r.Name(), size, written, r.woff)
+		})
 	}
 
 	// stats
@@ -805,9 +831,9 @@ func (r *XactBlobDl) cleanup() {
 	r.drainWich(r.workCh)
 	r.drainWich(r.doneCh)
 
-	for roff := range r.pending {
-		debug.Assert(r.args.RespWriter != nil || r.pending[roff].sgl == nil)
-		r.pending[roff].cleanup()
+	for _, wi := range r.pending {
+		debug.Assert(r.args.RespWriter != nil || wi.sgl == nil)
+		wi.cleanup()
 	}
 
 	debug.Func(func() {
@@ -908,7 +934,11 @@ func (w *blobWorker) do(wi *blobWI, buf []byte) (int, error) {
 		manifest   = w.parent.manifest
 		respWriter = w.parent.args.RespWriter
 	)
-	debug.Assert(w.parent.args.RespWriter != nil || wi.sgl == nil)
+	debug.Func(func() {
+		debug.Assert(w.parent.args.RespWriter != nil || wi.sgl == nil)
+		debug.Assertf(lom.IsLocked() == apc.LockWrite,
+			"%s must be w-locked (have %d)", lom.Cname(), lom.IsLocked())
+	})
 
 	partNum := wi.roff/chunkSize + 1
 
@@ -918,7 +948,7 @@ func (w *blobWorker) do(wi *blobWI, buf []byte) (int, error) {
 	}
 
 	// 2. Get object range reader. The context covers both reader acquisition and response-body copy.
-	parentCtx := w.parent.ctx
+	parentCtx := w.parent.Context()
 	debug.Assert(parentCtx != nil)
 
 	ctx, cancel := context.WithTimeout(parentCtx, w.parent.timeout)

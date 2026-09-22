@@ -7,6 +7,7 @@
 package space
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -240,7 +241,7 @@ func (*clnFactory) New(args xreg.Args, _ *meta.Bck) xreg.Renewable {
 
 func (p *clnFactory) Start() error {
 	p.xctn = &XactCln{p: p}
-	p.xctn.InitBase(p.UUID(), apc.ActStoreCleanup, nil)
+	p.xctn.InitBase(context.Background(), p.UUID(), apc.ActStoreCleanup, nil)
 	return nil
 }
 
@@ -553,12 +554,7 @@ func (j *clnJ) visit(fqn string, de fs.DirEntry) error {
 		return nil
 	}
 
-	if j.adv.ShouldCheck(j.nvisits) {
-		j.adv.Refresh()
-		if j.adv.Sleep > 0 {
-			time.Sleep(j.adv.Sleep)
-		}
-	}
+	j.adv.Throttle(j.nvisits, true /*yield*/)
 
 	if j.bck.IsAIS() && j.bck.IsSystem() {
 		j.visitSysBck(&parsed, fqn)
@@ -1128,7 +1124,7 @@ func (j *clnJ) rmLeftovers(specifier int) {
 				} else {
 					nfiles++
 					nbytes += finfo.Size()
-					j._throttle(nfiles)
+					j.adv.Throttle(nfiles)
 					if cmn.Rom.V(5, cos.ModSpace) {
 						nlog.Infoln(j.String(), "rm old", workfqn, "size", finfo.Size())
 					}
@@ -1173,7 +1169,7 @@ func (j *clnJ) rmLeftovers(specifier int) {
 						nlog.Infoln(j.String(), "rm misplaced", mlom.String(), "size", size)
 					}
 
-					j._throttle(nfiles)
+					j.adv.Throttle(nfiles)
 					if j.done() {
 						return
 					}
@@ -1199,7 +1195,7 @@ func (j *clnJ) rmLeftovers(specifier int) {
 					nbytes += finfo.Size()
 				}
 
-				j._throttle(nfiles)
+				j.adv.Throttle(nfiles)
 				if j.done() {
 					return
 				}
@@ -1248,16 +1244,7 @@ func (j *clnJ) rmFQNs(fqns []string, label string, nfiles, nbytes *int64) {
 		if cmn.Rom.V(5, cos.ModSpace) {
 			nlog.Infoln(j.String(), "rm", label, fqn, "size", size)
 		}
-		j._throttle(*nfiles)
-	}
-}
-
-func (j *clnJ) _throttle(n int64) {
-	if j.adv.ShouldCheck(n) {
-		j.adv.Refresh()
-		if j.adv.Sleep > 0 {
-			time.Sleep(j.adv.Sleep)
-		}
+		j.adv.Throttle(*nfiles)
 	}
 }
 

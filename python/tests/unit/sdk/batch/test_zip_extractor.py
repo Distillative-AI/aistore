@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 
 import unittest
@@ -9,6 +9,7 @@ import zipfile
 
 from aistore.sdk.batch.extractor.zip_stream_extractor import ZipStreamExtractor
 from aistore.sdk.batch.types import MossReq, MossIn, MossOut, MossResp
+from aistore.sdk.const import GB_MISSING_FILES_DIR
 
 
 # pylint: disable=duplicate-code
@@ -37,6 +38,30 @@ class TestZipStreamExtractor(unittest.TestCase):
         supported_formats = self.zip_extractor.get_supported_formats()
         expected_formats = (".zip",)
         self.assertEqual(supported_formats, expected_formats)
+
+    def test_duplicate_member_names(self):
+        archive = BytesIO()
+        with zipfile.ZipFile(archive, "w") as zip_file:
+            zip_file.writestr("test-bucket/file.txt", b"abcd")
+            with self.assertWarnsRegex(UserWarning, "Duplicate name"):
+                zip_file.writestr("test-bucket/file.txt", b"efghij")
+
+        request = MossReq(
+            moss_in=[
+                MossIn(obj_name="file.txt", bck="test-bucket", start=0, length=4),
+                MossIn(obj_name="file.txt", bck="test-bucket", start=4, length=6),
+            ],
+            output_format=".zip",
+            streaming_get=True,
+        )
+        result = list(
+            self.zip_extractor.extract(
+                self.mock_response, BytesIO(archive.getvalue()), request
+            )
+        )
+        self.assertEqual([content for _, content in result], [b"abcd", b"efghij"])
+        self.assertEqual([metadata.size for metadata, _ in result], [4, 6])
+        self.mock_response.close.assert_called_once()
 
     @patch("zipfile.ZipFile")
     def test_successful_extraction(self, mock_zipfile):
@@ -69,7 +94,7 @@ class TestZipStreamExtractor(unittest.TestCase):
         # In streaming mode, MossOut is constructed from MossIn
         self.assertEqual(moss_out.obj_name, "missing.txt")
         self.assertEqual(moss_out.bucket, "test-bucket")
-        mock_zip_file.read.assert_called_with("file1.txt")
+        mock_zip_file.read.assert_called_with(mock_zipinfo)
 
     @patch("zipfile.ZipFile")
     def test_skip_directory_entries(self, mock_zipfile):
@@ -103,38 +128,39 @@ class TestZipStreamExtractor(unittest.TestCase):
         self.assertEqual(len(result), 1)
         _, content = result[0]
         self.assertEqual(content, b"content")
-        mock_zip_file.read.assert_called_once_with("file.txt")
+        mock_zip_file.read.assert_called_once_with(file_zipinfo)
 
     @patch("zipfile.ZipFile")
-    def test_streaming_mode_conversion(self, mock_zipfile):
-        """Test ZIP extraction converts data_stream to BytesIO in streaming mode."""
-        # Setup mock ZipFile
-        mock_zip_file = MagicMock()
-        mock_zipfile.return_value.__enter__.return_value = mock_zip_file
-
-        # Create mock ZipInfo
-        mock_zipinfo = Mock()
-        mock_zipinfo.is_dir.return_value = False
-        mock_zipinfo.filename = "file1.txt"
-
-        mock_zip_file.infolist.return_value = [mock_zipinfo]
-        mock_zip_file.read.return_value = b"content"
-
-        # Execute with raw bytes (should convert to BytesIO)
-        result = list(
-            self.zip_extractor.extract(
-                self.mock_response, b"raw zip data", self.moss_req_zip, None
+    def test_input_buffering(self, mock_zipfile):
+        """Buffer non-seekable input regardless of request mode; close on read failure."""
+        mock_zipfile.return_value.__enter__.return_value.infolist.return_value = []
+        stream = Mock(spec=["read", "seekable"])
+        stream.seekable.return_value = False
+        stream.read.return_value = b"zip data"
+        seekable = BytesIO(b"zip data")
+        for streaming in (False, True):
+            self.moss_req_zip.streaming_get = streaming
+            for source in (b"zip data", seekable, stream):
+                with self.subTest(streaming=streaming, source=source):
+                    list(
+                        self.zip_extractor.extract(
+                            self.mock_response, source, self.moss_req_zip
+                        )
+                    )
+                    buffered = mock_zipfile.call_args.args[0]
+                    self.assertIsInstance(buffered, BytesIO)
+                    self.assertEqual(buffered.getvalue(), b"zip data")
+                    if source is seekable:
+                        self.assertIs(buffered, seekable)
+        stream.read.side_effect = OSError("read failed")
+        self.mock_response.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, "Failed to read zip archive stream"):
+            list(
+                self.zip_extractor.extract(
+                    self.mock_response, stream, self.moss_req_zip
+                )
             )
-        )
-
-        # Verify extraction worked
-        self.assertEqual(len(result), 1)
-        _, content = result[0]
-        self.assertEqual(content, b"content")
-
-        # Verify ZipFile was called with BytesIO object
-        args, _ = mock_zipfile.call_args
-        self.assertIsInstance(args[0], BytesIO)
+        self.mock_response.close.assert_called_once()
 
     @patch("zipfile.ZipFile")
     def test_non_streaming_mode(self, mock_zipfile):
@@ -253,8 +279,8 @@ class TestZipStreamExtractor(unittest.TestCase):
 
         # Verify both files were read
         self.assertEqual(mock_zip_file.read.call_count, 2)
-        mock_zip_file.read.assert_any_call("file1.txt")
-        mock_zip_file.read.assert_any_call("file2.txt")
+        mock_zip_file.read.assert_any_call(mock_zipinfo1)
+        mock_zip_file.read.assert_any_call(mock_zipinfo2)
 
         # Verify response was closed at the end
         self.mock_response.close.assert_called_once()
@@ -437,7 +463,7 @@ class TestZipStreamExtractor(unittest.TestCase):
 
     @patch("zipfile.ZipFile")
     def test_extraction_with_opaque(self, mock_zipfile):
-        """Test that opaque data flows through from MossResp."""
+        """Preserve opaque bytes in multipart and streaming metadata."""
         # Create MossReq
         moss_req = MossReq(
             moss_in=[
@@ -483,6 +509,21 @@ class TestZipStreamExtractor(unittest.TestCase):
         moss_out, _ = result[0]
         self.assertEqual(moss_out.opaque, b"tracking-metadata")
 
+        moss_req.streaming_get = True
+        for encoded, opaque in (
+            ("dXNlci1pZC0xMjM=", b"user-id-123"),
+            ("+/8=", b"\xfb\xff"),
+            (None, None),
+        ):
+            with self.subTest(opaque=opaque):
+                moss_req.moss_in[0] = moss_req.moss_in[0].model_copy(
+                    update={"opaque": encoded}
+                )
+                result = list(
+                    self.zip_extractor.extract(self.mock_response, BytesIO(), moss_req)
+                )
+                self.assertEqual(result[0][0].opaque, opaque)
+
     @patch("zipfile.ZipFile")
     def test_large_zip_file_error(self, mock_zipfile):
         """Test handling of large ZIP file errors."""
@@ -502,3 +543,42 @@ class TestZipStreamExtractor(unittest.TestCase):
 
         self.assertIn("Failed to read zip archive stream", str(context.exception))
         self.mock_response.close.assert_called_once()
+
+    @patch("zipfile.ZipFile")
+    def test_missing_entry_error_message(self, mock_open):
+        """Infer streaming errors from markers and preserve supplied server errors."""
+        request = self.moss_req_zip
+        request.only_obj_name = True
+        request.moss_in[1] = request.moss_in[1].model_copy(
+            update={"obj_name": f"{GB_MISSING_FILES_DIR}/empty.txt"}
+        )
+        archive = mock_open.return_value.__enter__.return_value
+        names = [
+            f"{GB_MISSING_FILES_DIR}/missing.txt",
+            f"{GB_MISSING_FILES_DIR}/empty.txt",
+        ]
+        # Local shard-load failure, local file failure, and forwarded file failure.
+        request.extend(
+            [request.moss_in[0].model_copy(update={"archpath": "/file.txt"})] * 3
+        )
+        names.extend([names[0], names[0] + "/file.txt", names[0] + "//file.txt"])
+        archive.infolist.return_value = [
+            Mock(filename=name, **{"is_dir.return_value": False}) for name in names
+        ]
+        archive.read.return_value = b""
+        results = list(self.zip_extractor.extract(Mock(), BytesIO(), request))
+        self.assertEqual(
+            [out.err_msg for out, _ in results],
+            ["Batch entry failed on the server", None]
+            + ["Batch entry failed on the server"] * 3,
+        )
+        request.streaming_get = False
+        metadata = MossResp(out=[out for out, _ in results])
+        for out in metadata.out:
+            if out.err_msg:
+                out.err_msg = "server error details"
+        results = list(self.zip_extractor.extract(Mock(), BytesIO(), request, metadata))
+        self.assertEqual(
+            [out.err_msg for out, _ in results],
+            ["server error details", None] + ["server error details"] * 3,
+        )

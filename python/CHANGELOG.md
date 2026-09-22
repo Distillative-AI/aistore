@@ -6,16 +6,63 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+### Fixed
+
+- Parallel range GETs keep a bounded prefetch queue and cancel pending work on
+  failure or early iterator close. Dispatched tasks finish before shared memory
+  is released; use a finite client timeout for stalled requests.
+- Object iteration drains large listing pages without shifting the remaining entries.
+- ZIP batch extraction reads each archive entry correctly when names repeat.
+- Parallel reads reject short or oversized ranges before exposing incomplete
+  data or overwriting an adjacent shared-memory range.
+- SDK network retries rewind streamed uploads to their initial position. An
+  unrewindable body raises `UnrewindableBodyError` before another SDK send.
+- Job duration returns `None` for running jobs with Go zero end timestamps.
+- Empty object-name lists and templates raise `ValueError` when creating an object group.
+- Cluster bucket listing accepts an empty provider to list buckets from all providers.
+- AuthN role creation and updates now combine permission flags with bitwise OR,
+  preventing overlapping or repeated flags from granting unintended permissions.
+- dSort file-based starts preserve all JSON/YAML settings, including `dry_run`
+  and `max_mem_usage`; framework serialization uses the server's `ekm_file_sep` key.
+- ETL pipelines preserve object names containing `#`, `?`, `%`, spaces, or
+  Unicode characters when forwarding buffered or streaming output to the next
+  stage. Existing encoded destination paths and signed query values are retained.
+- FastAPI ETL servers apply configured connection limits to the active HTTP transport.
+- Object listing collects pages without repeatedly copying all prior entries.
+- `HTTPMultiThreadedServer` rejects PUT requests with `Transfer-Encoding`
+  with HTTP 501 before transformation. Chunked input is not supported; this
+  prevents an unsupported request body from being transformed as empty data.
+- Removed redundant byte copies in streaming multipart decoding.
+- ZIP batch extraction buffers non-seekable multipart streams and closes the
+  response if buffering fails.
+- Pending results from `Batch.get(clear_batch=False)` retain their request
+  metadata when the batch is reordered or cleared by a later `get()` call.
+- Batch requests use standard Base64 for binary `opaque` tracking data, and
+  streaming TAR and ZIP results preserve the original tracking bytes.
+- Streaming TAR and ZIP batch extraction reports failed entries with `err_msg`
+  instead of returning them as successful empty objects.
+- `AISBatchIterDataset` raises on reported entry errors by default;
+  `cont_on_err=True` logs and skips failed entries instead of yielding empty samples.
+
 ### Changed
 
+- **BREAKING**: The minimum supported Python version is now 3.10. Python 3.8 and
+  3.9 have both reached end-of-life and are no longer tested or supported.
+- **BREAKING**: `Etl.init_class()` no longer supports Python 3.9, since the SDK
+  itself now requires 3.10 or later. Supported runtimes are 3.10 through 3.14.
 - **BREAKING**: `Object.head(props="")` now uses the selective object HEAD API,
   returns `ObjectAttributes` instead of a header mapping, and continues to
   refresh `Object.props_cached`. Request non-default fields explicitly and
   access values through attributes such as `.size` and `.checksum_value`.
+- Removed the unused `torchdata` dependency from the PyTorch extra, development
+  requirements, and pyaisloader. Applications that use it must install it directly.
 - `ObjectAttributes` now exposes selected chunk, last-modified, ETag, location,
   mirror, and erasure-coding metadata through one type.
 - `ObjectClient.head()` now accepts optional property selectors while preserving
   its previous default attribute set.
+- Updated `xxhash` to `>=3.6.0,<5`, so the SDK can fully support python 3.14.
+- Batch TAR extraction uses a 64 KiB read buffer to reduce stream read overhead:
+  `Batch.get(tar_buffer_size=...)` can override it for TAR formats.
 
 ### Removed
 

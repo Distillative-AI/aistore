@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/aistore/ais/s3"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -60,12 +61,12 @@ type (
 	}
 	singleRProxy struct {
 		rp *httputil.ReverseProxy
-		u  *url.URL
+		u  string
 	}
 )
 
 // [METHOD] /v1/reverse
-func (p *proxy) revHandler(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) revCtrlHandler(w http.ResponseWriter, r *http.Request) {
 	p._reverse(w, r, false /*isPub*/)
 }
 
@@ -86,7 +87,7 @@ func (p *proxy) _reverse(w http.ResponseWriter, r *http.Request, isPub bool) {
 		p.writeErrURL(w, r)
 		return
 	}
-	debug.Assert(len(apiEndpoint) == len(apc.Daemon) || apiEndpoint[len(apc.Daemon)] == '/', apiEndpoint)
+	debug.AssertFunc(func() bool { return len(apiEndpoint) == len(apc.Daemon) || apiEndpoint[len(apc.Daemon)] == '/' }, apiEndpoint)
 
 	// 2. update URL path: remove `apc.Reverse`
 	r.URL.Path = cos.JoinW0(apc.Version, apiEndpoint)
@@ -180,7 +181,7 @@ func (p *proxy) _reverse(w http.ResponseWriter, r *http.Request, isPub bool) {
 		if isPub {
 			p.daePubHandler(w, r)
 		} else {
-			p.daeHandler(w, r)
+			p.daeCtrlHandler(w, r)
 		}
 		return
 	}
@@ -235,6 +236,11 @@ func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMs
 	}
 	rprimary := &p.rproxy.primary
 
+	// TODO:
+	// Three S3 endpoints forward here - putBckS3, delBckS3, and putBckVersioningS3.
+	// Select the S3 error handler for those requests so that an _unreachable_ primary
+	// produces an XML error response instead of a bare 502 (can wait; unlikely; benign).
+
 	rprimary.mu.Lock()
 	if rprimary.url != smap.Primary.PubNet.URL {
 		rprimary.url = smap.Primary.PubNet.URL
@@ -245,6 +251,7 @@ func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMs
 		rprimary.rp.Transport = rpTransport(config)
 		rprimary.rp.ErrorHandler = p.rpErrHandler
 	}
+	rp := rprimary.rp
 	rprimary.mu.Unlock()
 
 	if len(body) > 0 {
@@ -264,7 +271,7 @@ func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMs
 			nlog.Infoln(p.String(), "forwarding [", s, "] to the primary", pname)
 		}
 	}
-	rprimary.rp.ServeHTTP(w, r)
+	rp.ServeHTTP(w, r)
 	return true // forwarded
 }
 
@@ -288,8 +295,26 @@ func rpTransport(config *cmn.Config) *http.Transport {
 	return transport
 }
 
-// Based on default error handler `defaultErrorHandler` in `httputil/reverseproxy.go`.
+type (
+	stdlibErrHdlr func(http.ResponseWriter, *http.Request, error)
+)
+
+// ref: stdlib httputil/reverseproxy.go
+// - type: stdlibErrHdlr
+// - impl: similar to defaultErrorHandler
 func (p *proxy) rpErrHandler(w http.ResponseWriter, r *http.Request, err error) {
+	p._rpErrLog(r, err)
+	w.WriteHeader(http.StatusBadGateway)
+}
+
+// (ditto) when client speaks S3: return an XML error response
+// instead of leaving the SDK to synthesize one from a bare status
+func (p *proxy) rpErrHandlerS3(w http.ResponseWriter, r *http.Request, err error) {
+	p._rpErrLog(r, err)
+	s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusBadGateway})
+}
+
+func (p *proxy) _rpErrLog(r *http.Request, err error) {
 	var (
 		smap = p.owner.smap.get()
 		si   = smap.PubNet2Node(r.URL.Host) // assuming pub
@@ -303,14 +328,10 @@ func (p *proxy) rpErrHandler(w http.ResponseWriter, r *http.Request, err error) 
 	} else {
 		nlog.Errorf("%s rproxy to %s (%s %s): %v", p, dst, r.Method, r.URL.Path, err)
 	}
-	w.WriteHeader(http.StatusBadGateway)
 }
 
 func (p *proxy) reverseNodeRequest(w http.ResponseWriter, r *http.Request, smap *smapX, si *meta.Snode) {
 	debug.AssertFunc(func() bool { return si.ID() != p.SID() }, "reversing to self")
-
-	parsedURL, err := url.Parse(si.URL(cmn.NetIntraControl))
-	debug.AssertNoErr(err)
 
 	// stamp/sign over intra-control net
 	debug.AssertFunc(func() bool { return smap.isValid() })
@@ -318,14 +339,19 @@ func (p *proxy) reverseNodeRequest(w http.ResponseWriter, r *http.Request, smap 
 	// caution: svReq.payload() currently does not include query, host, and scheme; if it ever changes
 	// the following will have to change as well
 	p.setIntraHdrs(r, smap, si != nil)
-	p.reverseRequest(w, r, si.ID(), parsedURL)
+	p.reverseRequest(w, r, si.ID(), si.URL(cmn.NetIntraControl))
 }
 
-// usage:
-// 1. primary => node in the cluster
-// 2. primary => remais
-func (p *proxy) reverseRequest(w http.ResponseWriter, r *http.Request, nodeID string, parsedURL *url.URL) {
-	rproxy := p.rproxy.loadOrStore(nodeID, parsedURL, p.rpErrHandler)
+// Relay to a cluster node or remote AIS. An optional error handler applies only
+// to this request; nil retains the cached handler.
+func (p *proxy) reverseRequest(w http.ResponseWriter, r *http.Request, nodeID, rawURL string, errHdlr ...stdlibErrHdlr) {
+	rproxy := p.rproxy.loadOrStore(nodeID, rawURL, p.rpErrHandler)
+	if len(errHdlr) > 0 && errHdlr[0] != nil {
+		// Keep the cached instance and its shared connection pool intact.
+		copyRP := *rproxy
+		copyRP.ErrorHandler = errHdlr[0]
+		rproxy = &copyRP
+	}
 	rproxy.ServeHTTP(w, r)
 }
 
@@ -372,8 +398,7 @@ func (p *proxy) reverseRemAis(w http.ResponseWriter, r *http.Request, msg *apc.A
 	}
 
 	debug.Assert(len(urls) > 0)
-	u, err := url.Parse(urls[0])
-	if err != nil {
+	if _, err := url.Parse(urls[0]); err != nil {
 		p.writeErr(w, r, err)
 		return
 	}
@@ -387,7 +412,7 @@ func (p *proxy) reverseRemAis(w http.ResponseWriter, r *http.Request, msg *apc.A
 	query = cmn.DelBckFromQuery(query)
 	query = bck.AddToQuery(query)
 	r.URL.RawQuery = query.Encode()
-	p.reverseRequest(w, r, aliasOrUUID, u)
+	p.reverseRequest(w, r, aliasOrUUID, urls[0])
 }
 
 //////////////////
@@ -401,22 +426,23 @@ func (rp *reverseProxy) init() {
 	}
 }
 
-func (rp *reverseProxy) loadOrStore(uuid string, u *url.URL,
-	errHdlr func(w http.ResponseWriter, r *http.Request, err error),
-) *httputil.ReverseProxy {
+func (rp *reverseProxy) loadOrStore(uuid, rawURL string, errHdlr stdlibErrHdlr) *httputil.ReverseProxy {
 	revProxyIf, exists := rp.nodes.Load(uuid)
 	if exists {
 		shrp := revProxyIf.(*singleRProxy)
-		if shrp.u.Host == u.Host {
+		if shrp.u == rawURL { // compare URL strings as is
 			return shrp.rp
 		}
 	}
+	u, err := url.Parse(rawURL)
+	debug.AssertNoErr(err)
+
 	rproxy := httputil.NewSingleHostReverseProxy(u)
 	rproxy.Transport = rpTransport(cmn.GCO.Get())
 	rproxy.ErrorHandler = errHdlr
 
 	// NOTE: races are rare probably happen only when storing an entry for the first time or when URL changes.
 	// Also, races don't impact the correctness as we always have latest entry for `uuid`, `URL` pair (see: L3917).
-	rp.nodes.Store(uuid, &singleRProxy{rproxy, u})
+	rp.nodes.Store(uuid, &singleRProxy{rproxy, rawURL})
 	return rproxy
 }

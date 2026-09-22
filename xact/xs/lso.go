@@ -76,6 +76,7 @@ type (
 		smap      *meta.Smap
 		walk      struct {
 			bp           core.Backend     // t.Backend(bck)
+			err          error            // remember failed-walk error
 			pageCh       chan *cmn.LsoEnt // channel to accumulate listed object entries
 			stopCh       *cos.StopCh      // to abort bucket walk
 			wi           *walkInfo        // walking context and state
@@ -131,7 +132,7 @@ func (*lsoFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 }
 
 func (p *lsoFactory) Start() error {
-	if err := cos.ValidatePrefix("bad list-objects request", p.msg.Prefix); err != nil {
+	if err := cos.ValidatePrefix(apc.BadLsoRequest, p.msg.Prefix); err != nil {
 		return err
 	}
 	r := &LsoXact{
@@ -434,6 +435,7 @@ func (r *LsoXact) Abort(err error) (ok bool) {
 func (r *LsoXact) initWalk() {
 	r.walk.pageCh = make(chan *cmn.LsoEnt, r.config.Lso.WalkBuffer)
 	r.walk.done = false
+	r.walk.err = nil
 	r.walk.stopCh = cos.NewStopCh()
 	r.walk.lastDir = "" // reset directory dedup state
 	r.walk.wg.Add(1)
@@ -474,18 +476,14 @@ func (r *LsoXact) Do(msg *apc.LsoMsg) *LsoRsp {
 
 func (r *LsoXact) doPage() *LsoRsp {
 	// throttle
-	nreq := r.stats.nreq.Inc()
-	if r.adv.ShouldCheck(nreq) {
-		r.adv.Refresh()
-		if r.adv.Sleep > 0 {
-			time.Sleep(r.adv.Sleep)
-		}
-	}
+	r.adv.Throttle(r.stats.nreq.Inc())
 
 	// repeated request for same page
 	if r.msg.ContinuationToken != "" && r.msg.ContinuationToken == r.token {
-		page := &cmn.LsoRes{UUID: r.msg.UUID, Entries: r.page, ContinuationToken: r.nextToken}
-		return &LsoRsp{Lst: page, Status: http.StatusOK}
+		if !r.walk.done || r.walk.err == nil {
+			page := &cmn.LsoRes{UUID: r.msg.UUID, Entries: r.page, ContinuationToken: r.nextToken}
+			return &LsoRsp{Lst: page, Status: http.StatusOK}
+		}
 	}
 
 	debug.Assert(!r.walk.remote || r.nbi == nil)
@@ -522,14 +520,19 @@ func (r *LsoXact) doPageR() *LsoRsp {
 func (r *LsoXact) doPageA() *LsoRsp {
 	r.nextPageA()
 
+	if r.walk.done && r.walk.err != nil {
+		return &LsoRsp{Status: http.StatusInternalServerError, Err: r.walk.err}
+	}
+
 	var (
 		cnt  = r.msg.PageSize
 		idx  = r.findToken(r.msg.ContinuationToken)
 		lst  = r.page[idx:]
 		page *cmn.LsoRes
 	)
-	debug.Assert(int64(len(lst)) >= cnt || r.walk.done)
-	if int64(len(lst)) >= cnt {
+	// if the lookahead entry (nextPageA) is present then this target has more to list
+	debug.Assert(int64(len(lst)) > cnt || r.walk.done)
+	if int64(len(lst)) > cnt {
 		entries := lst[:cnt]
 		page = &cmn.LsoRes{UUID: r.msg.UUID, Entries: entries, ContinuationToken: entries[cnt-1].Name}
 	} else {
@@ -732,7 +735,7 @@ func (r *LsoXact) _clrPage(from, to int) {
 
 func (r *LsoXact) nextPageA() {
 	if r.token > r.msg.ContinuationToken {
-		// restart traversing the bucket (TODO: cache more and try to scroll back)
+		// restart traversing the bucket to scroll back (TODO: cache more history)
 		r.walk.stopCh.Close()
 		r.walk.wg.Wait()
 		r.initWalk()
@@ -745,12 +748,18 @@ func (r *LsoXact) nextPageA() {
 
 	r.token = r.msg.ContinuationToken
 
+	// read one entry more than requested to check if this target has more to list
+	lookahead := r.msg.PageSize + 1
+
 	// if (a) done walking or (b) already have enough, stop
-	if r.walk.done || r.havePage(r.token, r.msg.PageSize) {
+	if r.walk.done || r.havePage(r.token, lookahead) {
 		return
 	}
+	// r.page may retain entries past the token (incl. previous lookahead):
+	// count them, and read only what's still needed to reach lookahead
+	cached := int64(len(r.page) - r.findToken(r.token))
 
-	for cnt := int64(0); cnt < r.msg.PageSize; {
+	for cnt := cached; cnt < lookahead; {
 		entry, ok := <-r.walk.pageCh
 		if !ok {
 			r.walk.done = true
@@ -816,6 +825,8 @@ func (r *LsoXact) doWalk(msg *apc.LsoMsg) {
 	if err := fs.WalkBck(opts); err != nil {
 		if err != filepath.SkipDir && err != errLsoStopped {
 			r.AddErr(err, 0)
+			// remember failed-walk error
+			r.walk.err = err
 		}
 	}
 	close(r.walk.pageCh)

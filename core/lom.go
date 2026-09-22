@@ -72,6 +72,7 @@ type (
 		smm      *memsys.MMSA
 		locker   nameLocker
 		lchk     lchk
+		sidx     sidx
 		maxLmeta atomic.Int64
 	}
 )
@@ -103,6 +104,7 @@ func Tinit(t Target, config *cmn.Config, runHK bool) {
 		g.locker = newNameLocker()
 		g.pmm = t.PageMM()
 		g.smm = t.ByteMM()
+		g.sidx.init(runHK)
 	}
 	if runHK {
 		g.lchk.init(config)
@@ -141,32 +143,20 @@ func (lom *LOM) Lsize(special ...bool) int64 {
 
 func (lom *LOM) loaded() bool { return lom.md.lid != 0 }
 
-func (lom *LOM) IsHRW() bool { return lom.md.flags&lmflHRW != 0 }
+func (md *lmeta) isHRW() bool { return md.flags&lmflHRW != 0 }
 
-func (lom *LOM) setHRW(v bool) {
+func (md *lmeta) setHRW(v bool) {
 	if v {
-		lom.md.flags |= lmflHRW
+		md.flags |= lmflHRW
 	} else {
-		lom.md.flags &^= lmflHRW
+		md.flags &^= lmflHRW
 	}
 }
 
-// HasShardIdx reports whether the LOM has an associated shard index persisted
-// in ais://.sys-shardidx.
-func (lom *LOM) HasShardIdx() bool { return lom.md.flags&lmflShardIdx != 0 }
-
-// SetShardIdx sets or clears the lmflShardIdx flag. The flag is persisted with
-// the next Persist/PersistMain call on this LOM.
-func (lom *LOM) SetShardIdx(v bool) {
-	if v {
-		lom.md.flags |= lmflShardIdx
-	} else {
-		lom.md.flags &^= lmflShardIdx
-	}
-}
+func (lom *LOM) IsHRW() bool   { return lom.md.isHRW() }
+func (lom *LOM) setHRW(v bool) { lom.md.setHRW(v) }
 
 // given an existing (on-disk) object, determines whether it is a _copy_
-// (compare with isMirror below)
 func (lom *LOM) IsCopy() bool {
 	if lom.IsHRW() {
 		return false
@@ -179,7 +169,7 @@ func (lom *LOM) IsCopy() bool {
 func (lom *LOM) Fstat(getAtime bool) (size, atimefs int64, mtime time.Time, _ error) {
 	finfo, err := os.Lstat(lom.FQN)
 	if err == nil {
-		size = finfo.Size() // NOTE: chunk?
+		size = finfo.Size()
 		mtime = finfo.ModTime()
 		if getAtime {
 			atimefs = ios.GetATime(finfo).UnixNano()
@@ -339,7 +329,7 @@ func (lom *LOM) LastModifiedLso() (string, time.Time) {
 func (lom *LOM) ETag(mtime time.Time, allowSyscall bool) string {
 	// 1. ETag via custom
 	if etag, ok := lom.GetCustomKey(cmn.ETag); ok {
-		debug.Assert(etag != "" && etag[0] != '"')
+		debug.AssertFunc(func() bool { return etag != "" && etag[0] != '"' })
 		return etag
 	}
 
@@ -350,7 +340,7 @@ func (lom *LOM) ETag(mtime time.Time, allowSyscall bool) string {
 
 	// 2. MD5
 	if !lom.IsChunked() && cksum.Ty() == cos.ChecksumMD5 {
-		debug.Assert(cksum.Val()[0] != '"', cksum.Val())
+		debug.Func(func() { debug.Assert(cksum.Val()[0] != '"', cksum.Val()) })
 		return cksum.Val()
 	}
 
@@ -632,13 +622,16 @@ func (lom *LOM) ComputeCksum(cksumType string, locked bool) (cksum *cos.CksumHas
 //
 // (compare w/ LoadUnsafe() below)
 func (lom *LOM) Load(cacheit, locked bool) error {
-	debug.Assert(lom.Bprops() != nil, lom.Cname()) // must be InitBck/InitFQN'ed
+	debug.Func(func() { debug.Assert(lom.Bprops() != nil, lom.Cname()) }) // must be InitBck/InitFQN'ed
 	var (
 		lcache, lmd = lom.fromCache()
 	)
 	// fast path
 	if lmd != nil {
+		hrw := lom.IsHRW()
 		lom.md = *lmd
+		lom.md.setHRW(hrw)
+
 		if lom.IsFntl() {
 			lom.fixupFntl()
 		}

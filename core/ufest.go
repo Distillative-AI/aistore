@@ -694,11 +694,14 @@ func (u *Ufest) storeCompleted(lom *LOM, overrideCompleted bool) error {
 		return fmt.Errorf("%s: failed to store, err: %v", u._itag(lom.Cname()), err)
 	}
 
-	// fixup chunk #1
+	// fixup chunk #1 (already in place when relocating - see Relocate)
 	c := u.firstChunk()
 	orig := c.path
-	if err := lom.RenameFinalize(c.path); err != nil {
-		return err
+	debug.Func(func() { debug.Assert(c.path != lom.FQN || overrideCompleted, lom.Cname()) })
+	if c.path != lom.FQN {
+		if err := lom.RenameFinalize(c.path); err != nil {
+			return err
+		}
 	}
 	c.path = u.chunk1Path(lom, true /*completed*/)
 
@@ -958,8 +961,10 @@ func (u *Ufest) ETagS3() (string, error) {
 			h.Write(c.MD5)
 			if c.ETag != "" {
 				if bin, err := cmn.ETagToMD5(c.ETag); err == nil {
-					debug.Assert(bytes.Equal(bin, c.MD5),
-						"ETag/md5 mismatch: ", c.ETag, " vs ", cmn.MD5ToQuotedETag(c.MD5))
+					debug.Func(func() {
+						debug.Assert(bytes.Equal(bin, c.MD5),
+							"ETag/md5 mismatch: ", c.ETag, " vs ", cmn.MD5ToQuotedETag(c.MD5))
+					})
 				}
 			}
 		case c.ETag != "":
@@ -1663,8 +1668,9 @@ func (u *Ufest) Relocate(hrwMi *fs.Mountpath, buf []byte) (*LOM, error) {
 	if err := hlom.InitFQN(dstObjFQN, lom.Bucket()); err != nil {
 		return nil, err
 	}
-	debug.Assert(hlom.Mountpath().Path == hrwMi.Path, hlom.Mountpath().Path, " vs ", hrwMi.Path)
+	debug.Func(func() { debug.Assert(hlom.Mountpath().Path == hrwMi.Path, hlom.Mountpath().Path, " vs ", hrwMi.Path) })
 	hlom.CopyAttrs(lom, false /*skip checksum*/)
+	hlom.SetShardIdx(lom.HasShardIdx())
 
 	// persist completed manifest at new location
 	u.lom = hlom // ostensibly, to pass assert(validate-locations)
