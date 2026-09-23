@@ -186,8 +186,19 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 		lom      = poi.lom
 		uploadID string
 	)
+	if poi.r != nil {
+		defer cos.Close(poi.r) // poi owns it (see "transfer ownership")
+	}
 
-	debug.Func(func() { debug.Assertf(poi.size > 0, "poi.size is required in chunk, object name: %s", poi.lom.Cname()) })
+	switch {
+	case poi.size <= 0:
+		return http.StatusInternalServerError, fmt.Errorf("%s: cannot chunk without object size (%d)", lom.Cname(), poi.size)
+	case chunkSize == 0:
+		chunkSize = cmn.ChunkSizeDflt
+	case chunkSize < 0:
+		return http.StatusInternalServerError, fmt.Errorf("%s: invalid chunk size %d", lom.Cname(), chunkSize)
+	}
+
 	if uploadID, err = poi.t.ups.start(poi.oreq, lom, poi.skipBackend); err != nil {
 		poi.t.ups.abort(poi.oreq, lom, uploadID)
 		return http.StatusInternalServerError, err
@@ -225,8 +236,7 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 			return ec, er
 		}
 
-		// Calculate actual bytes read
-		total += thisChunkSize
+		total += thisChunkSize // exact: putPart fails on a short read
 
 		// Track completed part
 		completedParts = append(completedParts, apc.MptCompletedPart{
@@ -235,6 +245,13 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 		})
 
 		partNum++
+	}
+
+	// expecting exactly poi.size (compare w/ ups._put)
+	var b [1]byte
+	if n, _ := io.ReadFull(poi.r, b[:]); n > 0 {
+		poi.t.ups.abort(poi.oreq, lom, uploadID)
+		return http.StatusInternalServerError, fmt.Errorf("%s: source exceeds its declared size %d", lom.Cname(), poi.size)
 	}
 
 	_, ecode, err = poi.t.ups.complete(&completeArgs{
@@ -269,6 +286,7 @@ func (poi *putOI) putObject() (ecode int, err error) {
 				nlog.Infoln(poi.lom.String(), "has identical", poi.cksumToUse.String(), "- PUT is a no-op")
 			}
 			cos.DrainReader(poi.r)
+			cos.Close(poi.r)
 			return 0, nil
 		}
 	}
@@ -1968,15 +1986,14 @@ func (coi *coi) _reader(t *target, dm *bundle.DM, lom, dst *core.LOM, args *core
 	if resp.Err != nil {
 		return xs.CoiRes{Ecode: resp.Ecode, Err: resp.Err}
 	}
-	// TODO: propagate resp.OAH.Lsize() and enforce the destination's hard limit
-	// in this GetROC/ETL path, with coverage separate from regular object copy.
 	poi := allocPOI()
 	defer freePOI(poi)
 	{
 		poi.t = t
 		poi.lom = dst
 		poi.config = coi.Config
-		poi.r = resp.R      // transfer ownership; Close may release GetROC's source rlock
+		poi.r = resp.R // transfer ownership
+		poi.size = resp.OAH.Lsize()
 		poi.xctn = coi.Xact // on behalf of
 		poi.workFQN = dst.GenFQN(fs.WorkCT, "copy-dp")
 		poi.atime = resp.OAH.AtimeUnix()
@@ -2012,8 +2029,8 @@ func (coi *coi) _regular(t *target, lom, dst *core.LOM, lcopy bool) (res xs.CoiR
 		return xs.CoiRes{Err: err}
 	}
 
-	// TODO: same-Uname copies need a dedicated lock handoff before manifest completion
-	if lom.Lsize() > int64(dst.Bprops().Chunks.MaxMonolithicSize) {
+	// prevent same-uname deadlock and avoid rechunking an already-chunked source
+	if !lcopy && !lom.IsChunked() && lom.Lsize() > int64(dst.Bprops().Chunks.MaxMonolithicSize) {
 		lom.Unlock(lcopy) // _chunk acquires its own read lock via GetROC
 		return coi._chunk(t, lom, dst, int64(dst.Bprops().Chunks.ChunkSize))
 	}
@@ -2052,13 +2069,12 @@ func (coi *coi) _chunk(t *target, lom, dst *core.LOM, dstChunkSize int64) (res x
 	if resp.Err != nil {
 		return xs.CoiRes{Ecode: resp.Ecode, Err: resp.Err}
 	}
-	defer cos.Close(resp.R) // releases the source rlock acquired by GetROC
 	poi := allocPOI()
 	defer freePOI(poi)
 	{
 		poi.t = t
 		poi.lom = dst
-		poi.r = resp.R
+		poi.r = resp.R // transfer ownership
 		poi.size = lom.Lsize()
 		poi.xctn = coi.Xact // on behalf of
 		poi.owt = coi.OWT
