@@ -20,7 +20,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/aistore/ais/s3"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
@@ -186,9 +185,11 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 		lom      = poi.lom
 		uploadID string
 	)
-	if poi.r != nil {
-		defer cos.Close(poi.r) // poi owns it (see "transfer ownership")
-	}
+	defer func() {
+		if poi.r != nil {
+			cos.Close(poi.r) // poi owns it (see "transfer ownership")
+		}
+	}()
 
 	switch {
 	case poi.size <= 0:
@@ -247,13 +248,8 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 		partNum++
 	}
 
-	// expecting exactly poi.size (compare w/ ups._put)
-	var b [1]byte
-	if n, _ := io.ReadFull(poi.r, b[:]); n > 0 {
-		poi.t.ups.abort(poi.oreq, lom, uploadID)
-		return http.StatusInternalServerError, fmt.Errorf("%s: source exceeds its declared size %d", lom.Cname(), poi.size)
-	}
-
+	cos.Close(poi.r) // ditto
+	poi.r = nil
 	_, ecode, err = poi.t.ups.complete(&completeArgs{
 		r:           poi.oreq,
 		lom:         lom,
@@ -318,7 +314,8 @@ func (poi *putOI) putObject() (ecode int, err error) {
 		poi.stats()
 		// response header
 		if poi.resphdr != nil {
-			cmn.ToHeader(poi.lom.ObjAttrs(), poi.resphdr, 0 /*skip setting content-length*/)
+			rsphdr := rsphdr{hdr: poi.resphdr, lom: poi.lom, size: -1 /*skip setting content-length*/}
+			rsphdr.set()
 		}
 	}
 
@@ -1333,15 +1330,11 @@ func _txsize(size int64) int64 {
 	return min(size, memsys.DefaultBuf2Size)
 }
 
+// GET response header: warm, cold (both regular and streaming), and range reads
+// (cksum: range checksum, or nil for the object's own)
 func (goi *getOI) setwhdr(whdr http.Header, cksum *cos.Cksum, size int64) {
-	oa := goi.lom.ObjAttrs()
-	oa.ContentTypeToHeader(whdr) // stored or cos.ContentBinary
-	if goi.dpq.isS3 {
-		whdr.Set(cos.HdrContentLength, strconv.FormatInt(size, 10))
-		s3.SetS3Headers(whdr, goi.lom)
-	} else {
-		cmn.ToHeader(oa, whdr, size, cksum)
-	}
+	rsphdr := rsphdr{hdr: whdr, lom: goi.lom, cksum: cksum, size: size, s3: goi.dpq.isS3, ctype: true}
+	rsphdr.set()
 
 	// when applicable, retire the kTLS-armed connection _after_ this response
 	ktlsRetire(goi.ktls, whdr, size)
@@ -2069,6 +2062,11 @@ func (coi *coi) _chunk(t *target, lom, dst *core.LOM, dstChunkSize int64) (res x
 	if resp.Err != nil {
 		return xs.CoiRes{Ecode: resp.Ecode, Err: resp.Err}
 	}
+	// preserve source version and custom metadata - same as Copy2FQN in _regular
+	// (CopyAttrs copies key by key - dst must not alias the source's CustomMD map;
+	// size and atime get overwritten upon completion)
+	dst.CopyAttrs(lom, true /*skip checksum: computed upon completion*/)
+
 	poi := allocPOI()
 	defer freePOI(poi)
 	{
@@ -2169,7 +2167,7 @@ func (coi *coi) put(t *target, sargs *sendArgs) error {
 		query = sargs.bckTo.NewQuery()
 		size  = sargs.objAttrs.Lsize(true)
 	)
-	cmn.ToHeader(sargs.objAttrs, hdr, size)
+	cmn.ToHeader(sargs.objAttrs, hdr, sargs.objAttrs.Checksum()) // (Content-Length: see req.ContentLength below)
 	hdr.Set(cos.HdrContentType, cos.ContentBinary)
 
 	query.Set(apc.QparamOWT, sargs.owt.ToS())
