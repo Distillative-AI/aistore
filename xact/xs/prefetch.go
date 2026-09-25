@@ -39,11 +39,13 @@ type (
 		pending []core.Xact
 		n       atomic.Int32 // pending + claimed children not yet accounted for
 		mu      sync.Mutex
+		once    sync.Once
 	}
 	prfStats struct {
 		// cold-GET
 		coldN    atomic.Int64 // cold-GET completions
 		coldSize atomic.Int64 // --/-- size
+		tooLarge atomic.Int64 // large cold GETs (blob-downloader not used)
 		// pending
 		blobN    atomic.Int64 // blob-downloader children accepted/spawned
 		blobSize atomic.Int64 // bytes --/--
@@ -84,10 +86,13 @@ func (p *prfFactory) Start() (err error) {
 	if p.msg.BlobNumWorkers < xact.NwpNone {
 		return fmt.Errorf("invalid blob-num-workers=%d: expecting (-1..N) range", p.msg.BlobNumWorkers)
 	}
-	if p.msg.BlobThreshold > 0 && p.msg.BlobThreshold < minBlobDlPrefetch {
-		a, b := cos.IEC(p.msg.BlobThreshold, 0), cos.IEC(minBlobDlPrefetch, 0)
+	if p.msg.BlobThreshold < 0 {
+		return fmt.Errorf("invalid blob-threshold=%d: expecting a non-negative value", p.msg.BlobThreshold)
+	}
+	if p.msg.BlobThreshold > 0 && p.msg.BlobThreshold < MinBlobDlPrefetchSize {
+		a, b := cos.IEC(p.msg.BlobThreshold, 0), cos.IEC(MinBlobDlPrefetchSize, 0)
 		nlog.Warningln("blob-threshold (", a, ") is too small, must be at least", b, "- updating...")
-		p.msg.BlobThreshold = minBlobDlPrefetch
+		p.msg.BlobThreshold = MinBlobDlPrefetchSize
 	}
 
 	b := p.Bck
@@ -134,7 +139,7 @@ func newPrefetch(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.Prefetch
 		stats.VlabBucket: bck.Cname(""),
 		stats.VlabXkind:  r.Kind(),
 	}
-	r.ctx = xact.NewCtxVlabs(r.xlabs)
+	r.ctx = xact.WithCtxVlabs(r.Context(), r.xlabs)
 
 	if r.msg.BlobThreshold > 0 {
 		r.pebl.init(r)
@@ -222,10 +227,14 @@ func (r *prefetch) do(lom *core.LOM, lrit *lrit, _ []byte) {
 	if blobOK && size >= r.msg.BlobThreshold {
 		ecode, err = r.blobdl(lom, oa)
 	} else {
-		if r.msg.BlobThreshold == 0 && size > cos.GiB {
-			r._whinge(lom, size)
+		reason := "below blob threshold"
+		switch {
+		case r.msg.BlobThreshold == 0:
+			reason = "blob-downloading disabled (threshold = 0)"
+		case !blobOK:
+			reason = "blob-downloader too busy"
 		}
-		ecode, err = r.getCold(lom)
+		ecode, err = r.getCold(lom, oa, reason)
 	}
 
 	if err == nil {
@@ -242,24 +251,37 @@ func (r *prefetch) do(lom *core.LOM, lrit *lrit, _ []byte) {
 			r.AddErr(err, 5, cos.ModXs)
 		}
 	case cos.IsErrOOS(err):
-		r.Abort(err)
 		r.errStats()
+		r.Abort(err)
 	default:
 		r.AddErr(err, 5, cos.ModXs)
 		r.errStats()
 	}
 }
 
-func (r *prefetch) _whinge(lom *core.LOM, size int64) {
+const (
+	logWarnSize = cos.GiB
+	logErrSize  = 5 * cos.GiB
+)
+
+// sparse-log why blob-downloader was not used (but was expected to)
+func (r *prefetch) _warnGetLarge(lom *core.LOM, size int64, reason string) {
+	cnt := r.stats.tooLarge.Inc()
+	if size < logErrSize && !cmn.Rom.V(5, cos.ModXs) && !cos.Sparse(cnt) {
+		return
+	}
+
 	var sb cos.SB
 	sb.Init(ctlMsgBufSize)
 	sb.WriteString(r.Name())
-	sb.WriteString(": prefetching large size ")
+	sb.WriteString(": prefetched large size ")
 	sb.WriteString(cos.IEC(size, 1))
-	sb.WriteString(" with blob-downloading disabled [")
+	sb.WriteString(" via cold GET (")
+	sb.WriteString(reason)
+	sb.WriteString(") [")
 	sb.WriteString(lom.Cname())
 	sb.WriteUint8(']')
-	if size >= 5*cos.GiB {
+	if size >= logErrSize {
 		nlog.Errorln(sb.String())
 	} else {
 		nlog.Warningln(sb.String())
@@ -269,7 +291,7 @@ func (r *prefetch) _whinge(lom *core.LOM, size int64) {
 // OwtGetPrefetchLock: minimal locking, optimistic concurrency
 // - light-weight alternative to t.GetCold impl.
 // - rate limited via ais/rlbackend, if defined
-func (r *prefetch) getCold(lom *core.LOM) (ecode int, err error) {
+func (r *prefetch) getCold(lom *core.LOM, oa *cmn.ObjAttrs, reason string) (ecode int, err error) {
 	started := mono.NanoTime()
 
 	// note invariant: either a) LoadLatest => UncacheDel (not-latest) or b) not-found
@@ -281,6 +303,9 @@ func (r *prefetch) getCold(lom *core.LOM) (ecode int, err error) {
 
 	// RGET stats (compare with ais/tgtimpl namesake)
 	size := lom.Lsize()
+	if oa != nil && oa.Size != size {
+		nlog.Warningln(r.Name(), ": remote size changed between HEAD and GET:", lom.Cname(), oa.Size, "->", size)
+	}
 	rgetstats(r.bp, r.xlabs, size, started)
 
 	// own stats
@@ -288,6 +313,11 @@ func (r *prefetch) getCold(lom *core.LOM) (ecode int, err error) {
 	r.stats.coldN.Inc()
 	r.stats.coldSize.Add(size)
 	r.coldStats(size, started)
+
+	// large, and blob-download was expected (threshold 0 or crossed)
+	if size > logWarnSize && (r.msg.BlobThreshold == 0 || size >= r.msg.BlobThreshold) {
+		r._warnGetLarge(lom, size, reason)
+	}
 
 	return 0, nil
 }
@@ -305,22 +335,21 @@ func (r *prefetch) Snap() (snap *core.Snap) {
 func (r *prefetch) blobdl(lom *core.LOM, oa *cmn.ObjAttrs) (int, error) {
 	// pass user preferences through; blobFactory.Start tunes them once
 	params := &core.BlobParams{
-		Lom:     core.AllocLOM(lom.ObjName),
+		Lom:     &core.LOM{ObjName: lom.ObjName},
 		Context: r.Context(),
 		Msg: &apc.BlobMsg{
 			ChunkSize:  r.msg.BlobChunkSize,
 			NumWorkers: r.msg.BlobNumWorkers,
+			LatestVer:  r.latestVer, // (re-check under w-lock)
 		},
 		Parent: xact.Cname(BlobParentPrefetch, r.ID()),
 		TermCB: r.pebl.done,
 	}
 	if err := params.Lom.InitBck(lom.Bck()); err != nil {
-		core.FreeLOM(params.Lom)
 		return 0, err
 	}
 	xctn, err := core.T.GetColdBlob(params, oa)
 	if err != nil {
-		core.FreeLOM(params.Lom) // xaction was not registered and did not take ownership
 		// No range request has started; 429 here would be an internal protocol leak.
 		debug.Func(func() { debug.Assert(!cmn.IsErrTooManyRequests(err)) })
 		if !isErrBlobDlColdFallback(err) {
@@ -330,13 +359,17 @@ func (r *prefetch) blobdl(lom *core.LOM, oa *cmn.ObjAttrs) (int, error) {
 		r.stats.blobRej.Inc()
 		r.blobRejStats()
 		nlog.Warningln(r.Name(), ": blob download failed to start, falling back to regular cold GET: ", err)
-		return r.getCold(lom)
+		return r.getCold(lom, oa, "blob-download failed to start")
+	}
+	if xctn == nil {
+		// present under w-lock (e.g., filled by a concurrent cold GET) - nothing to do
+		return 0, nil
 	}
 
-	// account for the spawn
+	size := xctn.(*XactBlobDl).Size() // trust the pebl's (actual) size - target may re-HEAD and replace oa
 	r.stats.blobN.Inc()
-	r.stats.blobSize.Add(oa.Size)
-	r.stats.peblSize.Add(oa.Size)
+	r.stats.blobSize.Add(size)
+	r.stats.peblSize.Add(size)
 
 	// TermCB may have fired before this add (and found nothing to remove) - reap
 	r.pebl.add(xctn)
@@ -479,7 +512,8 @@ func (pebl *pebl) wait() {
 		case total >= peblTimeout:
 			err := fmt.Errorf("%d blob download%s timed-out: %s", n, cos.Plural(int(n)), pebl.str())
 			nlog.Warningln(xname, err)
-			r.AddErr(err)
+			r.Abort(err)
+			pebl.abort(err)
 			return
 		case total >= 4*time.Minute && total-sleep < 4*time.Minute:
 			nlog.Warningln(xname, waiting, pebl.str())
@@ -505,6 +539,10 @@ func (pebl *pebl) wait() {
 }
 
 func (pebl *pebl) abort(err error) {
+	pebl.once.Do(func() { pebl.abortPending(err) })
+}
+
+func (pebl *pebl) abortPending(err error) {
 	pebl.mu.Lock()
 	pending := slices.Clone(pebl.pending)
 	pebl.mu.Unlock()
@@ -592,6 +630,9 @@ func (r *prefetch) blobRejStats() {
 }
 
 func (r *prefetch) errStats() {
+	if r.IsAborted() {
+		return
+	}
 	core.T.StatsUpdater().IncWith(stats.ErrPrefetchCount, r.xlabs)
 }
 
@@ -651,6 +692,12 @@ func (r *prefetch) _ctlMsgJob(sb *cos.SB) {
 		sb.WriteUint8(',')
 		sb.WriteString(cos.IEC(r.stats.coldSize.Load(), 2))
 		sb.WriteUint8(')')
+	}
+	largeN := r.stats.tooLarge.Load()
+	if largeN > 0 {
+		sep()
+		sb.WriteString("large-cold:")
+		sb.WriteString(strconv.FormatInt(largeN, 10))
 	}
 	if blobN > 0 || blobRej > 0 {
 		sep()
