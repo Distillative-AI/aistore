@@ -46,7 +46,9 @@ const (
 var supportedRemAttrs = [...]string{VersionObjMD, CRC32CObjMD, MD5ObjMD, ETag, cos.HdrLastModified, cos.HdrContentType}
 
 type (
-	// NOTE: will be removed in the upcoming releases; use ObjectPropsV2 instead
+	// ObjectProps is the legacy native object HEAD v1 response.
+	//
+	// Deprecated: Use ObjectPropsV2 for native object HEAD responses.
 	ObjectProps struct {
 		Bck Bck `json:"bucket"`
 		ObjAttrs
@@ -270,6 +272,16 @@ func (oa *ObjAttrs) EqCksum(cksum *cos.Cksum) bool {
 	return !cos.NoneC(oa.Cksum) && oa.Cksum.Equal(cksum)
 }
 
+// usage:
+// - in-cluster object
+// - no changes since the previous check, atime excluding
+// see also:
+// - ObjAttrs.CheckEq that compares (in-cluster <=> remote)
+func (oa *ObjAttrs) EqLocal(other *ObjAttrs) bool {
+	return oa.Size == other.Size && oa.Version() == other.Version() && oa.Cksum.Equal(other.Cksum) &&
+		maps.Equal(oa.CustomMD, other.CustomMD)
+}
+
 func (oa *ObjAttrs) Version(_ ...bool) string {
 	if oa.Ver == nil {
 		return ""
@@ -324,6 +336,15 @@ func (oa *ObjAttrs) DelStdCustom() {
 
 func (oa *ObjAttrs) DelCustomKey(k string) {
 	delete(oa.CustomMD, k)
+}
+
+// SetContentType stores only non-default values.
+func (oa *ObjAttrs) SetContentType(v string) {
+	if IsDefaultContentType(v) {
+		oa.DelCustomKey(cos.HdrContentType)
+		return
+	}
+	oa.SetCustomKey(cos.HdrContentType, v)
 }
 
 // GET and HEAD responses: stored Content-Type, if any; otherwise cos.ContentBinary
@@ -568,7 +589,9 @@ func (op *ObjectPropsV2) FromHeaders(hdr http.Header, props string) error {
 // Note version comparison may fail even when the objects are identical, content-wise:
 // same size, ETag, and checksums may still "co-exist" with different versions.
 //
-// TODO: count == 1 with matching checksum being xxhash - must be configurable :NOTE
+// TODO: count == 1 with matching checksum being xxhash - must be configurable
+//
+// See also: ObjAttrs.EqLocal, ObjAttrs.EqCksum
 func (oa *ObjAttrs) CheckEq(rem cos.OAH) error {
 	var (
 		ver       string

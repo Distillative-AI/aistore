@@ -180,6 +180,29 @@ func (poi *putOI) do(resphdr http.Header, r *http.Request, dpq *dpq) (_ int, err
 	return poi.putObject()
 }
 
+// poi.chunk() writes a single input reader (`poi.r`) in chunks
+//
+// Execution paths:
+// - native/S3 single-object PUT: poi.do() => putObject() => chunk(bucket.ChunkSize)
+//   when the known size exceeds the bucket's MaxMonolithicSize;
+// - target.PutObject(): params.ChunkSize > 0 calls chunk() directly -
+//   otherwise, putObject() applies the same hard-limit check;
+// - local regular copy: coi._regular() => _chunk() for a monolithic source above
+//   the destination's MaxMonolithicSize; excludes same-object replica copies;
+// - copy through a reader: coi._reader() => putObject() => the same size check;
+// and finally:
+// - copy to another target: HTTP PUT or DM receiver => destination PUT machinery => the same size check.
+//
+// Ownership: chunk() owns and closes poi.r, and owns the internal upload ID. On failure,
+// it preserves the original error and aborts unless complete() has retired the upload.
+// Further:
+// - force=true attempts local cleanup even if backend abort fails;
+// - skipBackend=true also skips backend abort;
+// - cleanup upon any failure - is best effort.
+//
+// Explicit native/S3 MPU clients own their upload IDs and call ups.abort(force=false):
+// backend abort failure retains local upload state for retry, except for backend 404.
+
 func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 	var (
 		lom      = poi.lom
@@ -201,7 +224,9 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 	}
 
 	if uploadID, err = poi.t.ups.start(poi.oreq, lom, poi.skipBackend); err != nil {
-		poi.t.ups.abort(poi.oreq, lom, uploadID)
+		if uploadID != "" {
+			poi.t.ups.abort(poi.oreq, lom, uploadID, true /*force*/, poi.skipBackend)
+		}
 		return http.StatusInternalServerError, err
 	}
 
@@ -233,7 +258,7 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 		}
 		etag, ec, er := poi.t.ups.putPart(&args)
 		if er != nil {
-			poi.t.ups.abort(poi.oreq, lom, uploadID)
+			poi.t.ups.abort(poi.oreq, lom, uploadID, true /*force*/, poi.skipBackend)
 			return ec, er
 		}
 
@@ -250,7 +275,7 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 
 	cos.Close(poi.r) // ditto
 	poi.r = nil
-	_, ecode, err = poi.t.ups.complete(&completeArgs{
+	cargs := completeArgs{
 		r:           poi.oreq,
 		lom:         lom,
 		uploadID:    uploadID,
@@ -259,19 +284,23 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 		isS3:        false,
 		skipBackend: poi.skipBackend,
 		locked:      poi.locked,
-	})
+	}
+	_, ecode, err = poi.t.ups.complete(&cargs)
+	if err != nil && !cargs.uploadClosed {
+		poi.t.ups.abort(poi.oreq, lom, uploadID, true /*force*/, poi.skipBackend)
+	}
 	return ecode, err
 }
 
 func (poi *putOI) putObject() (ecode int, err error) {
-	maxMonoSize := int64(poi.lom.Bprops().Chunks.MaxMonolithicSize)
-	// protect the bucket: if the object size exceeds the max monolithic size, MUST chunk
+	chunkSize := poi.lom.Bprops().Chunks.ChunkSizeFor(poi.size)
+	// TODO: validate cksumToUse while chunking before completing the internal upload
 	// NOTE: if `poi.size` is not set, don't trigger chunking
-	if maxMonoSize > 0 && poi.size > maxMonoSize {
+	if chunkSize > 0 {
 		if cmn.Rom.V(5, cos.ModAIS) {
-			nlog.Infoln("PUT", poi.lom.Cname(), "size", poi.size, "exceeds object size limit, PUT as chunks")
+			nlog.Infoln("PUT", poi.lom.Cname(), "size", poi.size, "requires chunking per bucket policy")
 		}
-		return poi.chunk(int64(poi.lom.Bprops().Chunks.ChunkSize))
+		return poi.chunk(chunkSize)
 	}
 	poi.ltime = mono.NanoTime()
 
@@ -2023,9 +2052,11 @@ func (coi *coi) _regular(t *target, lom, dst *core.LOM, lcopy bool) (res xs.CoiR
 	}
 
 	// prevent same-uname deadlock and avoid rechunking an already-chunked source
-	if !lcopy && !lom.IsChunked() && lom.Lsize() > int64(dst.Bprops().Chunks.MaxMonolithicSize) {
-		lom.Unlock(lcopy) // _chunk acquires its own read lock via GetROC
-		return coi._chunk(t, lom, dst, int64(dst.Bprops().Chunks.ChunkSize))
+	if !lcopy && !lom.IsChunked() {
+		if chunkSize := dst.Bprops().Chunks.ChunkSizeFor(lom.Lsize()); chunkSize > 0 {
+			lom.Unlock(lcopy) // _chunk acquires its own read lock via GetROC
+			return coi._chunk(t, lom, dst, chunkSize)
+		}
 	}
 
 	defer lom.Unlock(lcopy)
@@ -2201,6 +2232,10 @@ func (coi *coi) put(t *target, sargs *sendArgs) error {
 	if err != nil {
 		err = cmn.NewErrFailedTo(t, "coi.put "+sargs.bckTo.Cname(sargs.objNameTo), sargs.tsi, err)
 	} else {
+		err = cmn.CheckResp(resp, req.Method, req.URL.Path)
+		if herr := cmn.AsErrHTTP(err); herr != nil {
+			herr.Message += " (" + t.String() + ": coi.put " + sargs.bckTo.Cname(sargs.objNameTo) + " " + sargs.tsi.String() + ")"
+		}
 		cos.DrainReader(resp.Body)
 		resp.Body.Close()
 	}

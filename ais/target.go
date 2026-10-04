@@ -6,6 +6,7 @@ package ais
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -1312,7 +1313,7 @@ func (t *target) httpobjdelete(w http.ResponseWriter, r *http.Request, apireq *a
 			return
 		}
 		uploadID := apireq.dpq.get(apc.QparamMptUploadID)
-		if ecode, err := t.ups.abort(r, lom, uploadID); err != nil {
+		if ecode, err := t.ups.abort(r, lom, uploadID, false /*force*/, false /*skipBackend*/); err != nil {
 			t.writeErr(w, r, err, ecode)
 		}
 		return
@@ -1342,6 +1343,10 @@ func (t *target) httpobjdelete(w http.ResponseWriter, r *http.Request, apireq *a
 
 // POST /v1/objects/bucket-name/object-name
 func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *apiRequest) {
+	if r.URL.Path == apc.URLPathObjects.S { // head-batch: no bucket in the URL
+		t.httpobjhdb(w, r, apireq.dpq)
+		return
+	}
 	msg, err := t.readActionMsg(w, r)
 	if err != nil {
 		return
@@ -1426,14 +1431,19 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 				break
 			}
 		}
-		_, ecode, err = t.ups.complete(&completeArgs{
+		cargs := completeArgs{
 			r:        r,
 			lom:      lom,
 			uploadID: uploadID,
 			body:     nil,
 			parts:    mptCompletedParts,
 			locked:   false,
-		})
+		}
+		_, ecode, err = t.ups.complete(&cargs)
+		if err != nil && cargs.uploadClosed {
+			e := cargs.closedErr(err)
+			err = errors.New(e.Error()) // special: ecode here takes precedence over "%w"
+		}
 	case apc.ActCheckLock:
 		t._checkLocked(w, r, apireq.bck, apireq.items[1])
 	default:
@@ -1474,15 +1484,10 @@ func (t *target) _checkLocked(w http.ResponseWriter, r *http.Request, bck *meta.
 	w.WriteHeader(ecode)
 }
 
-// HEAD /v1/objects/<bucket-name>/<object-name>
+// Native HEAD /v1/objects/<bucket-name>/<object-name>
 //
-// Deprecation notice:
-// - This is the legacy HEAD(object) v1 API.
-// - It remains fully supported in v4.2, but new development should target Object HEAD v2.
-// - The v1 path is planned for removal in a future major release.
-//
-// See also: target.objHeadV2()
-
+// Deprecation notice: requests without a nonempty `props` query select the deprecated v1 response;
+// specify `props` to select object HEAD v2. S3 compatibility HEAD(object) uses its own handler.
 func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *apiRequest) {
 	if err := t.parseReq(w, r, apireq); err != nil {
 		return
@@ -1514,6 +1519,8 @@ func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *api
 	}
 }
 
+// Deprecated: legacy native HEAD v1 implementation; use objHeadV2 for new callers.
+//
 // NOTE: sets whdr.ContentLength = obj-size, with no response body
 //
 // Returns non-standard HTTP status codes:

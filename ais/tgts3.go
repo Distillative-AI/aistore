@@ -233,10 +233,11 @@ func (t *target) putObjS3(w http.ResponseWriter, r *http.Request, bck *meta.Bck,
 			return
 		}
 	}
-	// Content-Type: ais:// and s3:// only (the latter via aws PutObj);
-	// TODO: other providers (to preserve remote round-trip)
-	if bck.IsAIS() || bck.IsRemoteS3() {
-		if v := r.Header.Get(cos.HdrContentType); !cmn.IsDefaultContentType(v) {
+	// Store Content-Type for local and supported remote round-trips.
+	if bck.IsAIS() || bck.IsRemoteS3() || bck.IsRemoteGCP() {
+		// GCP distinguishes an omitted Content-Type (sniff it) from an explicitly
+		// supplied default (preserve it).
+		if v := r.Header.Get(cos.HdrContentType); v != "" && (!cmn.IsDefaultContentType(v) || bck.IsRemoteGCP()) {
 			lom.SetCustomKey(cos.HdrContentType, v)
 		}
 	}
@@ -378,10 +379,10 @@ func (t *target) headObjS3(w http.ResponseWriter, r *http.Request, items []strin
 
 	var (
 		hdr = w.Header()
-		op  cmn.ObjectProps
+		op  cmn.ObjAttrs
 	)
 	if exists {
-		op.ObjAttrs = *lom.ObjAttrs()
+		op = *lom.ObjAttrs()
 	} else {
 		// cold HEAD
 		objAttrs, ecode, err := t.HeadCold(lom, r)
@@ -393,7 +394,7 @@ func (t *target) headObjS3(w http.ResponseWriter, r *http.Request, items []strin
 			s3.WriteErr(w, r, ei)
 			return
 		}
-		op.ObjAttrs = *objAttrs
+		op = *objAttrs
 	}
 
 	custom := op.GetCustomMD()

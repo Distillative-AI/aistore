@@ -47,7 +47,9 @@ type (
 		visits atomic.Int64
 		loads  atomic.Int64
 		// skip
-		skipBusy atomic.Int64
+		skipBusy     atomic.Int64
+		skipBusyLate atomic.Int64
+		skipChanged  atomic.Int64
 		// keep despite
 		keepPeerMissing atomic.Int64
 		keepDiverged    atomic.Int64
@@ -327,16 +329,22 @@ func (j *clnJogger) _lwalk(lom *core.LOM, fqn string) error {
 // verify a misplaced object against its HRW owner, and remove the local copy
 // returns nil (removed) or cmn.ErrSkip (kept)
 func (clnArgs *clnArgs) verifyRemove(lom *core.LOM, tsi *meta.Snode) error {
-	stats := &clnArgs.stats
-
-	// lock
-	if !lom.TryLock(true) {
+	var (
+		diverged error
+		oa       cmn.ObjAttrs
+		stats    = &clnArgs.stats
+	)
+	if !lom.TryLock(false) {
 		stats.skipBusy.Inc()
 		return cmn.ErrSkip
 	}
-	defer lom.Unlock(true)
+	err := lom.Load(false /*cache*/, true /*locked*/)
+	if err == nil {
+		oa.CopyFrom(lom.ObjAttrs(), false /*skip cksum*/)
+	}
+	lom.Unlock(false)
 
-	if err := lom.Load(false /*cache*/, true /*locked*/); err != nil {
+	if err != nil {
 		if cos.IsNotExist(err) {
 			return cmn.ErrSkip
 		}
@@ -360,14 +368,32 @@ func (clnArgs *clnArgs) verifyRemove(lom *core.LOM, tsi *meta.Snode) error {
 	}
 
 	// identical?
-	if eqErr := lom.ObjAttrs().CheckEq(op); eqErr != nil {
+	if eqErr := oa.CheckEq(op); eqErr != nil {
 		if !clnArgs.force {
 			cnt := stats.keepDiverged.Inc()
 			cmn.SparseWarn(cos.ModReb, cnt, clnArgs.logHdr, "diverged:", lom.Cname(), "peer:", tsi.StringEx(), eqErr, "[ keep:", cnt, "]")
 			return cmn.ErrSkip
 		}
-		cnt := stats.removeDiverged.Inc()
-		cmn.SparseWarn(cos.ModReb, cnt, clnArgs.logHdr, "force-removing diverged:", lom.Cname(), eqErr, "[ forced:", cnt, "]")
+		diverged = eqErr
+	}
+
+	if !lom.TryLock(true) {
+		stats.skipBusyLate.Inc()
+		return cmn.ErrSkip
+	}
+	defer lom.Unlock(true)
+
+	if err := lom.Load(false /*cache*/, true /*locked*/); err != nil {
+		if cos.IsNotExist(err) {
+			return cmn.ErrSkip
+		}
+		stats.errLoad.Inc()
+		return cmn.ErrSkip
+	}
+	if !lom.ObjAttrs().EqLocal(&oa) {
+		cnt := stats.skipChanged.Inc()
+		cmn.SparseWarn(cos.ModReb, cnt, clnArgs.logHdr, "changed while unlocked, keep:", lom.Cname(), "[ changed:", cnt, "]")
+		return cmn.ErrSkip
 	}
 
 	// remove
@@ -378,6 +404,10 @@ func (clnArgs *clnArgs) verifyRemove(lom *core.LOM, tsi *meta.Snode) error {
 		cnt := stats.errRemove.Inc()
 		cmn.SparseWarn(cos.ModReb, cnt, clnArgs.logHdr, "remove failed:", lom.Cname(), errRm, "[ failures:", cnt, "]")
 		return cmn.ErrSkip
+	}
+	if diverged != nil {
+		cnt := stats.removeDiverged.Inc()
+		cmn.SparseWarn(cos.ModReb, cnt, clnArgs.logHdr, "force-removed diverged:", lom.Cname(), diverged, "[ forced:", cnt, "]")
 	}
 
 	clnArgs.xreb.ObjsAdd(1, size)
@@ -433,6 +463,14 @@ func (clnArgs *clnArgs) ctlMsg(sb *cos.SB) {
 	}
 	if v := s.skipBusy.Load(); v > 0 {
 		sb.WriteString(" skip-busy=")
+		sb.WriteString(strconv.FormatInt(v, 10))
+	}
+	if v := s.skipBusyLate.Load(); v > 0 {
+		sb.WriteString(" skip-busy-late=")
+		sb.WriteString(strconv.FormatInt(v, 10))
+	}
+	if v := s.skipChanged.Load(); v > 0 {
+		sb.WriteString(" skip-changed=")
 		sb.WriteString(strconv.FormatInt(v, 10))
 	}
 

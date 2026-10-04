@@ -123,6 +123,7 @@ func NormalizeObjName(objName string) (string, error) {
 	return name, cos.ValidateOname(name)
 }
 
+//nolint:revive // unexported-return: single caller ais/tgtdl.go
 func ParseStartRequest(bck *meta.Bck, id string, dlb Body, xdl *Xact) (jobif, error) {
 	switch dlb.Type {
 	case TypeBackend:
@@ -249,6 +250,12 @@ func headLink(link string) (resp *http.Response, err error) {
 	req, err = http.NewRequestWithContext(ctx, http.MethodHead, link, http.NoBody)
 	if err == nil {
 		resp, err = clientForURL(link).Do(req)
+	}
+	if err == nil {
+		if err = cmn.CheckResp(resp, req.Method, req.URL.Path); err != nil {
+			cos.Close(resp.Body)
+			resp = nil
+		}
 	}
 	cancel()
 	return

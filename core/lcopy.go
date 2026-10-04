@@ -275,13 +275,9 @@ func (lom *LOM) Copy2FQN(dstFQN string, buf []byte) (dst *LOM, err error) {
 		var (
 			nested     error
 			sameBucket bool
-			locked     bool
 		)
 		sameBucket = dst.Bck().Equal(lom.Bck(), true /*same BID*/, true /*same backend*/)
-		err, nested, locked = lom._copy2fqn(dst, buf, sameBucket)
-		if locked {
-			dst.Unlock(true)
-		}
+		err, nested = lom._copy2fqn(dst, buf, sameBucket)
 		if nested != nil && !cos.IsNotExist(nested) {
 			nlog.Errorln("nested err:", nested)
 		}
@@ -314,6 +310,12 @@ func (lom *LOM) _copyChunks(dst *LOM, buf []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to create Ufest for destination %s: %w", dst.Cname(), err)
 	}
+	partialFQN := dstUfest._fqns(dst, false /*completed*/) // before storeCompleted (fntl)
+	defer func() {
+		if err := cos.RemoveFile(partialFQN); err != nil {
+			nlog.Warningln("failed to remove partial manifest:", partialFQN, err)
+		}
+	}()
 
 	// Copy each chunk from source to destination
 	srcUfest.Lock()
@@ -334,14 +336,14 @@ func (lom *LOM) _copyChunks(dst *LOM, buf []byte) error {
 
 			dstChunk, err := dstUfest.NewChunk(int(srcChunk.Num()), dst)
 			if err != nil {
-				errCh <- dstUfest._undoCopy(fmt.Errorf("failed to create destination chunk %d: %w", srcChunk.Num(), err))
+				errCh <- fmt.Errorf("failed to create destination chunk %d: %w", srcChunk.Num(), err)
 				return
 			}
 
 			_, _, err = cos.CopyFile(srcChunk.Path(), dstChunk.Path(), buf, srcChunk.cksum.Type())
 			if err != nil {
-				errCh <- dstUfest._undoCopy(fmt.Errorf("failed to copy chunk %d from %s to %s: %w",
-					srcChunk.Num(), srcChunk.Path(), dstChunk.Path(), err))
+				errCh <- fmt.Errorf("failed to copy chunk %d from %s to %s: %w",
+					srcChunk.Num(), srcChunk.Path(), dstChunk.Path(), err)
 				return
 			}
 
@@ -351,7 +353,7 @@ func (lom *LOM) _copyChunks(dst *LOM, buf []byte) error {
 
 			err = dstUfest.Add(dstChunk, srcChunk.Size(), int64(srcChunk.Num()))
 			if err != nil {
-				errCh <- dstUfest._undoCopy(fmt.Errorf("failed to add chunk %d to destination manifest: %w", srcChunk.Num(), err))
+				errCh <- fmt.Errorf("failed to add chunk %d to destination manifest: %w", srcChunk.Num(), err)
 				return
 			}
 		}(srcUfest.chunks[i])
@@ -395,15 +397,20 @@ func (lom *LOM) _copyChunks(dst *LOM, buf []byte) error {
 }
 
 func (u *Ufest) _undoCopy(err error) error {
-	u.removeChunks(u.lom, false /*except first*/)
+	u.Abort(u.lom)
 	return err
 }
 
-func (lom *LOM) _copy2fqn(dst *LOM, buf []byte, sameBucket bool) (err, nested error, locked bool) {
+// TODO: `dst` is cloned from the source - so if there's an existing destination
+// (its chunks, copies, and shard index) the latter is never loaded and, therefore,
+// never cleanly removed - left to space-cleanup
+
+func (lom *LOM) _copy2fqn(dst *LOM, buf []byte, sameBucket bool) (err, nested error) {
 	var (
 		dstCksum   *cos.CksumHash
 		dstFQN     = dst.FQN
 		dstCksumTy = dst.CksumType()
+		workFQN    string
 	)
 	if dst.isMirror(lom) && lom.md.copies != nil {
 		dst.md.copies = maps.Clone(lom.md.copies)
@@ -413,19 +420,30 @@ func (lom *LOM) _copy2fqn(dst *LOM, buf []byte, sameBucket bool) (err, nested er
 		dst.SetVersion(lomInitialVersion)
 	}
 
-	workFQN := dst.GenFQN(fs.WorkCT, fs.WorkfileCopy)
-	_, dstCksum, err = cos.CopyFile(lom.FQN, workFQN, buf, dstCksumTy)
-	if err != nil {
-		return err, nil, false
+	// chunked
+	if lom.IsChunked() {
+		// caller must w-lock the destination
+		debug.Func(func() { debug.Assert(dst.IsLocked() == apc.LockWrite, dst.Cname(), " destination is not write-locked") })
+
+		if err = lom._copyChunks(dst, nil /* use a different buffer - not `buf` */); err != nil {
+			return err, nil
+		}
+		dstFQN = dst.FQN
+		goto persist
 	}
 
-	if !sameBucket {
-		locked = dst.TryLock(true)
+	// monolithic
+	workFQN = dst.GenFQN(fs.WorkCT, fs.WorkfileCopy)
+	_, dstCksum, err = cos.CopyFile(lom.FQN, workFQN, buf, dstCksumTy)
+	if err != nil {
+		return err, nil
 	}
+
+	debug.Func(func() { debug.Assert(dst.IsLocked() == apc.LockWrite, dst.Cname(), " destination is not write-locked") })
 
 	if err = cos.Rename(workFQN, dstFQN); err != nil {
 		nested = cos.RemoveFile(workFQN)
-		return err, nested, locked
+		return err, nested
 	}
 
 	// different object (neither mirror copy nor restore): new content for dst
@@ -434,17 +452,13 @@ func (lom *LOM) _copy2fqn(dst *LOM, buf []byte, sameBucket bool) (err, nested er
 	}
 
 	switch {
-	case lom.IsChunked():
-		if err := lom._copyChunks(dst, buf); err != nil {
-			return err, nil, locked
-		}
 	case dstCksumTy != cos.ChecksumNone:
 		dst.SetCksum(dstCksum.Clone())
 	default:
 		dst.SetCksum(cos.NoneCksum)
 	}
 
-	// persist
+persist:
 	if lom.isMirror(dst) {
 		if lom.md.copies == nil {
 			lom.md.copies = make(fs.MPI, 2)
@@ -460,14 +474,14 @@ func (lom *LOM) _copy2fqn(dst *LOM, buf []byte, sameBucket bool) (err, nested er
 			if errPersist := lom.Persist(); errPersist != nil {
 				err = fmt.Errorf("sync-with-copies: %w, persist: %w", err, errPersist)
 			}
-			return err, nested, locked
+			return err, nested
 		}
 		err = lom.Persist()
 	} else if err = dst.Persist(); err != nil {
-		nested = cos.RemoveFile(dst.FQN)
+		nested = dst.RemoveObj()
 	}
 
-	return err, nested, locked
+	return err, nested
 }
 
 // load-balanced GET from replicated lom

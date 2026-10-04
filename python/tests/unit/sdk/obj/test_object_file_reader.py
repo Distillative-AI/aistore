@@ -15,7 +15,6 @@ from tests.utils import BadContentIterProvider, cases, scripted_content_provider
 
 
 class TestObjectFileReader(unittest.TestCase):
-
     def setUp(self):
         self.content_provider_mock = Mock()
         # Every stream is a separate generator, so each one records its own close.
@@ -44,7 +43,7 @@ class TestObjectFileReader(unittest.TestCase):
         self.assertEqual(self.object_file._stream.delivered_position, 0)
         self.assertEqual(self.object_file._stream.resumes, 0)
         self.assertIsNone(self.object_file._remainder)
-        self.assertFalse(self.object_file._closed)
+        self.assertFalse(self.object_file.closed)
         self.content_provider_mock.create_iter.assert_called_once()
 
         # Verify ObjectFileReader extends IOBase
@@ -56,13 +55,13 @@ class TestObjectFileReader(unittest.TestCase):
         self.object_file.read(4)
 
         # Verify file is not closed initially
-        self.assertFalse(self.object_file._closed)
+        self.assertFalse(self.object_file.closed)
 
         # Close the file
         self.object_file.close()
 
         # Verify file is closed and stream is closed
-        self.assertTrue(self.object_file._closed)
+        self.assertTrue(self.object_file.closed)
         self.mock_generator.close.assert_called_once()
 
     def test_readable(self):
@@ -154,7 +153,7 @@ class TestObjectFileReader(unittest.TestCase):
 
         with self.object_file as obj_file:
             # State should be reset inside context
-            self.assertFalse(obj_file._closed)
+            self.assertFalse(obj_file.closed)
             self.assertEqual(self.object_file._stream.delivered_position, 0)
             self.assertIsNone(self.object_file._remainder)
 
@@ -162,14 +161,13 @@ class TestObjectFileReader(unittest.TestCase):
             obj_file.read(4)
 
         # After context, file should be closed and stream should be closed
-        self.assertTrue(self.object_file._closed)
+        self.assertTrue(self.object_file.closed)
         # Entering the context replaced the first stream, and the exit closed the second.
         for generator in self.generators:
             generator.close.assert_called_once()
 
 
 class TestObjectFileReaderResume(unittest.TestCase):
-
     def setUp(self):
         self.data = b"chunk1chunk2chunk3chunk4"
         self.chunk_size = 6

@@ -19,12 +19,15 @@ AISTORE_PATH = $(shell git rev-parse --show-toplevel)
 
 CLI_VERSION := $(shell ais version 2>/dev/null)
 
+## NOTE: keep in sync with deploy/ci/fedora.dockerfile
+RUFF_VERSION ?= 0.16.8
+
 # Do not print enter/leave directory when doing 'make -C DIR <target>'
 MAKEFLAGS += --no-print-directory
 
 # Uncomment to cross-compile aisnode and cli, respectively:
-# CROSS_COMPILE = docker run --rm -v $(AISTORE_PATH):/go/src/n -w /go/src/n golang:1.26
-# CROSS_COMPILE_CLI = docker run -e $(CGO_DISABLE) --rm -v $(AISTORE_PATH)/cmd/cli:/go/src/n -w /go/src/n golang:1.26
+# CROSS_COMPILE = docker run --rm -v $(AISTORE_PATH):/go/src/n -w /go/src/n golang:1.27
+# CROSS_COMPILE_CLI = docker run -e $(CGO_DISABLE) --rm -v $(AISTORE_PATH)/cmd/cli:/go/src/n -w /go/src/n golang:1.27
 
 #
 # Build: version, flags, destination, and tags
@@ -300,7 +303,7 @@ lint-update:
 ## See also: .github/workflows/lint.yml
 lint-update-ci:
 	@rm -f $(GOPATH)/bin/golangci-lint
-	@go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
+	@go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
 lint:
 	@([[ -x "$(command -v golangci-lint)" ]] && echo "Cannot find golangci-lint, run 'make lint-update' to install" && exit 1) || true
@@ -329,12 +332,12 @@ lint-ishard:
 install-python-deps:
 	@cd python && make common_deps botocore_deps
 
-fmt-check: install-python-deps ## Check code formatting
-	@pip3 install --upgrade black[jupyter] -q
+fmt-check: ## Check code formatting
+	@pip3 install ruff==$(RUFF_VERSION) -q
 	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" fmt
 
 fmt-fix: ## Fix code formatting
-	@pip3 install --upgrade black[jupyter] -q
+	@pip3 install ruff==$(RUFF_VERSION) -q
 	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" fmt --fix
 
 spell-check: ## Run spell checker on the project

@@ -40,7 +40,7 @@ AIStore runs on commodity Linux machines with no special requirements. It is exp
 
 * [Linux](#linux) with `gcc`, `sysstat`, `attr`, `util-linux`
 * Linux **kernel ≥ 6.8**
-* [Go ≥ 1.23](https://golang.org/dl/) (or build via `CROSS_COMPILE`)
+* [Go ≥ 1.27](https://golang.org/dl/) (or build via `CROSS_COMPILE`)
 * Local filesystem with **extended attributes** ([xattrs](https://en.wikipedia.org/wiki/Extended_file_attributes)) enabled
 * **Optional** – cloud credentials (AWS, GCP, Azure, OCI)
 
@@ -50,7 +50,7 @@ AIStore runs on commodity Linux machines with no special requirements. It is exp
 
 Depending on your Linux distribution, you may or may not have `GCC`, `sysstat`, and/or `attr` packages. These packages must be installed.
 
-Speaking of distributions, our current default recommendation (based on our experience) is Ubuntu Server 24.04 LTS or Ubuntu Server 22.04 LTS. However, AIStore has no special dependencies, so virtually any distribution will work.
+Speaking of distributions, our current default recommendation (based on our experience) is Ubuntu Server 26.04 LTS or Ubuntu Server 24.04 LTS (for other distributions: Linux kernel 6.8 or later). However, AIStore has no special dependencies, so virtually any distribution will work.
 
 For the [local filesystem](/docs/performance.md), we currently recommend xfs. But again, this default recommendation should not be interpreted as a limitation: other fine choices include zfs, ext4, f2fs and more.
 
@@ -678,7 +678,7 @@ $ ais cp --help
 To quickly set up AIStore (with AWS and GCP backends) in a [Google Colab](https://colab.research.google.com/) notebook, use our ready-to-use [notebook](https://colab.research.google.com/github/NVIDIA/aistore/blob/main/python/examples/google_colab/aistore_deployment.ipynb):
 
 **Important Notes:**
-- This sample installs Go v1.23.1, the supported Go version and toolchain at the time of writing.
+- This sample installs Go v1.27.1, the toolchain required by `main`.
 - AIStore runs in the background. However, if you stop any cell, it sends a "SIGINT" (termination signal) to all background processes, terminating AIStore. To restart AIStore, simply rerun the relevant cell.
 
 ### Kubernetes Playground

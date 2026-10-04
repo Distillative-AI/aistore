@@ -111,6 +111,12 @@ func (t *target) HeadObjT2T(lom *core.LOM, tsi *meta.Snode, reqProps ...string) 
 	return t.headt2t(lom, tsi, smap, reqProps)
 }
 
+// batch counterpart of HeadObjT2T
+func (t *target) HeadBatchT2T(req *cmn.HdbReq, tsi *meta.Snode) (*apc.HdbResp, error) {
+	smap := t.owner.smap.get()
+	return t.headBatcht2t(req, tsi, smap)
+}
+
 // CopyObject:
 // - either creates a full replica of the source object (the `lom` argument)
 // - or transforms the object
@@ -264,15 +270,13 @@ func (t *target) GetFromNeighbor(params *core.GfnParams) (*http.Response, error)
 	reqWith := req.WithContext(ctx)
 
 	resp, err := g.client.data.Do(reqWith)
+	if err == nil {
+		err = cmn.CheckResp(resp, reqWith.Method, reqWith.URL.Path)
+	}
 
 	cmn.FreeHra(reqArgs)
 	cmn.HreqFree(req)
 
-	if err == nil {
-		if code := resp.StatusCode; code >= http.StatusBadRequest {
-			err = &cmn.ErrHTTP{Message: http.StatusText(code), Status: code}
-		}
-	}
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			cos.DrainReader(resp.Body)
