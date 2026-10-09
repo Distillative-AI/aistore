@@ -5,6 +5,7 @@
 package ais
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"hash"
@@ -42,6 +43,7 @@ type (
 		sync.RWMutex
 	}
 	partArgs struct {
+		ctx         context.Context // independent of per-part request headers
 		req         *http.Request
 		reader      io.ReadCloser
 		lom         *core.LOM
@@ -284,7 +286,7 @@ func (ups *ups) _start(r *http.Request, lom *core.LOM, skipBackend bool) (upload
 			return "", nil, fmt.Errorf("%s: %w", lom.Cname(), err)
 		}
 
-		uploadID, _, err = ups.t.Backend(bck).StartMpt(lom, r)
+		uploadID, _, err = ups.t.Backend(bck).StartMpt(mptRequestContext(r), lom, r)
 	} else {
 		uploadID = cos.GenUUID()
 		if r != nil {
@@ -331,11 +333,16 @@ func (ups *ups) putPart(args *partArgs) (etag string, ecode int, err error) {
 
 func (ups *ups) _put(args *partArgs) (etag string, ecode int, err error) {
 	var (
+		ctx       = args.ctx
 		lom       = args.lom
 		reader    = args.reader
 		rsize     = args.size
 		startTime = mono.NanoTime()
 	)
+
+	if ctx == nil {
+		ctx = mptRequestContext(args.req)
+	}
 
 	// Initialize checksums and get writers
 	pc, writers := initPartChecksums(args)
@@ -374,7 +381,7 @@ func (ups *ups) _put(args *partArgs) (etag string, ecode int, err error) {
 		rdr := memsys.NewGuardReader(sgl)
 		if err == nil {
 			remoteStart := mono.NanoTime()
-			etag, ecode, err = backend.PutMptPart(lom, rdr, args.req, uploadID, expectedSize, int32(args.partNum))
+			etag, ecode, err = backend.PutMptPart(ctx, lom, rdr, args.req, uploadID, expectedSize, int32(args.partNum))
 			remotePutLatency = mono.SinceNano(remoteStart)
 		}
 		rdr.Free() // not sgl.Free
@@ -396,7 +403,7 @@ func (ups *ups) _put(args *partArgs) (etag string, ecode int, err error) {
 		rdr := memsys.NewGuardReader(sgl)
 		if err == nil {
 			remoteStart := mono.NanoTime()
-			etag, ecode, err = backend.PutMptPart(lom, rdr, args.req, uploadID, expectedSize, int32(args.partNum))
+			etag, ecode, err = backend.PutMptPart(ctx, lom, rdr, args.req, uploadID, expectedSize, int32(args.partNum))
 			remotePutLatency = mono.SinceNano(remoteStart)
 		}
 		rdr.Free() // not sgl.Free (ditto)
@@ -574,7 +581,9 @@ func (ups *ups) _completeRemote(r *http.Request, lom *core.LOM, uploadID string,
 		provider = bck.Provider
 	)
 
-	version, etag, ecode, err = ups.t.Backend(bck).CompleteMpt(lom, r, uploadID, body, partList)
+	// Finish backend completion despite client cancellation so local finalization can follow.
+	ctx := context.WithoutCancel(mptRequestContext(r))
+	version, etag, ecode, err = ups.t.Backend(bck).CompleteMpt(ctx, lom, r, uploadID, body, partList)
 	if err != nil {
 		return "", ecode, err
 	}
@@ -594,7 +603,12 @@ func (ups *ups) abort(r *http.Request, lom *core.LOM, uploadID string, force, sk
 		return http.StatusBadRequest, err
 	}
 	if lom.Bck().IsRemote() && !skipBackend {
-		ecode, err := ups.t.Backend(lom.Bck()).AbortMpt(lom, r, uploadID)
+		ctx := mptRequestContext(r)
+		if force {
+			// Preserve best-effort internal cleanup after request cancellation.
+			ctx = context.Background()
+		}
+		ecode, err := ups.t.Backend(lom.Bck()).AbortMpt(ctx, lom, r, uploadID)
 
 		if force || err == nil || ecode == http.StatusNotFound {
 			if e := ups._abort(uploadID, lom); e != nil && !cos.IsNotExist(e) {
@@ -640,6 +654,14 @@ func (ups *ups) _abort(id string, lom *core.LOM) error {
 
 	manifest.Abort(lom)
 	return nil
+}
+
+// An internal chunk carries context without carrying the whole-object headers.
+func mptRequestContext(r *http.Request) context.Context {
+	if r != nil {
+		return r.Context()
+	}
+	return context.Background()
 }
 
 //
@@ -700,11 +722,13 @@ func (pc *partCksums) finalize(chunk *core.Uchunk, partNum int, etag string) (st
 		chunk.SetCksum(&pc.crc32c.Cksum)
 	}
 
-	// S3 compatibility API over ais:// buckets: compute part ETag as MD5 of the part (S3 convention).
+	// Store the part MD5; generate an S3 ETag only if none was supplied.
 	if pc.md5 != nil {
 		chunk.MD5 = pc.md5.H.Sum(nil)
 		debug.Assert(len(chunk.MD5) == cos.LenMD5Hash, len(chunk.MD5))
-		etag = cmn.MD5ToQuotedETag(chunk.MD5)
+		if etag == "" {
+			etag = cmn.MD5ToQuotedETag(chunk.MD5)
+		}
 	}
 	return etag, nil
 }

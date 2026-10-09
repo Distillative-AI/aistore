@@ -273,6 +273,25 @@ type (
 	}
 )
 
+// protection from stalled GET transfers in both directions
+// see docs/configuration.md, section "Minimum transfer rate"
+type (
+	// backend GET (timeout.send_file_time; terminology: see XferRenewSize)
+	// - must not match net.Error or context.DeadlineExceeded
+	// - must not be mistaken for a (benign) client timeout
+	ErrRemoteGetTimeout struct {
+		tout      time.Duration
+		renewSize int64
+	}
+
+	// GET response => client reading slowly or not at all
+	ErrSlowReadingClient struct {
+		err       error // (os.ErrDeadlineExceeded)
+		tout      time.Duration
+		renewSize int64
+	}
+)
+
 var (
 	ErrSkip           = errors.New("skip")
 	ErrStartupTimeout = errors.New("startup timeout") // related StartupMayTimeout
@@ -361,8 +380,8 @@ func isErrUnsupp(err error) bool {
 	if _, ok := err.(*ErrUnsupp); ok {
 		return true
 	}
-	var wrapped *ErrUnsupp
-	return errors.As(err, &wrapped)
+	_, ok := errors.AsType[*ErrUnsupp](err)
+	return ok
 }
 
 func NewErrNotImpl(action, what string) *ErrNotImpl { return &ErrNotImpl{action, what} }
@@ -376,8 +395,8 @@ func isErrNotImpl(err error) bool {
 	if _, ok := err.(*ErrNotImpl); ok {
 		return true
 	}
-	var wrapped *ErrNotImpl
-	return errors.As(err, &wrapped)
+	_, ok := errors.AsType[*ErrNotImpl](err)
+	return ok
 }
 
 // (ais) ErrBucketAlreadyExists
@@ -498,8 +517,8 @@ func IsErrBckNameConflict(err error) bool {
 	if _, ok := err.(*ErrBckNameConflict); ok {
 		return true
 	}
-	var e *ErrBckNameConflict
-	return errors.As(err, &e)
+	_, ok := errors.AsType[*ErrBckNameConflict](err)
+	return ok
 }
 
 // ErrRemoteMetadataMismatch
@@ -530,8 +549,8 @@ func IsErrBusy(err error) bool {
 	if _, ok := err.(*ErrBusy); ok {
 		return true
 	}
-	var wrapped *ErrBusy
-	return errors.As(err, &wrapped)
+	_, ok := errors.AsType[*ErrBusy](err)
+	return ok
 }
 
 // errAccessDenied & ErrBucketAccessDenied
@@ -592,8 +611,8 @@ func IsErrCapExceeded(err error) bool {
 	if _, ok := err.(*ErrCapExceeded); ok || cos.IsErrOOS(err) /*syscall.ENOSPC*/ {
 		return true
 	}
-	var wrapped *ErrCapExceeded
-	return errors.As(err, &wrapped)
+	_, ok := errors.AsType[*ErrCapExceeded](err)
+	return ok
 }
 
 // ErrGetCap
@@ -779,8 +798,8 @@ func NewErrObjDefunct(name string, d1, d2 uint64) *ErrObjDefunct {
 }
 
 func IsErrObjDefunct(err error) bool {
-	var wrapped *ErrObjDefunct
-	return errors.As(err, &wrapped)
+	_, ok := errors.AsType[*ErrObjDefunct](err)
+	return ok
 }
 
 // ErrAborted
@@ -815,8 +834,7 @@ func AsErrAborted(err error) (errAborted *ErrAborted) {
 	if errAborted, ok = err.(*ErrAborted); ok {
 		return
 	}
-	var wrapped *ErrAborted
-	if errors.As(err, &wrapped) {
+	if wrapped, ok := errors.AsType[*ErrAborted](err); ok {
 		errAborted = wrapped
 	}
 	return
@@ -942,8 +960,8 @@ func (e *ErrLmetaCorrupted) Error() string       { return e.err.Error() }
 func (e *ErrLmetaCorrupted) Unwrap() (err error) { return e.err }
 
 func IsErrLmetaCorrupted(err error) bool {
-	var wrapped *ErrLmetaCorrupted
-	return errors.As(err, &wrapped)
+	_, ok := errors.AsType[*ErrLmetaCorrupted](err)
+	return ok
 }
 
 func NewErrLmetaNotFound(name string, err error) *ErrLmetaNotFound {
@@ -955,8 +973,8 @@ func (e *ErrLmetaNotFound) Error() string       { return e.name + ", err: " + e.
 func (e *ErrLmetaNotFound) Unwrap() (err error) { return e.err }
 
 func IsErrLmetaNotFound(err error) bool {
-	var wrapped *ErrLmetaNotFound
-	return errors.As(err, &wrapped)
+	_, ok := errors.AsType[*ErrLmetaNotFound](err)
+	return ok
 }
 
 // ErrLimitedCoexistence
@@ -975,8 +993,8 @@ func isErrLimitedCoexistence(err error) bool {
 	if _, ok := err.(*ErrLimitedCoexistence); ok {
 		return true
 	}
-	var wrapped *ErrLimitedCoexistence
-	return errors.As(err, &wrapped)
+	_, ok := errors.AsType[*ErrLimitedCoexistence](err)
+	return ok
 }
 
 // ErrXactUsePrev
@@ -1050,8 +1068,8 @@ func IsErrTooManyRequests(err error) bool {
 	if _, ok := err.(*ErrTooManyRequests); ok {
 		return true
 	}
-	var wrapped *ErrTooManyRequests
-	return errors.As(err, &wrapped)
+	_, ok := errors.AsType[*ErrTooManyRequests](err)
+	return ok
 }
 
 func NewErrRateLimitFrontend() *ErrRateLimitFrontend {
@@ -1091,8 +1109,8 @@ func IsErrMembershipChange(err error) bool {
 	if _, ok := err.(*ErrMembershipChange); ok {
 		return true
 	}
-	var wrapped *ErrMembershipChange
-	return errors.As(err, &wrapped)
+	_, ok := errors.AsType[*ErrMembershipChange](err)
+	return ok
 }
 
 // ErrBackendRetry
@@ -1123,8 +1141,8 @@ func (e *ErrNotEnoughTargets) Error() string {
 }
 
 func IsErrNotEnoughTargets(err error) bool {
-	var e *ErrNotEnoughTargets
-	return errors.As(err, &e)
+	_, ok := errors.AsType[*ErrNotEnoughTargets](err)
+	return ok
 }
 
 //
@@ -1172,8 +1190,7 @@ func AsErrHTTP(err error) *ErrHTTP {
 	if e, ok := err.(*ErrHTTP); ok {
 		return e
 	}
-	var e *ErrHTTP
-	if errors.As(err, &e) {
+	if e, ok := errors.AsType[*ErrHTTP](err); ok {
 		return e
 	}
 	return nil
@@ -1432,8 +1449,8 @@ func _err2HTTP(err error) *ErrHTTP {
 		return e
 	}
 
-	var e *ErrHTTP
-	if !errors.As(err, &e) {
+	e, ok := errors.AsType[*ErrHTTP](err)
+	if !ok {
 		return nil
 	}
 	return e
@@ -1459,4 +1476,38 @@ func WriteErr405(w http.ResponseWriter, r *http.Request, methods ...string) {
 	} else {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 	}
+}
+
+// ErrRemoteGetTimeout
+
+func NewErrRemoteGetTimeout(tout time.Duration, renewSize int64) *ErrRemoteGetTimeout {
+	return &ErrRemoteGetTimeout{tout: tout, renewSize: renewSize}
+}
+
+func (e *ErrRemoteGetTimeout) Error() string {
+	return fmt.Sprintf("remote GET timeout: received less than %s in %v (timeout.send_file_time)",
+		cos.IEC(e.renewSize, 1), e.tout)
+}
+
+func IsErrRemoteGetTimeout(err error) bool {
+	_, ok := errors.AsType[*ErrRemoteGetTimeout](err)
+	return ok
+}
+
+// ErrSlowReadingClient
+
+func NewErrSlowReadingClient(err error, tout time.Duration, renewSize int64) *ErrSlowReadingClient {
+	return &ErrSlowReadingClient{err: err, tout: tout, renewSize: renewSize}
+}
+
+func (e *ErrSlowReadingClient) Error() string {
+	return fmt.Sprintf("slow reading client: sent less than %s in %v (timeout.send_file_time): %v",
+		cos.IEC(e.renewSize, 1), e.tout, e.err)
+}
+
+func (e *ErrSlowReadingClient) Unwrap() error { return e.err }
+
+func IsErrSlowReadingClient(err error) bool {
+	_, ok := errors.AsType[*ErrSlowReadingClient](err)
+	return ok
 }

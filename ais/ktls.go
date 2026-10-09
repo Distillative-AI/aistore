@@ -26,6 +26,7 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
@@ -41,6 +42,12 @@ import (
 // on userspace crypto/tls. Two constraints apply to the listener as a whole,
 // armed or not: TLS session tickets are disabled (TLS 1.3 record-sequence
 // prerequisite) and ALPN is pinned to http/1.1.
+//
+// Arming is lazy: the first response may opt in before writing headers, for a
+// monolithic file-backed GET (incl. range) of at least ktlsMinSize. Any
+// userspace TLS write after the handshake permanently rules out offload.
+// Saved handshake material is wiped after the decision, on handshake failure,
+// or on transmit close.
 
 // TODO:
 // - end-to-end benches: plain HTTP => HTTPS => (HTTPS + kTLS + sendfile).
@@ -72,15 +79,15 @@ import (
 //   multi-match passes lom.Lsize() for a tar it has not produced yet. Both can
 //   still reach `exhaust` mid-body - the very thing retirement exists to avoid.
 //
-// - observability: nothing outside the node can tell armed from unsupported.
-//   Publish ktlsCnt, and /proc/net/tls_stat for the software-vs-hardware split
+// - observability: export ktlsCnt through node stats/Prometheus, and publish
+//   /proc/net/tls_stat for the software-vs-hardware split
 //   (TlsCurrTxSw vs TlsCurrTxDevice) - the kernel chooses HW or SW itself and
 //   setsockopt succeeds either way. Ad hoc: `ss -tin | grep -B1 tcp-ulp-tls`
 //   shows "txconf: sw|hw". No integration test or CI job yet; when there is one
 //   it must assert armed > 0 - a missing TLS ULP falls back silently.
 //
-// - lazy arming: install TLS_TX on the first response that would use sendfile,
-//   not at handshake. Ideally, must only be used for large payloads.
+// - ktlsMinSize is a placeholder pending the sendfile-vs-userspace crossover
+//   bench; likely lower with NIC offload (TlsTxDevice)
 //
 // - classify errKtlsExhausted/errKtlsPoisoned as connection-lifecycle
 //   events: they are neither object-transmit errors nor FSHC input (tgtfshc)
@@ -136,6 +143,7 @@ type (
 	tlsArmedConn struct {
 		*net.TCPConn
 		txState *atomic.Uint32
+		owner   *ktlsConn
 		tls12   tls12WireState
 
 		// what crypto/tls has put on the wire (used by unit tests)
@@ -166,8 +174,10 @@ type (
 		secrets *trafficSecrets
 		install ktlsInstaller
 
-		once    sync.Once
-		initErr error
+		once          sync.Once
+		initErr       error
+		handshakeDone atomic.Bool
+		armOnce       sync.Once // first response or post-handshake TLS write decides permanently
 
 		txState  atomic.Uint32 // unarmed -> armed -> poisoned/exhausted
 		txMu     sync.Mutex    // serialize the TLS_TX point of no return against transmit shutdown
@@ -178,6 +188,10 @@ type (
 		txBytes    atomic.Int64
 		txMaxBytes int64
 		txRetiring atomic.Bool // current response is the last one
+
+		armedAt       int64       // set before publishing ktlsArmed
+		statsStopped  atomic.Bool // transmit shutdown requested; account after in-flight I/O
+		statsReported bool        // one shutdown summary, under txOut
 
 		closeOnce sync.Once
 		closeErr  error
@@ -193,18 +207,34 @@ type (
 
 	ktlsState interface {
 		isArmed() bool
+		tryArm(size int64) bool
 		retire(size int64) bool
 	}
 
-	// basic offload observability; see the "observability" section below
+	// node-wide offload and transmit-lifecycle observability
 	ktlsCounters struct {
+		declined       atomic.Int64 // first response too small, or a userspace TLS write came first
 		armed          atomic.Int64 // TLS_TX installed; the kernel owns transmit
 		skipped        atomic.Int64 // arm() bailed before reaching the installer
+		refused        atomic.Int64 // arm() refused: our misconfiguration (session tickets)
 		unsupported    atomic.Int64 // kernel, TLS version, or cipher declined
 		failed         atomic.Int64 // installation error
 		notEstablished atomic.Int64 // TCP_ULP: ENOTCONN (socket not in TCP_ESTABLISHED)
 		poisoned       atomic.Int64 // crypto/tls attempted to transmit after offload
 		exhausted      atomic.Int64 // per-key transmit budget reached
+		retiring       atomic.Int64 // retirement requested, not necessarily completed
+		stopped        atomic.Int64 // armed TX shutdown accounted, including CloseWrite
+		stopBytes      atomic.Int64 // actual plaintext bytes on stopped TX sides, including headers
+		lastLog        atomic.Int64 // monotonic timestamp; independent of event counts
+		logMu          sync.Mutex
+		lastStats      ktlsCounterValues // last emitted summary, under logMu
+	}
+	ktlsCounterValues struct {
+		armed, skipped                         int64
+		refused, unsupported, failed           int64
+		notEstablished                         int64
+		poisoned, exhausted                    int64
+		declined, retiring, stopped, stopBytes int64
 	}
 	ktlsCtxKey struct{}
 
@@ -212,7 +242,6 @@ type (
 	noReadFrom struct{ io.Writer }
 )
 
-// TODO -- FIXME: placement
 var (
 	keyKtls ktlsCtxKey
 	ktlsCnt ktlsCounters // node-wide kTLS-offload observability
@@ -230,6 +259,10 @@ const (
 	// records under one key. Retire earlier, after 256 GiB of plaintext.
 	ktlsMaxBytes = int64(1 << 38)
 	ktlsHeadroom = int64(64 * cos.KiB) // response headers and net/http framing
+	ktlsMinSize  = int64(cos.MiB)      // minimum first-response payload for offload
+
+	ktlsLogInterval        = 10 * time.Minute
+	ktlsVerboseLogInterval = time.Minute
 
 	tlsRecordHeaderSize           = 5
 	tlsRecordTypeChangeCipherSpec = 20
@@ -489,17 +522,23 @@ func (s *tls12WireState) stop() {
 //////////////////
 
 func (c *tlsArmedConn) Write(p []byte) (int, error) {
+	if c.owner.handshakeDone.Load() {
+		// Includes crypto/tls control records (e.g. a KeyUpdate response).
+		// Either decline before emitting one, or reject it after offload.
+		c.owner.decline()
+	}
 	if c.txState.Load() != ktlsUnarmed {
 		// A peer-requested TLS 1.3 KeyUpdate reaches this crypto/tls _read_
 		// path. Its response cannot be handed to the kernel after offload, so
 		// fail closed: mark the connection and let Read/Write/ReadFrom refuse it.
 		if c.txState.CompareAndSwap(ktlsArmed, ktlsPoisoned) {
 			cnt := ktlsCnt.poisoned.Add(1)
-			if cmn.Rom.V(5, cos.ModAIS) || cos.Sparse(cnt) {
+			if cos.Sparse(cnt) {
 				nlog.Errorln("ktls-tx: crypto/tls attempted to transmit after offload; closing the connection -",
-					&ktlsCnt)
+					c.TCPConn.RemoteAddr())
 			}
 			_ = c.TCPConn.Close()
+			c.owner.stopStats()
 		}
 		return 0, errKtlsActive
 	}
@@ -531,7 +570,7 @@ func newKtlsConn(tcp *net.TCPConn, tmpl *tls.Config, install ktlsInstaller) *ktl
 
 		txMaxBytes: ktlsMaxBytes,
 	}
-	c.wire = &tlsArmedConn{TCPConn: tcp, txState: &c.txState}
+	c.wire = &tlsArmedConn{TCPConn: tcp, txState: &c.txState, owner: c}
 
 	// KeyLogWriter is per-tls.Config, hence the per-connection clone; everything
 	// else is already set on the listener's template
@@ -544,49 +583,164 @@ func newKtlsConn(tcp *net.TCPConn, tmpl *tls.Config, install ktlsInstaller) *ktl
 }
 
 // Go 1.27 net/http calls HandshakeContext with socket deadlines already set.
-// Complete handshake => armed before returning; ConnectionState remains a pure getter.
+// ConnectionState remains a pure getter; TX ownership is decided by the response.
 func (c *ktlsConn) init(ctx context.Context) error {
-	c.once.Do(func() { c.initErr = c.handshakeAndArm(ctx) })
+	c.once.Do(func() { c.initErr = c.handshake(ctx) })
 	return c.initErr
 }
 func (c *ktlsConn) HandshakeContext(ctx context.Context) error { return c.init(ctx) }
 
-func (c *ktlsConn) handshakeAndArm(ctx context.Context) error {
-	// KeyLogWriter may receive secrets before a handshake ultimately fails.
-	// Wipe every outcome and permanently discard any later key-log writes.
-	defer c.secrets.zero()
-	defer c.wire.tls12.stop()
-
+func (c *ktlsConn) handshake(ctx context.Context) error {
 	// all ordinary crypto/tls certificate, client-certificate, Finished, ALPN,
 	// and VerifyConnection processing happens here
 	if err := c.Conn.HandshakeContext(ctx); err != nil {
+		c.decide(false)
 		return err
 	}
-
-	c.arm()
+	c.handshakeDone.Store(true)
 	return nil
 }
 
-func (c *ktlsCounters) String() string {
-	armed, skipped := c.armed.Load(), c.skipped.Load()
-	unsupported, failed := c.unsupported.Load(), c.failed.Load()
-	notEstablished := c.notEstablished.Load()
-	poisoned, exhausted := c.poisoned.Load(), c.exhausted.Load()
-	return fmt.Sprintf("ktls-tx[attempted=%d armed=%d skipped=%d unsupported=%d failed=%d not-established=%d poisoned=%d exhausted=%d]",
-		armed+skipped+unsupported+failed+notEstablished, armed, skipped, unsupported, failed, notEstablished, poisoned, exhausted)
+// decides offload for the connection on its first sendfile-eligible response;
+// call before any response bytes are written
+func (c *ktlsConn) tryArm(size int64) bool {
+	if err := c.init(context.Background()); err != nil {
+		return false
+	}
+	if size < ktlsMinSize {
+		c.decline()
+	} else {
+		c.decide(true)
+	}
+	return c.isArmed()
 }
 
-// arm() bailed on its own, before reaching the installer: a missing secret,
-// session tickets, an unusable TLS version. Always a bug or a misconfiguration
-// on our side, never the kernel's.
+// declines offload, counted, unless already decided
+func (c *ktlsConn) decline() {
+	if c.decide(false) {
+		ktlsCnt.declined.Add(1)
+		ktlsCnt.log()
+	}
+}
+
+// decides offload once per connection; returns true when this call decided
+func (c *ktlsConn) decide(arm bool) (decided bool) {
+	c.armOnce.Do(func() {
+		decided = true
+		defer c.secrets.zero()
+		defer c.wire.tls12.stop()
+		if arm {
+			// NOTE: no app records have been written yet:
+			// - TLS 1.3 starts at sequence zero
+			// - TLS 1.2 uses the observed handshake sequence
+			c.arm()
+		}
+	})
+	return decided
+}
+
+func (c *ktlsCounters) String() string {
+	return c.snapshot().String()
+}
+
+func (c *ktlsCounters) snapshot() ktlsCounterValues {
+	return ktlsCounterValues{
+		armed: c.armed.Load(), skipped: c.skipped.Load(), refused: c.refused.Load(), unsupported: c.unsupported.Load(),
+		failed: c.failed.Load(), notEstablished: c.notEstablished.Load(),
+		poisoned: c.poisoned.Load(), exhausted: c.exhausted.Load(),
+		retiring: c.retiring.Load(), stopped: c.stopped.Load(), stopBytes: c.stopBytes.Load(),
+		declined: c.declined.Load(),
+	}
+}
+
+// ktlsCounterValues.String() order
+var ktlsStatNames = [...]string{
+	"declined", "attempted", "armed", "skipped", "refused", "unsupported", "failed", "not-established",
+	"poisoned", "exhausted", "retiring", "stopped", "stopped-bytes", "avg-bytes",
+}
+
+func (c ktlsCounterValues) String() string {
+	var avg int64
+	if c.stopped > 0 {
+		avg = c.stopBytes / c.stopped
+	}
+	vals := [len(ktlsStatNames)]int64{
+		c.declined,
+		c.armed + c.skipped + c.refused + c.unsupported + c.failed + c.notEstablished,
+		c.armed, c.skipped, c.refused, c.unsupported, c.failed, c.notEstablished,
+		c.poisoned, c.exhausted, c.retiring, c.stopped, c.stopBytes, avg,
+	}
+
+	// upper bound: " name=" plus max int64 digits (w/ sign) per counter
+	n := len("ktls-tx[]")
+	for _, name := range ktlsStatNames {
+		n += len(name) + 2 + 20
+	}
+	var sb cos.SB
+	sb.Init(n)
+	sb.WriteString("ktls-tx[")
+	for i, name := range ktlsStatNames {
+		if i > 0 {
+			sb.WriteUint8(' ')
+		}
+		sb.WriteString(name)
+		sb.WriteUint8('=')
+		sb.WriteInt64(vals[i])
+	}
+	sb.WriteUint8(']')
+	return sb.String()
+}
+
+// Activity-driven: emit only changed counters, at most once per interval.
+// Detailed errors remain sparse.
+func (c *ktlsCounters) log() bool {
+	interval := ktlsLogInterval
+	if cmn.Rom.V(5, cos.ModKTLS) {
+		interval = ktlsVerboseLogInterval
+	}
+	if stats := c.logDue(mono.NanoTime(), interval); stats != nil {
+		nlog.Infoln(stats.String())
+		return true
+	}
+	return false
+}
+
+func (c *ktlsCounters) logDue(now int64, interval time.Duration) *ktlsCounterValues {
+	last := c.lastLog.Load()
+	if (last != 0 && time.Duration(now-last) < interval) || !c.logMu.TryLock() {
+		return nil
+	}
+	defer c.logMu.Unlock()
+	if last = c.lastLog.Load(); last != 0 && time.Duration(now-last) < interval {
+		return nil
+	}
+	stats := c.snapshot()
+	if stats == c.lastStats {
+		return nil
+	}
+	c.lastStats = stats
+	c.lastLog.Store(now)
+	return &stats
+}
+
+// arm() bailed before reaching the installer: a missing secret, session tickets,
+// an unusable TLS version, or transmit shutdown winning the race. The kernel
+// did not decline offload; that is counted separately as unsupported.
 func (c *ktlsConn) skip(reason string) {
-	ktlsCnt.skipped.Add(1)
-	if cmn.Rom.V(5, cos.ModAIS) {
-		nlog.Infoln("ktls-tx: not arming:", reason, c.tcp.RemoteAddr(), &ktlsCnt)
+	if cnt := ktlsCnt.skipped.Add(1); cmn.Rom.V(5, cos.ModKTLS) && cos.Sparse(cnt) {
+		nlog.Infoln("ktls-tx: not arming:", reason, c.tcp.RemoteAddr())
+	}
+}
+
+// arm() refused: always our misconfiguration - counted separately, reported regardless of verbosity
+func (c *ktlsConn) refuse(reason string) {
+	if cnt := ktlsCnt.refused.Add(1); cos.Sparse(cnt) {
+		nlog.Errorln("ktls-tx: refusing to arm -", reason, c.tcp.RemoteAddr())
 	}
 }
 
 func (c *ktlsConn) arm() {
+	defer ktlsCnt.log()
 	state := c.Conn.ConnectionState()
 	params := ktlsParams{version: state.Version, cipherSuite: state.CipherSuite}
 	switch state.Version {
@@ -595,8 +749,7 @@ func (c *ktlsConn) arm() {
 		// change. Session tickets are the known crypto/tls write under the
 		// server application epoch during the handshake, hence they must be off.
 		if !c.cfg.SessionTicketsDisabled {
-			nlog.Errorln("ktls-tx: refusing to arm - session tickets are enabled")
-			c.skip("session tickets are enabled")
+			c.refuse("session tickets are enabled")
 			return
 		}
 		params.secret = c.secrets.takeTLS13()
@@ -634,6 +787,8 @@ func (c *ktlsConn) arm() {
 	}
 	enabled, err := c.install(c.tcp, &params)
 	if enabled && err == nil {
+		c.armedAt = mono.NanoTime()
+		ktlsCnt.armed.Add(1)
 		c.txState.Store(ktlsArmed)
 	}
 	c.txMu.Unlock()
@@ -641,31 +796,21 @@ func (c *ktlsConn) arm() {
 	switch {
 	case errors.Is(err, errKtlsNotEstablished):
 		ktlsCnt.notEstablished.Add(1)
-		if cmn.Rom.V(5, cos.ModAIS) {
-			nlog.Infoln("ktls-tx: not armed, continuing with crypto/tls:", err, c.tcp.RemoteAddr(), &ktlsCnt)
-		}
 		return
 	case err != nil:
 		// distinguished from `unsupported` on purpose (see ktlsUnsupported)
 		cnt := ktlsCnt.failed.Add(1)
-		if cmn.Rom.V(5, cos.ModAIS) || cos.Sparse(cnt) {
+		if cos.Sparse(cnt) {
 			nlog.Errorln("ktls-tx: install failed, continuing with crypto/tls:", err,
-				c.tcp.RemoteAddr(), &ktlsCnt)
+				c.tcp.RemoteAddr())
 		}
 		return
 	case !enabled:
-		ktlsCnt.unsupported.Add(1)
-		if cmn.Rom.V(5, cos.ModAIS) {
+		if cnt := ktlsCnt.unsupported.Add(1); cmn.Rom.V(5, cos.ModKTLS) && cos.Sparse(cnt) {
 			nlog.Infoln("ktls-tx: offload unavailable", tls.VersionName(params.version),
-				tls.CipherSuiteName(params.cipherSuite), c.tcp.RemoteAddr(), &ktlsCnt)
+				tls.CipherSuiteName(params.cipherSuite), c.tcp.RemoteAddr())
 		}
 		return
-	}
-
-	ktlsCnt.armed.Add(1)
-	if cmn.Rom.V(5, cos.ModAIS) {
-		nlog.Infoln("ktls-tx: armed", tls.VersionName(params.version),
-			tls.CipherSuiteName(params.cipherSuite), c.tcp.RemoteAddr(), &ktlsCnt)
 	}
 }
 
@@ -686,6 +831,7 @@ func (c *ktlsConn) Write(p []byte) (int, error) {
 	if err := c.init(context.Background()); err != nil {
 		return 0, err
 	}
+	c.decline()
 	switch c.txState.Load() {
 	case ktlsArmed:
 		// plaintext enters TCP; kTLS emits encrypted TLS records
@@ -700,7 +846,7 @@ func (c *ktlsConn) Write(p []byte) (int, error) {
 
 func (c *ktlsConn) write(p []byte) (int, error) {
 	c.txOut.Lock()
-	defer c.txOut.Unlock()
+	defer c.endTx()
 	if c.txClosed.Load() {
 		return 0, net.ErrClosed
 	}
@@ -718,6 +864,7 @@ func (c *ktlsConn) ReadFrom(r io.Reader) (int64, error) {
 	if err := c.init(context.Background()); err != nil {
 		return 0, err
 	}
+	c.decline()
 	switch c.txState.Load() {
 	case ktlsArmed:
 		// NOTE: sendfile path must use io.LimitedReader (see getOI._txreg in ais/tgtobj)
@@ -727,7 +874,7 @@ func (c *ktlsConn) ReadFrom(r io.Reader) (int64, error) {
 		}
 
 		c.txOut.Lock()
-		defer c.txOut.Unlock()
+		defer c.endTx()
 		if c.txClosed.Load() {
 			return 0, net.ErrClosed
 		}
@@ -779,13 +926,20 @@ func (c *ktlsConn) finish(reserved, written int64) {
 	}
 }
 
+func (c *ktlsConn) endTx() {
+	c.txOut.Unlock()
+	if c.statsStopped.Load() {
+		c.stopStats()
+	}
+}
+
 func (c *ktlsConn) exhaust() {
 	if !c.txState.CompareAndSwap(ktlsArmed, ktlsExhausted) {
 		return
 	}
 	cnt := ktlsCnt.exhausted.Add(1)
-	if cmn.Rom.V(5, cos.ModAIS) || cos.Sparse(cnt) {
-		nlog.Warningln(errKtlsExhausted, c.tcp.RemoteAddr(), &ktlsCnt)
+	if cos.Sparse(cnt) {
+		nlog.Warningln(errKtlsExhausted, c.tcp.RemoteAddr())
 	}
 
 	// record transmit shutdown under txMu, as beginClose does
@@ -795,6 +949,8 @@ func (c *ktlsConn) exhaust() {
 
 	_ = c.closeNotify() // closeOnce: idempotent vs. Close/CloseWrite
 	_ = c.tcp.Close()
+	c.statsStopped.Store(true)
+	c.reportStop() // caller holds txOut; no finish() follows a rejected reservation
 }
 
 func (c *ktlsConn) stateErr() error {
@@ -805,7 +961,9 @@ func (c *ktlsConn) stateErr() error {
 }
 
 func (c *ktlsConn) Close() error {
-	switch c.beginClose() {
+	state := c.beginClose()
+	defer c.stopStats()
+	switch state {
 	case ktlsArmed:
 		// Match crypto/tls: if Close races an active write, close the socket
 		// immediately instead of waiting to send close_notify.
@@ -829,7 +987,9 @@ func (c *ktlsConn) Close() error {
 }
 
 func (c *ktlsConn) CloseWrite() error {
-	switch c.beginClose() {
+	state := c.beginClose()
+	defer c.stopStats()
+	switch state {
 	case ktlsArmed:
 		// As in crypto/tls, order close_notify after any active application
 		// write and prevent every subsequent write.
@@ -850,7 +1010,42 @@ func (c *ktlsConn) beginClose() uint32 {
 	c.txClosed.Store(true)
 	state := c.txState.Load()
 	c.txMu.Unlock()
+	c.decide(false)
 	return state
+}
+
+// Do not wait for active I/O: Close must remain able to interrupt a blocked
+// transmit. If txOut is busy, endTx() reports after refunding any short write.
+func (c *ktlsConn) stopStats() {
+	c.statsStopped.Store(true)
+	if c.txOut.TryLock() {
+		c.reportStop()
+		c.txOut.Unlock()
+	}
+}
+
+// Under txOut. Close, CloseWrite, exhaustion, and poisoning share this one-shot
+// accounting; an unarmed connection contributes no shutdown count.
+func (c *ktlsConn) reportStop() {
+	if c.armedAt == 0 || c.statsReported {
+		return
+	}
+	c.statsReported = true
+	ktlsCnt.stopBytes.Add(c.txBytes.Load())
+	ktlsCnt.stopped.Add(1)
+
+	// log
+	if ktlsCnt.log() && cmn.Rom.V(5, cos.ModKTLS) {
+		state := "armed"
+		switch c.txState.Load() {
+		case ktlsPoisoned:
+			state = "poisoned"
+		case ktlsExhausted:
+			state = "exhausted"
+		}
+		nlog.Infoln("ktls-tx: stopped", c.tcp.RemoteAddr(), "armed-for", time.Duration(mono.SinceNano(c.armedAt)),
+			"tx-bytes", c.txBytes.Load(), "retiring", c.txRetiring.Load(), "state", state)
+	}
 }
 
 func (c *ktlsConn) closeNotify() error {
@@ -886,7 +1081,10 @@ func (c *ktlsConn) retire(size int64) bool {
 	if rem > ktlsHeadroom && size < rem-ktlsHeadroom {
 		return false
 	}
-	c.txRetiring.Store(true)
+	if c.txRetiring.CompareAndSwap(false, true) {
+		ktlsCnt.retiring.Add(1)
+		ktlsCnt.log()
+	}
 	return true
 }
 

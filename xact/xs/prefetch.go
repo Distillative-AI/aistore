@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strconv"
 	"sync"
 	"time"
 
@@ -101,6 +100,22 @@ func (p *prfFactory) Start() (err error) {
 	}
 	if !b.IsCloud() && !b.IsRemoteAIS() {
 		return fmt.Errorf("can only prefetch Cloud and remote AIS buckets (have %s)", b.Cname(""))
+	}
+	chunks := b.Props.Chunks
+
+	// see docs/storage_svcs.md#prefetch-mechanism
+	if p.msg.BlobThreshold > 0 {
+		if chunks.AutoEnabled() {
+			p.msg.BlobThreshold = max(p.msg.BlobThreshold, int64(chunks.ObjSizeLimit))
+			if p.msg.BlobChunkSize != 0 {
+				nlog.Warningf("%s: ignoring blob-chunk-size=%s; bucket auto-chunking uses chunks.chunk_size=%s",
+					xact.Cname(p.Kind(), p.UUID()), cos.IEC(p.msg.BlobChunkSize, 0), chunks.ChunkSize)
+			}
+			p.msg.BlobChunkSize = int64(chunks.ChunkSize)
+		} else {
+			nlog.Warningf("%s: bucket auto-chunking is disabled; blob-prefetched objects stay chunked; "+
+				"run 'ais bucket rechunk' to restore the bucket layout", xact.Cname(p.Kind(), p.UUID()))
+		}
 	}
 	p.xctn, err = newPrefetch(&p.Args, p.Kind(), b, p.msg)
 	return err
@@ -333,7 +348,7 @@ func (r *prefetch) Snap() (snap *core.Snap) {
 //
 
 func (r *prefetch) blobdl(lom *core.LOM, oa *cmn.ObjAttrs) (int, error) {
-	// pass user preferences through; blobFactory.Start tunes them once
+	// bucket auto-chunking has already taken precedence in prfFactory.Start
 	params := &core.BlobParams{
 		Lom:     &core.LOM{ObjName: lom.ObjName},
 		Context: r.Context(),
@@ -688,7 +703,7 @@ func (r *prefetch) _ctlMsgJob(sb *cos.SB) {
 	if coldN > 0 {
 		sep()
 		sb.WriteString("cold:(")
-		sb.WriteString(strconv.FormatInt(coldN, 10))
+		sb.WriteInt64(coldN)
 		sb.WriteUint8(',')
 		sb.WriteString(cos.IEC(r.stats.coldSize.Load(), 2))
 		sb.WriteUint8(')')
@@ -697,24 +712,24 @@ func (r *prefetch) _ctlMsgJob(sb *cos.SB) {
 	if largeN > 0 {
 		sep()
 		sb.WriteString("large-cold:")
-		sb.WriteString(strconv.FormatInt(largeN, 10))
+		sb.WriteInt64(largeN)
 	}
 	if blobN > 0 || blobRej > 0 {
 		sep()
 		sb.WriteString("blob-started:(")
-		sb.WriteString(strconv.FormatInt(blobN, 10))
+		sb.WriteInt64(blobN)
 		sb.WriteUint8(',')
 		sb.WriteString(cos.IEC(r.stats.blobSize.Load(), 2))
 		if blobRej > 0 {
 			sb.WriteString(" rejected:")
-			sb.WriteString(strconv.FormatInt(blobRej, 10))
+			sb.WriteInt64(blobRej)
 		}
 		sb.WriteUint8(')')
 	}
 	if peblN > 0 {
 		sep()
 		sb.WriteString("pending:(")
-		sb.WriteString(strconv.FormatInt(int64(peblN), 10))
+		sb.WriteInt(int(peblN))
 		sb.WriteUint8(',')
 		sb.WriteString(cos.IEC(r.stats.peblSize.Load(), 2))
 		sb.WriteUint8(')')
@@ -750,7 +765,7 @@ func (*prefetch) _ctlMsgNode(sb *cos.SB) {
 	if coldN > 0 {
 		sep()
 		sb.WriteString("cold:(")
-		sb.WriteString(strconv.FormatInt(coldN, 10))
+		sb.WriteInt64(coldN)
 		sb.WriteUint8(',')
 		sb.WriteString(cos.IEC(coldSize, 2))
 		if coldLat > 0 {
@@ -763,7 +778,7 @@ func (*prefetch) _ctlMsgNode(sb *cos.SB) {
 	if blobN > 0 {
 		sep()
 		sb.WriteString("blob-done:(")
-		sb.WriteString(strconv.FormatInt(blobN, 10))
+		sb.WriteInt64(blobN)
 		sb.WriteUint8(',')
 		sb.WriteString(cos.IEC(blobSize, 2))
 		sb.WriteUint8(')')

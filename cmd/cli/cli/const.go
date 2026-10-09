@@ -1092,20 +1092,25 @@ var (
 	// usage: shard-index build
 	skipVerifyFlag = cli.BoolFlag{
 		Name: "skip-verify",
-		Usage: "If a shard already has an index, trust it without loading and verifying staleness (fast re-run);\n" +
-			indent1 + "\tuse with caution: stale indexes will remain until the next non-skip-verify run",
+		Usage: "If a shard already has an index, skip standalone verification (fast re-run);\n" +
+			indent1 + "\tuse with caution: stale indexes remain until a verifying run, unless loaded and verified via '--cache'",
+	}
+	shardIdxCacheFlag = cli.BoolFlag{
+		Name: "cache",
+		Usage: "Cache shard index in memory (both existing and newly built; subject to memory pressure);\n" +
+			indent1 + "\tloading an existing index verifies it: stale or corrupt indexes get rebuilt",
 	}
 
 	blobThresholdFlag = cli.StringFlag{
 		Name: "blob-threshold",
-		Usage: "Utilize built-in blob-downloader for remote objects greater than the specified (threshold) size\n" +
+		Usage: "Utilize built-in blob-downloader for remote objects at or above the specified (threshold) size\n" +
 			indent1 + "\tin IEC or SI units, or \"raw\" bytes (e.g.: 4mb, 1MiB, 1048576, 128k; see '--units')",
 	}
 	blobChunkSizeFlag = cli.StringFlag{
 		Name: "blob-chunk-size",
 		Usage: "Preferred chunk size for each blob-download started by prefetch (in IEC or SI units, or \"raw\" bytes; e.g.: 4mb, 1MiB, 1048576);\n" +
 			indent1 + "\tsilently clamped by the server to a permitted range;\n" +
-			indent1 + "\tonly takes effect together with '--blob-threshold'",
+			indent1 + "\tonly takes effect with '--blob-threshold' when bucket auto-chunking is disabled; otherwise, 'chunks.chunk_size' applies",
 	}
 	blobNumWorkersFlag = cli.IntFlag{
 		Name: "blob-num-workers",

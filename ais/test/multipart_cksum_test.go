@@ -78,7 +78,11 @@ func TestMultipartChecksumSequential(t *testing.T) {
 	tlog.Logfln("sequential multipart upload with checksum validation: %s/%s", bck.Name, objName)
 
 	// Create multipart upload
-	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	uploadID, err := api.CreateMultipartUpload(&api.MptArgs{
+		BaseParams: baseParams,
+		Bck:        bck,
+		ObjName:    objName},
+	)
 	tassert.CheckFatal(t, err)
 
 	// Upload parts SEQUENTIALLY (wait for each to complete)
@@ -105,12 +109,20 @@ func TestMultipartChecksumSequential(t *testing.T) {
 	for i := range partNumbers {
 		partNumbers[i] = i + 1
 	}
-	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+	err = api.CompleteMultipartUpload(&api.CompleteMptArgs{
+		MptArgs: api.MptArgs{
+			BaseParams: baseParams,
+			Bck:        bck,
+			ObjName:    objName,
+		},
+		UploadID:    uploadID,
+		PartNumbers: partNumbers,
+	})
 	tassert.CheckFatal(t, err)
 
 	// Verify object attributes
 	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
-	objProps, err := api.HeadObject(baseParams, bck, objName, hargs)
+	objProps, err := api.HeadObjectV2(baseParams, bck, objName, apc.GetPropsChecksum, hargs)
 	tassert.CheckFatal(t, err)
 
 	actualCksum := objProps.ObjAttrs.Checksum()
@@ -171,7 +183,11 @@ func TestMultipartChecksumParallel(t *testing.T) {
 	tlog.Logfln("parallel multipart upload with checksum validation: %s/%s (%d parts)", bck.Name, objName, numParts)
 
 	// Create multipart upload
-	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	uploadID, err := api.CreateMultipartUpload(&api.MptArgs{
+		BaseParams: baseParams,
+		Bck:        bck,
+		ObjName:    objName,
+	})
 	tassert.CheckFatal(t, err)
 
 	// Upload ALL parts simultaneously to guarantee out-of-order arrival
@@ -215,12 +231,20 @@ func TestMultipartChecksumParallel(t *testing.T) {
 	for i := range partNumbers {
 		partNumbers[i] = i + 1
 	}
-	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+	err = api.CompleteMultipartUpload(&api.CompleteMptArgs{
+		MptArgs: api.MptArgs{
+			BaseParams: baseParams,
+			Bck:        bck,
+			ObjName:    objName,
+		},
+		UploadID:    uploadID,
+		PartNumbers: partNumbers,
+	})
 	tassert.CheckFatal(t, err)
 
 	// Verify object attributes
 	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
-	objProps, err := api.HeadObject(baseParams, bck, objName, hargs)
+	objProps, err := api.HeadObjectV2(baseParams, bck, objName, apc.GetPropsChecksum, hargs)
 	tassert.CheckFatal(t, err)
 
 	actualCksum := objProps.ObjAttrs.Checksum()
@@ -270,7 +294,11 @@ func TestMultipartChecksumSinglePart(t *testing.T) {
 	tlog.Logfln("single-part multipart upload: %s/%s", bck.Name, objName)
 
 	// Create and complete single-part upload
-	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	uploadID, err := api.CreateMultipartUpload(&api.MptArgs{
+		BaseParams: baseParams,
+		Bck:        bck,
+		ObjName:    objName,
+	})
 	tassert.CheckFatal(t, err)
 
 	putPartArgs := &api.PutPartArgs{
@@ -287,12 +315,20 @@ func TestMultipartChecksumSinglePart(t *testing.T) {
 	err = api.UploadPart(putPartArgs)
 	tassert.CheckFatal(t, err)
 
-	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, []int{1})
+	err = api.CompleteMultipartUpload(&api.CompleteMptArgs{
+		MptArgs: api.MptArgs{
+			BaseParams: baseParams,
+			Bck:        bck,
+			ObjName:    objName,
+		},
+		UploadID:    uploadID,
+		PartNumbers: []int{1},
+	})
 	tassert.CheckFatal(t, err)
 
 	// Verify checksum
 	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
-	objProps, err := api.HeadObject(baseParams, bck, objName, hargs)
+	objProps, err := api.HeadObjectV2(baseParams, bck, objName, apc.GetPropsChecksum, hargs)
 	tassert.CheckFatal(t, err)
 
 	actualCksum := objProps.ObjAttrs.Checksum()
@@ -355,7 +391,11 @@ func TestMultipartChecksumLargeParts(t *testing.T) {
 	}
 
 	// Create multipart upload
-	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	uploadID, err := api.CreateMultipartUpload(&api.MptArgs{
+		BaseParams: baseParams,
+		Bck:        bck,
+		ObjName:    objName,
+	})
 	tassert.CheckFatal(t, err)
 
 	// Upload parts sequentially
@@ -381,12 +421,20 @@ func TestMultipartChecksumLargeParts(t *testing.T) {
 	for i := range partNumbers {
 		partNumbers[i] = i + 1
 	}
-	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+	err = api.CompleteMultipartUpload(&api.CompleteMptArgs{
+		MptArgs: api.MptArgs{
+			BaseParams: baseParams,
+			Bck:        bck,
+			ObjName:    objName,
+		},
+		UploadID:    uploadID,
+		PartNumbers: partNumbers,
+	})
 	tassert.CheckFatal(t, err)
 
 	// Verify checksum
 	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
-	objProps, err := api.HeadObject(baseParams, bck, objName, hargs)
+	objProps, err := api.HeadObjectV2(baseParams, bck, objName, apc.GetPropsChecksum, hargs)
 	tassert.CheckFatal(t, err)
 
 	actualCksum := objProps.ObjAttrs.Checksum()
@@ -447,7 +495,11 @@ func TestMultipartChecksumManyParts(t *testing.T) {
 	}
 
 	// Create multipart upload
-	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	uploadID, err := api.CreateMultipartUpload(&api.MptArgs{
+		BaseParams: baseParams,
+		Bck:        bck,
+		ObjName:    objName,
+	})
 	tassert.CheckFatal(t, err)
 
 	// Upload parts sequentially
@@ -473,12 +525,20 @@ func TestMultipartChecksumManyParts(t *testing.T) {
 	for i := range partNumbers {
 		partNumbers[i] = i + 1
 	}
-	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+	err = api.CompleteMultipartUpload(&api.CompleteMptArgs{
+		MptArgs: api.MptArgs{
+			BaseParams: baseParams,
+			Bck:        bck,
+			ObjName:    objName,
+		},
+		UploadID:    uploadID,
+		PartNumbers: partNumbers,
+	})
 	tassert.CheckFatal(t, err)
 
 	// Verify checksum
 	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
-	objProps, err := api.HeadObject(baseParams, bck, objName, hargs)
+	objProps, err := api.HeadObjectV2(baseParams, bck, objName, apc.GetPropsChecksum, hargs)
 	tassert.CheckFatal(t, err)
 
 	actualCksum := objProps.ObjAttrs.Checksum()

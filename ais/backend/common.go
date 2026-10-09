@@ -5,6 +5,7 @@
 package backend
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 const numBackendMetricks = 12
 
 type base struct {
+	tstats   stats.Tracker
 	metrics  cos.StrKVs // this backend's metric names (below)
 	provider string
 }
@@ -45,6 +47,7 @@ func (b *base) init(snode *meta.Snode, tr stats.Tracker, startingUp bool) {
 	}
 
 	labels := cos.StrKVs{"backend": prefix}
+	b.tstats = tr
 	b.metrics = make(map[string]string, numBackendMetricks)
 
 	// NOTE semantics:
@@ -165,6 +168,24 @@ func (b *base) init(snode *meta.Snode, tr stats.Tracker, startingUp bool) {
 		)
 	}
 
+	// remote GET timeout (see rdl.go; not used by remote AIS)
+	// NOTE: error metric names must start with "err." (see stats.IsErrMetric)
+	if prefix != apc.RemAIS {
+		b.metrics[stats.GetTimeoutCount] = "err." + prefix + "." + stats.GetTimeoutCount
+		if regExt {
+			tr.RegExtMetric(snode,
+				b.metrics[stats.GetTimeoutCount],
+				stats.KindCounter,
+				&stats.Extra{
+					Help:    "GET: number of remote requests aborted upon read deadline (backend sending below minimum transfer rate; see timeout.send_file_time)",
+					StrName: "remote_get_timeout_count",
+					Labels:  labels,
+					VarLabs: stats.BckVlabs,
+				},
+			)
+		}
+	}
+
 	// version changed out-of-band
 	b.metrics[stats.VerChangeCount] = prefix + "." + stats.VerChangeCount
 	b.metrics[stats.VerChangeSize] = prefix + "." + stats.VerChangeSize
@@ -209,19 +230,19 @@ func (b *base) CreateBucket(_ *meta.Bck) (int, error) {
 // multipart upload - default "not implemented" methods
 //
 
-func (b *base) StartMpt(*core.LOM, *http.Request) (string, int, error) {
+func (b *base) StartMpt(context.Context, *core.LOM, *http.Request) (string, int, error) {
 	return "", http.StatusNotImplemented, cmn.NewErrUnsupp("multipart upload start", b.provider)
 }
 
-func (b *base) PutMptPart(*core.LOM, cos.ReadOpenCloser, *http.Request, string, int64, int32) (string, int, error) {
+func (b *base) PutMptPart(context.Context, *core.LOM, cos.ReadOpenCloser, *http.Request, string, int64, int32) (string, int, error) {
 	return "", http.StatusNotImplemented, cmn.NewErrUnsupp("multipart upload part", b.provider)
 }
 
-func (b *base) CompleteMpt(*core.LOM, *http.Request, string, []byte, apc.MptCompletedParts) (string, string, int, error) {
+func (b *base) CompleteMpt(context.Context, *core.LOM, *http.Request, string, []byte, apc.MptCompletedParts) (string, string, int, error) {
 	return "", "", http.StatusNotImplemented, cmn.NewErrUnsupp("multipart upload complete", b.provider)
 }
 
-func (b *base) AbortMpt(*core.LOM, *http.Request, string) (int, error) {
+func (b *base) AbortMpt(context.Context, *core.LOM, *http.Request, string) (int, error) {
 	return http.StatusNotImplemented, cmn.NewErrUnsupp("multipart upload abort", b.provider)
 }
 
@@ -252,4 +273,12 @@ func allocPutParams(res core.GetReaderResult, owt cmn.OWT) *core.PutParams {
 		params.SkipBackend = true
 	}
 	return params
+}
+
+// Multipart operations without an explicit context retain background behavior.
+func mptContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }

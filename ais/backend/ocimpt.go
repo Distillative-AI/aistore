@@ -12,6 +12,7 @@ import (
 	"net/http"
 
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core"
 
@@ -47,7 +48,8 @@ import (
 // The backend parameter is guaranteed to be *ocibp by the call path
 // routing logic (see ais/tgts3mpt)
 
-func (bp *ocibp) StartMpt(lom *core.LOM, _ *http.Request) (string, int, error) {
+func (bp *ocibp) StartMpt(ctx context.Context, lom *core.LOM, _ *http.Request) (string, int, error) {
+	ctx = mptContext(ctx)
 	var (
 		client                       *ocios.ObjectStorageClient
 		cloudBck                     = lom.Bck().RemoteBck()
@@ -69,7 +71,7 @@ func (bp *ocibp) StartMpt(lom *core.LOM, _ *http.Request) (string, int, error) {
 		return "", ecode, err
 	}
 
-	createMultipartUploadResponse, err = client.CreateMultipartUpload(context.Background(), createMultipartUploadRequest)
+	createMultipartUploadResponse, err = client.CreateMultipartUpload(ctx, createMultipartUploadRequest)
 
 	if err == nil {
 		uploadID = *createMultipartUploadResponse.MultipartUpload.UploadId
@@ -80,7 +82,8 @@ func (bp *ocibp) StartMpt(lom *core.LOM, _ *http.Request) (string, int, error) {
 	return uploadID, ecode, err
 }
 
-func (bp *ocibp) PutMptPart(lom *core.LOM, r cos.ReadOpenCloser, _ *http.Request, uploadID string, size int64, partNum int32) (string, int, error) {
+func (bp *ocibp) PutMptPart(ctx context.Context, lom *core.LOM, r cos.ReadOpenCloser, _ *http.Request, uploadID string, size int64, partNum int32) (string, int, error) {
+	ctx = mptContext(ctx)
 	var (
 		client            *ocios.ObjectStorageClient
 		cloudBck          = lom.Bck().RemoteBck()
@@ -105,7 +108,7 @@ func (bp *ocibp) PutMptPart(lom *core.LOM, r cos.ReadOpenCloser, _ *http.Request
 		return "", ecode, err
 	}
 
-	uploadPartResponse, err = client.UploadPart(context.Background(), uploadPartRequest)
+	uploadPartResponse, err = client.UploadPart(ctx, uploadPartRequest)
 
 	if err == nil {
 		etag = *uploadPartResponse.ETag
@@ -116,7 +119,8 @@ func (bp *ocibp) PutMptPart(lom *core.LOM, r cos.ReadOpenCloser, _ *http.Request
 	return etag, ecode, err
 }
 
-func (bp *ocibp) CompleteMpt(lom *core.LOM, _ *http.Request, uploadID string, _ []byte, parts apc.MptCompletedParts) (string, string, int, error) {
+func (bp *ocibp) CompleteMpt(ctx context.Context, lom *core.LOM, _ *http.Request, uploadID string, _ []byte, parts apc.MptCompletedParts) (string, string, int, error) {
+	ctx = mptContext(ctx)
 	var (
 		client                       *ocios.ObjectStorageClient
 		cloudBck                     = lom.Bck().RemoteBck()
@@ -142,15 +146,17 @@ func (bp *ocibp) CompleteMpt(lom *core.LOM, _ *http.Request, uploadID string, _ 
 
 	// Convert apc.MptCompletedParts to OCI types
 	for _, completedPart := range parts {
+		// OCI expects the provider ETag without S3 response quotes.
+		etag := cmn.UnquoteCEV(completedPart.ETag)
 		commitMultipartUploadRequest.CommitMultipartUploadDetails.PartsToCommit = append(
 			commitMultipartUploadRequest.CommitMultipartUploadDetails.PartsToCommit,
 			ocios.CommitMultipartUploadPartDetails{
 				PartNum: &completedPart.PartNumber,
-				Etag:    &completedPart.ETag,
+				Etag:    &etag,
 			})
 	}
 
-	commitMultipartUploadResponse, err = client.CommitMultipartUpload(context.Background(), commitMultipartUploadRequest)
+	commitMultipartUploadResponse, err = client.CommitMultipartUpload(ctx, commitMultipartUploadRequest)
 
 	if err == nil {
 		etag = *commitMultipartUploadResponse.ETag
@@ -161,7 +167,8 @@ func (bp *ocibp) CompleteMpt(lom *core.LOM, _ *http.Request, uploadID string, _ 
 	return "", etag, ecode, err
 }
 
-func (bp *ocibp) AbortMpt(lom *core.LOM, _ *http.Request, uploadID string) (int, error) {
+func (bp *ocibp) AbortMpt(ctx context.Context, lom *core.LOM, _ *http.Request, uploadID string) (int, error) {
+	ctx = mptContext(ctx)
 	var (
 		client                      *ocios.ObjectStorageClient
 		cloudBck                    = lom.Bck().RemoteBck()
@@ -180,7 +187,7 @@ func (bp *ocibp) AbortMpt(lom *core.LOM, _ *http.Request, uploadID string) (int,
 		return ociClientToAISError("AbortMultipartUpload", cloudBck.Name, lom.ObjName, err)
 	}
 
-	abortMultipartUploadResponse, err = client.AbortMultipartUpload(context.Background(), abortMultipartUploadRequest)
+	abortMultipartUploadResponse, err = client.AbortMultipartUpload(ctx, abortMultipartUploadRequest)
 
 	if err != nil {
 		ecode, err = ociErrorToAISError(fmt.Sprintf("AbortMultipartUpload(%s)", uploadID), cloudBck.Name, lom.ObjName, "", err, abortMultipartUploadResponse.RawResponse)

@@ -1856,27 +1856,32 @@ func TestECEmergencyTargetForReplica(t *testing.T) {
 		t.FailNow()
 	}
 
-	// kill #parity-slices of targets, normal EC restore won't be possible
-	// 2. Kill a random target
-	removedTargets := make(meta.Nodes, 0, o.parityCnt)
+	// Remove enough targets that normal EC restore won't be possible.
 	smap := tools.GetClusterMap(t, proxyURL)
-
-	for i := o.dataCnt - 1; i >= 0; i-- {
-		var removedTarget *meta.Snode
-		smap, removedTarget = tools.RmTargetSkipRebWait(t, proxyURL, smap)
-		removedTargets = append(removedTargets, removedTarget)
+	removedTargets := smap.Tmap.ActiveNodes()[:o.dataCnt]
+	sids := make([]string, len(removedTargets))
+	for i, target := range removedTargets {
+		sids[i] = target.ID()
 	}
-
-	defer func() {
-		var rebID string
-		for _, target := range removedTargets {
-			rebID, _ = tools.RestoreTarget(t, proxyURL, target)
-		}
-		if rebID == "" {
-			return
-		}
+	// Record recovery before the request or its cluster-state wait can fail.
+	t.Cleanup(func() {
+		args := &apc.ActValRmNode{}
+		args.SetIDs(sids...)
+		rebID, err := stopMaintenanceRetry(t, baseParams, args)
+		tassert.CheckFatal(t, err)
+		_, err = tools.WaitForClusterState(proxyURL, "restore EC targets", 0,
+			smap.CountActivePs(), smap.CountActiveTs())
+		tassert.CheckError(t, err)
 		tools.WaitForRebalanceByID(t, baseParams, rebID)
-	}()
+	})
+
+	args := &apc.ActValRmNode{SkipRebalance: true}
+	args.SetIDs(sids...)
+	_, err := startMaintenanceRetry(t, baseParams, args)
+	tassert.CheckFatal(t, err)
+	_, err = tools.WaitForClusterState(proxyURL, "remove EC targets", smap.Version,
+		smap.CountActivePs(), smap.CountActiveTs()-len(removedTargets))
+	tassert.CheckFatal(t, err)
 
 	hasTarget := func(targets meta.Nodes, target *meta.Snode) bool {
 		for _, tr := range targets {
@@ -2726,7 +2731,7 @@ func TestECGenerations(t *testing.T) {
 			for i := range o.objCount {
 				objName := ecTestDir + fmt.Sprintf(o.pattern, i)
 				hargs := api.HeadArgs{FltPresence: apc.FltPresent}
-				props, err := api.HeadObject(baseParams, bck, objName, hargs)
+				props, err := api.HeadObjectV2(baseParams, bck, objName, apc.GetPropsEC, hargs)
 				tassert.CheckError(t, err)
 				if err == nil && props.EC.Generation > lastWrite[i] && props.EC.Generation < currentTime {
 					t.Errorf("Object %s, generation %d expected between %d and %d",

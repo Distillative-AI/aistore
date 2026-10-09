@@ -55,6 +55,11 @@ const (
 	VerChangeCount = "ver.change.n"
 	VerChangeSize  = "ver.change.size"
 
+	// two error counters for stalled GET transfers in both directions
+	// see docs/configuration.md, section "Minimum transfer rate"
+	GetTimeoutCount       = "get.timeout.n"                 // per-backend remote GET timeout suffix; see cmn.ErrRemoteGetTimeout
+	ErrGetSlowClientCount = errPrefix + "get.slow.client.n" // see cmn.ErrSlowReadingClient
+
 	// errors (note common prefix convention)
 	ErrPutCksumCount = errPrefix + "put.cksum.n"
 	ErrFSHCCount     = errPrefix + "fshc.n"
@@ -420,6 +425,12 @@ func (r *Trunner) RegMetrics(snode *meta.Snode) {
 	)
 
 	// errors
+	r.reg(snode, ErrGetSlowClientCount, KindCounter,
+		&Extra{
+			Help:    "GET: number of responses aborted upon write deadline (client reading below minimum transfer rate; see timeout.send_file_time)",
+			VarLabs: BckVlabs,
+		},
+	)
 	r.reg(snode, ErrPutCksumCount, KindCounter,
 		&Extra{
 			Help:    "PUT: number of checksum errors",
@@ -930,7 +941,7 @@ func (r *Trunner) logCapacity(now int64) {
 				sb.WriteString(alert)
 			} else {
 				sb.WriteString(": used ")
-				sb.WriteString(strconv.Itoa(int(cdf.Capacity.PctUsed)))
+				sb.WriteInt(int(cdf.Capacity.PctUsed))
 				sb.WriteUint8('%')
 				sb.WriteString(", avail ")
 				sb.WriteString(cos.IEC(int64(cdf.Capacity.Avail), 2))
@@ -1016,7 +1027,7 @@ func _more(sb *cos.SB, xnames []string, prefix string) {
 	_apps(sb, prefix, show, l)
 	if more > 0 {
 		sb.WriteString("... (and ")
-		sb.WriteString(strconv.Itoa(more))
+		sb.WriteInt(more)
 		sb.WriteString(" more)")
 	}
 }
@@ -1032,7 +1043,7 @@ func _apps(sb *cos.SB, prefix string, items []string, total int) {
 
 	sb.WriteString(prefix)
 	sb.WriteUint8('(')
-	sb.WriteString(strconv.Itoa(total))
+	sb.WriteInt(total)
 	sb.WriteString("): ")
 	sb.WriteString(items[0])
 	for _, s := range items[1:] {

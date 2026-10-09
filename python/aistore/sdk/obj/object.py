@@ -23,8 +23,6 @@ from aistore.sdk.const import (
     QPARAM_ARCHPATH,
     QPARAM_ARCHREGX,
     QPARAM_ARCHMODE,
-    QPARAM_ETL_NAME,
-    QPARAM_ETL_ARGS,
     QPARAM_LATEST,
     QPARAM_PROPS,
     QPARAM_SYNC,
@@ -292,6 +290,12 @@ class Object:
                     "Cannot use `num_workers` with `etl`. "
                     "Parallel download issues raw range reads that bypass ETL."
                 )
+            if archive_config:
+                raise ValueError(
+                    "Cannot use `num_workers` with `archive_config`. "
+                    "Parallel download issues raw range reads, and the target "
+                    "rejects a range read of archived content."
+                )
 
         if byte_range:
             # For range formatting, see the spec:
@@ -355,11 +359,10 @@ class Object:
         if archpath:
             params[QPARAM_ARCHPATH] = archpath
 
-        # ETL Configuration
+        # ETL Configuration. The same call get_reader() and copy() make, so a
+        # pipeline keeps its stages and dict args keep their JSON encoding.
         if etl:
-            params[QPARAM_ETL_NAME] = etl.name
-            if etl.args:
-                params[QPARAM_ETL_ARGS] = etl.args
+            etl.update_qparams(params)
 
         return self._client.get_full_url(self._object_path, params)
 

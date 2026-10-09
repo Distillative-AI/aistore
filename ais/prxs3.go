@@ -22,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
@@ -277,7 +278,10 @@ func (p *proxy) handleMptUpload(w http.ResponseWriter, r *http.Request, items []
 
 // DELETE /s3/<bucket-name>?delete
 // +gen:endpoint DELETE /s3/{bucket-name} [s3.QparamMultiDelete=string] payload=s3-delete-multiple
-// +gen:payload s3-delete-multiple=<?xml version="1.0" encoding="UTF-8"?><Delete><Object><Key>file1.txt</Key></Object><Object><Key>file2.txt</Key></Object></Delete>
+// +gen:payload s3-delete-multiple=<?xml version="1.0" encoding="UTF-8"?><Delete>\
+// <Object><Key>file1.txt</Key></Object>\
+// <Object><Key>file2.txt</Key></Object>\
+// </Delete>
 // Delete a list of objects from an S3 bucket
 func (p *proxy) delMultipleObjs(w http.ResponseWriter, r *http.Request, bucket string) {
 	bck := p.initByNameOnly(w, r, bucket)
@@ -369,7 +373,8 @@ func (p *proxy) headBckS3(w http.ResponseWriter, r *http.Request, bucket string)
 	w.Header().Set(cos.S3HdrBckRegion, s3.AISRegion)
 }
 
-// +gen:endpoint GET /s3/{bucket-name} [s3.QparamMaxKeys=string,s3.QparamPrefix=string,s3.QparamContinuationToken=string,s3.QparamStartAfter=string,s3.QparamDelimiter=string]
+// +gen:endpoint GET /s3/{bucket-name} [s3.QparamMaxKeys=string,s3.QparamPrefix=string,\
+// s3.QparamContinuationToken=string,s3.QparamStartAfter=string,s3.QparamDelimiter=string]
 // List objects in an S3 bucket
 func (p *proxy) listObjectsS3(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
 	bck := p.initByNameOnly(w, r, bucket)
@@ -558,13 +563,13 @@ func (p *proxy) putObjS3(w http.ResponseWriter, r *http.Request, items []string)
 func (p *proxy) copyObjS3(w http.ResponseWriter, r *http.Request, items []string) {
 	src := r.Header.Get(cos.S3HdrObjSrc)
 	src = strings.Trim(src, "/")
-	parts := strings.SplitN(src, "/", 2)
-	if len(parts) < 2 {
+	srcBck, srcObj, found := strings.Cut(src, "/")
+	if !found {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: errS3Obj})
 		return
 	}
 	// src
-	bckSrc := p.initByNameOnly(w, r, parts[0])
+	bckSrc := p.initByNameOnly(w, r, srcBck)
 	if bckSrc == nil {
 		return
 	}
@@ -582,7 +587,7 @@ func (p *proxy) copyObjS3(w http.ResponseWriter, r *http.Request, items []string
 		return
 	}
 
-	objName := strings.Trim(parts[1], "/")
+	objName := strings.Trim(srcObj, "/")
 	smap := p.owner.smap.get()
 	tsi, err := smap.HrwName2T(bckSrc.MakeUname(objName))
 	if err != nil {
@@ -672,7 +677,18 @@ func (p *proxy) getObjS3(w http.ResponseWriter, r *http.Request, items []string,
 
 // GET /s3/<bucket-name>/<object-name> with `s3.QparamMptUploads`
 func (p *proxy) listMultipart(w http.ResponseWriter, r *http.Request, bck *meta.Bck, q url.Values) {
+	keyMarker := q.Get(s3.QparamMptKeyMarker)
+	uploadIDMarker := q.Get(s3.QparamMptUploadIDMarker)
+	maxUploads, err := s3.ParseMptMaxUploads(q.Get(s3.QparamMptMaxUploads))
+	if err != nil {
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusBadRequest, Code: s3.ErrCodeInvalidArgument})
+		return
+	}
 	smap := p.owner.smap.get()
+	if err := smap.validate(); err != nil {
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusServiceUnavailable})
+		return
+	}
 
 	// NOTE:
 	// Target-side /s3 is served on the public and intra-data networks - not intra-control.
@@ -689,35 +705,53 @@ func (p *proxy) listMultipart(w http.ResponseWriter, r *http.Request, bck *meta.
 		return
 	}
 
-	// bcast & aggregate
+	// Each target's first maxUploads matching entries contain every candidate
+	// for the cluster-wide page. Keep the client filters and markers intact.
 
-	all := &s3.ListMptUploadsResult{}
-	for _, si := range smap.Tmap {
-		var (
-			url   = si.URL(cmn.NetIntraData) // see Note above
-			cargs = allocCargs()
-		)
-		cargs.si = si
-		cargs.req = cmn.HreqArgs{Method: http.MethodGet, Base: url, Path: r.URL.Path, Query: q}
-		res := p.call(cargs, smap)
-		b, err := res.bytes, res.err
-		freeCargs(cargs)
-		freeCR(res)
-		if err == nil {
-			results := &s3.ListMptUploadsResult{}
-			if err := xml.Unmarshal(b, results); err == nil {
-				if len(results.Uploads) > 0 {
-					if len(all.Uploads) == 0 {
-						*all = *results
-						all.Uploads = make([]s3.UploadInfoResult, 0)
-					}
-					all.Uploads = append(all.Uploads, results.Uploads...)
-				}
-			}
+	args := allocBcArgs()
+	args.req = cmn.HreqArgs{Method: http.MethodGet, Path: r.URL.Path, Query: q}
+	args.network = cmn.NetIntraData
+	args.smap = smap
+	args.to = core.Targets
+	results := p.bcastGroup(args)
+	freeBcArgs(args)
+	defer freeBcastRes(results)
+
+	all := make([]s3.UploadInfoResult, 0, len(results)*maxUploads)
+	var truncated bool
+	for _, res := range results {
+		if res.err != nil {
+			err := res.toErr()
+			s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusServiceUnavailable})
+			return
 		}
+		result := &s3.ListMptUploadsResult{}
+		if err := xml.Unmarshal(res.bytes, result); err != nil {
+			err = fmt.Errorf("failed to decode multipart uploads from %s: %w", res.si, err)
+			s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusInternalServerError})
+			return
+		}
+		all = append(all, result.Uploads...)
+		truncated = truncated || result.IsTruncated
+	}
+
+	result := s3.PageUploads(all, s3.ListMptUploadsParams{
+		BckName:    bck.Name,
+		Prefix:     q.Get(s3.QparamPrefix),
+		MaxUploads: maxUploads,
+	})
+	// Targets already applied the markers. Restore the response fields without
+	// filtering again, and account for entries omitted by a target's limit.
+	result.KeyMarker = keyMarker
+	result.UploadIDMarker = uploadIDMarker
+	if truncated {
+		result.IsTruncated = true
+		last := result.Uploads[len(result.Uploads)-1]
+		result.NextKeyMarker = last.Key
+		result.NextUploadIDMarker = last.UploadID
 	}
 	sgl := p.gmm.NewSGL(0)
-	all.MustMarshal(sgl)
+	result.MustMarshal(sgl)
 	w.Header().Set(cos.HdrContentType, cos.ContentXML)
 	sgl.WriteTo2(w)
 	sgl.Free()

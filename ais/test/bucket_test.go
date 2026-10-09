@@ -9,10 +9,12 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -323,6 +325,48 @@ func TestCreateRemoteBucket(t *testing.T) {
 	}
 }
 
+// SSRF: S3 requests to a per-bucket `extra.aws.endpoint` must not reach loopback
+func TestRemoteBucketEndpointEgress(t *testing.T) {
+	var (
+		proxyURL = tools.RandomProxyURL(t)
+		bp       = tools.BaseAPIParams(proxyURL)
+		bck      = cmn.Bck{Name: strings.ToLower(trand.String(10)), Provider: apc.AWS}
+		hits     atomic.Int32
+	)
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredCloudProvider: apc.AWS, Bck: cliBck})
+
+	endpoint := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		hits.Add(1)
+	}))
+	defer endpoint.Close()
+
+	props := &cmn.BpropsToSet{
+		Extra: &cmn.ExtraToSet{AWS: &cmn.ExtraPropsAWSToSet{
+			Endpoint:    apc.Ptr(endpoint.URL),
+			CloudRegion: apc.Ptr("us-east-1"), // skip region discovery
+		}},
+	}
+	blocked := cmn.ErrBlockedEgress.Error()
+	t.Cleanup(func() {
+		if exists, _ := tools.BucketExists(nil, proxyURL, bck); exists {
+			tools.EvictRemoteBucket(t, proxyURL, bck, false /*keepMD*/)
+		}
+	})
+
+	// create (HEAD(remote bucket) fails)
+	err := api.CreateBucket(bp, bck, props)
+	tassert.Fatalf(t, err != nil && strings.Contains(err.Error(), blocked), "expected %q, got %v", blocked, err)
+
+	// create without HEAD (cold GET fails)
+	err = api.CreateBucket(bp, bck, props, true /*dontHeadRemote*/)
+	tassert.CheckFatal(t, err)
+
+	_, err = api.GetObject(bp, bck, "obj", nil)
+	tassert.Fatalf(t, err != nil && strings.Contains(err.Error(), blocked), "expected %q, got %v", blocked, err)
+
+	tassert.Errorf(t, hits.Load() == 0, "endpoint %s received %d request(s)", endpoint.URL, hits.Load())
+}
+
 func TestCreateDestroyRemoteAISBucket(t *testing.T) {
 	t.Run("withObjects", func(t *testing.T) { testCreateDestroyRemoteAISBucket(t, true) })
 	t.Run("withoutObjects", func(t *testing.T) { testCreateDestroyRemoteAISBucket(t, false) })
@@ -563,21 +607,41 @@ func TestResetBucketProps(t *testing.T) {
 	if !p.Equal(defaultProps) {
 		t.Errorf("props have not been reset properly: expected: %+v, got: %+v", defaultProps, p)
 	}
+
+	// Resetting these two independent updates would require both re-EC and rechunk.
+	_, err = api.SetBucketProps(bp, bck, &cmn.BpropsToSet{EC: &cmn.ECConfToSet{Enabled: apc.Ptr(false)}})
+	tassert.CheckFatal(t, err)
+	chunkSize := cos.SizeIEC(cmn.ChunkSizeMin)
+	if chunkSize == defaultProps.Chunks.ChunkSize {
+		chunkSize *= 2
+	}
+	err = setBucketChunksAndWait(bp, bck, &cmn.ChunksConfToSet{ChunkSize: &chunkSize})
+	tassert.CheckFatal(t, err)
+
+	beforeReset, err := api.HeadBucket(bp, bck, true /* don't add */)
+	tassert.CheckFatal(t, err)
+	_, err = api.ResetBucketProps(bp, bck)
+	tassert.Fatalf(t, api.HTTPStatus(err) == http.StatusBadRequest, "expected HTTP 400, got %v", err)
+	afterReset, err := api.HeadBucket(bp, bck, true /* don't add */)
+	tassert.CheckFatal(t, err)
+	tassert.Fatalf(t, afterReset.Equal(beforeReset), "bucket properties changed after rejected reset")
 }
 
 func TestSetInvalidBucketProps(t *testing.T) {
 	var (
-		proxyURL = tools.RandomProxyURL(t)
-		bp       = tools.BaseAPIParams(proxyURL)
-		bck      = cmn.Bck{
+		proxyURL          = tools.RandomProxyURL(t)
+		bp                = tools.BaseAPIParams(proxyURL)
+		conflictChunkSize = cos.SizeIEC(cmn.ChunkSizeMin)
+		bck               = cmn.Bck{
 			Name:     testBucketName,
 			Provider: apc.AIS,
 			Ns:       genBucketNs(),
 		}
 
 		tests = []struct {
-			name  string
-			props *cmn.BpropsToSet
+			name           string
+			props          *cmn.BpropsToSet
+			wantBadRequest bool
 		}{
 			{
 				name: "humongous number of copies",
@@ -621,11 +685,33 @@ func TestSetInvalidBucketProps(t *testing.T) {
 					EC:     &cmn.ECConfToSet{Enabled: apc.Ptr(true)},
 					Mirror: &cmn.MirrorConfToSet{Enabled: apc.Ptr(true)},
 				},
+				wantBadRequest: true,
+			},
+			{
+				name: "enable ec and change chunk layout",
+				props: &cmn.BpropsToSet{
+					EC:     &cmn.ECConfToSet{Enabled: apc.Ptr(true)},
+					Chunks: &cmn.ChunksConfToSet{ChunkSize: &conflictChunkSize},
+				},
+				wantBadRequest: true,
+			},
+			{
+				name: "enable mirroring and change chunk layout",
+				props: &cmn.BpropsToSet{
+					Mirror: &cmn.MirrorConfToSet{Enabled: apc.Ptr(true)},
+					Chunks: &cmn.ChunksConfToSet{ChunkSize: &conflictChunkSize},
+				},
+				wantBadRequest: true,
 			},
 		}
 	)
 
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
+	origProps, err := api.HeadBucket(bp, bck, true /* don't add */)
+	tassert.CheckFatal(t, err)
+	if origProps.Chunks.ChunkSize == conflictChunkSize {
+		conflictChunkSize *= 2 // make it different from the default chunk size
+	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -633,6 +719,12 @@ func TestSetInvalidBucketProps(t *testing.T) {
 			if err == nil {
 				t.Error("expected error when setting bad input")
 			}
+			if test.wantBadRequest {
+				tassert.Fatalf(t, api.HTTPStatus(err) == http.StatusBadRequest, "expected HTTP 400, got %v", err)
+			}
+			props, err := api.HeadBucket(bp, bck, true /* don't add */)
+			tassert.CheckFatal(t, err)
+			tassert.Fatalf(t, props.Equal(origProps), "bucket properties changed after rejected request")
 		})
 	}
 }
@@ -1588,6 +1680,7 @@ func TestCopyBucket(t *testing.T) {
 			tools.CheckSkip(t, &tools.SkipTestArgs{Long: test.onlyLong})
 			var (
 				srcBckList *cmn.LsoRes
+				dstCksum   string
 				suffix     = cos.GenTie()
 
 				objCnt = 100
@@ -1631,9 +1724,13 @@ func TestCopyBucket(t *testing.T) {
 			bckTest := cmn.Bck{Provider: apc.AIS, Ns: cmn.NsGlobal}
 			if test.srcRemote {
 				srcm.bck = cliBck
+				srcm.prefix = "copy-bucket/" + suffix + "/"
 				srcm.deleteRemoteBckObjs = true
 				bckTest.Provider = cliBck.Provider
 				tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: srcm.bck})
+			}
+			if test.dstRemote {
+				srcm.prefix = "copy-bucket/" + suffix + "/"
 			}
 			if test.dstRemote {
 				dstms = []*ioContext{
@@ -1641,6 +1738,8 @@ func TestCopyBucket(t *testing.T) {
 						t:   t,
 						num: 0, // Make sure to not put anything new to destination remote bucket
 						bck: cliBck,
+						// Keep shared cloud bucket cleanup and verification scoped to this test.
+						prefix: srcm.prefix,
 					},
 				}
 				tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: dstms[0].bck})
@@ -1676,6 +1775,18 @@ func TestCopyBucket(t *testing.T) {
 
 			srcProps, err := api.HeadBucket(bp, srcm.bck, true /* don't add */)
 			tassert.CheckFatal(t, err)
+			if test.dstBckExist && !test.dstRemote {
+				dstCksum = cos.ChecksumMD5
+				if dstCksum == srcProps.Cksum.Type {
+					dstCksum = cos.ChecksumSHA256
+				}
+				for _, dstm := range dstms {
+					_, err := api.SetBucketProps(bp, dstm.bck, &cmn.BpropsToSet{
+						Cksum: &cmn.CksumConfToSet{Type: apc.Ptr(dstCksum)},
+					})
+					tassert.CheckFatal(t, err)
+				}
+			}
 
 			if test.dstBckHasObjects {
 				for _, dstm := range dstms {
@@ -1690,11 +1801,11 @@ func TestCopyBucket(t *testing.T) {
 			case bckTest.IsAIS():
 				srcm.puts()
 
-				srcBckList, err = api.ListObjects(bp, srcm.bck, nil, api.ListArgs{})
+				srcBckList, err = api.ListObjects(bp, srcm.bck, &apc.LsoMsg{Prefix: srcm.prefix}, api.ListArgs{})
 				tassert.CheckFatal(t, err)
 			case bckTest.IsRemote():
 				srcm.remotePuts(false /*evict*/)
-				srcBckList, err = api.ListObjects(bp, srcm.bck, nil, api.ListArgs{})
+				srcBckList, err = api.ListObjects(bp, srcm.bck, &apc.LsoMsg{Prefix: srcm.prefix}, api.ListArgs{})
 				tassert.CheckFatal(t, err)
 				if test.evictRemoteSrc {
 					tlog.Logfln("evicting %s", srcm.bck.String())
@@ -1716,7 +1827,7 @@ func TestCopyBucket(t *testing.T) {
 					uuid string
 					err  error
 					cmsg = &apc.TCBMsg{
-						CopyBckMsg: apc.CopyBckMsg{Force: true},
+						CopyBckMsg: apc.CopyBckMsg{Force: true, Prefix: srcm.prefix},
 						NumWorkers: test.numWorkers,
 					}
 				)
@@ -1772,10 +1883,9 @@ func TestCopyBucket(t *testing.T) {
 				srcProps.Provider = ""
 				dstProps.Provider = ""
 
-				// If bucket existed before, ensure that the bucket props were **not** copied over.
-				if test.dstBckExist && srcProps.Equal(dstProps) {
-					t.Fatalf("source and destination bucket props match, even though they should not:\n%#v\n%#v",
-						srcProps, dstProps)
+				// If the bucket existed before, ensure its checksum property was not overwritten.
+				if test.dstBckExist && dstProps.Cksum.Type != dstCksum {
+					t.Fatalf("destination checksum changed: expected %q, got %q", dstCksum, dstProps.Cksum.Type)
 				}
 
 				// When copying remote => ais we create the destination ais bucket on the fly
@@ -1802,7 +1912,7 @@ func TestCopyBucket(t *testing.T) {
 				dstmProps, err := api.HeadBucket(bp, dstm.bck, true /* don't add */)
 				tassert.CheckFatal(t, err)
 
-				msg := &apc.LsoMsg{}
+				msg := &apc.LsoMsg{Prefix: dstm.prefix}
 				msg.AddProps(apc.GetPropsVersion)
 				if test.dstRemote {
 					msg.Flags = apc.LsCached
@@ -2001,7 +2111,7 @@ func TestCopyBucketChecksumValidation(t *testing.T) {
 			// Validate each object's checksum in destination bucket
 			tlog.Logfln("validating checksums of %d objects in destination bucket", objCnt)
 			for objName, expectedCksum := range expectedCksums {
-				objProps, err := api.HeadObject(bp, dstBck, objName, api.HeadArgs{FltPresence: apc.FltPresent})
+				objProps, err := api.HeadObjectV2(bp, dstBck, objName, apc.GetPropsChecksum, api.HeadArgs{FltPresence: apc.FltPresent})
 				tassert.CheckFatal(t, err)
 
 				actualCksum := objProps.ObjAttrs.Checksum()

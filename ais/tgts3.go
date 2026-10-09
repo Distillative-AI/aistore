@@ -147,18 +147,18 @@ func (t *target) copyObjS3(w http.ResponseWriter, r *http.Request, items []strin
 	}
 
 	src = strings.Trim(src, "/") // in AWS examples the path starts with "/"
-	parts := strings.SplitN(src, "/", 2)
-	if len(parts) < 2 {
+	srcBck, srcObj, found := strings.Cut(src, "/")
+	if !found {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: errS3Obj})
 		return
 	}
 	// src
-	bckSrc, ecode, err := meta.InitByNameOnly(parts[0], t.owner.bmd)
+	bckSrc, ecode, err := meta.InitByNameOnly(srcBck, t.owner.bmd)
 	if err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: ecode})
 		return
 	}
-	objSrc := strings.Trim(parts[1], "/")
+	objSrc := strings.Trim(srcObj, "/")
 	if err := cos.ValidateOname(objSrc); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
 		return
@@ -299,7 +299,7 @@ func (t *target) getObjS3(w http.ResponseWriter, r *http.Request, items []string
 		if cmn.Rom.V(5, cos.ModS3) {
 			nlog.Infoln("listUploadsMpt", bck.String(), dpq.m)
 		}
-		t.listUploadsMptS3(w, bck, dpq)
+		t.listUploadsMptS3(w, r, bck, dpq)
 		return
 	}
 	if len(items) < 2 {

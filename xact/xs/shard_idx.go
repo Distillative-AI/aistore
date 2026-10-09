@@ -6,6 +6,7 @@
 package xs
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
@@ -47,6 +49,7 @@ type (
 			indexed    atomic.Int64 // newly indexed shards
 			stale      atomic.Int64 // stale indexes successfully rebuilt
 			corrupt    atomic.Int64 // corrupt indexes successfully rebuilt
+			cached     atomic.Int64 // indexes loaded or reused in memory
 		}
 		lastLog atomic.Int64 // last log timestamp (sparse)
 	}
@@ -154,6 +157,12 @@ func (r *xactShardIndex) do(lom *core.LOM, _ []byte) error {
 		r.stats.corrupt.Inc()
 	}
 	r.ObjsAdd(1, idx.SrcSize()) // the amount of data indexed
+	if r.msg.Cache {
+		// cache the saved index via the archive-read path
+		if err := r.cacheSavedIdx(lom); err != nil {
+			r.addIndexErr(err, core.ShardIndexLoadFailed)
+		}
+	}
 
 	if now := mono.NanoTime(); time.Duration(now-r.lastLog.Load()) > idxLogInterval {
 		r.lastLog.Store(now)
@@ -164,6 +173,9 @@ func (r *xactShardIndex) do(lom *core.LOM, _ []byte) error {
 
 // Load and build under source(R); release before returning.
 // Caller frees the index and reports errors.
+// - no index: build it
+// - existing index: verify unless SkipVerify, cache if requested (see checkIdx)
+// - stale or corrupt: rebuild
 func (r *xactShardIndex) buildIdx(lom *core.LOM) (*archive.ShardIndex, core.ShardIndexStatus, error) {
 	if err := r.Context().Err(); err != nil {
 		return nil, core.ShardIndexNone, err
@@ -185,8 +197,88 @@ func (r *xactShardIndex) buildIdx(lom *core.LOM) (*archive.ShardIndex, core.Shar
 		return nil, core.ShardIndexNone, nil
 	}
 
+	status := core.ShardIndexNew
+	if lom.HasShardIdx() {
+		var err error
+		status, err = r.checkIdx(lom)
+		switch status {
+		case core.ShardIndexExisting, core.ShardIndexLoadFailed:
+			return nil, status, err
+		}
+		// New (index object gone), Stale, Corrupt: (re)build
+	}
+
 	// TAR scan is not interruptible; check cancellation again before saving.
-	return lom.BuildShardIndex(r.msg.SkipVerify)
+	idx, err := lom.ScanShardIndex()
+	return idx, status, err
+}
+
+// existing index: verify unless SkipVerify; cache if requested
+// - caching (i.e., loading) verifies it (decoding, staleness), and
+// - invalid index is rebuilt regardless of SkipVerify
+func (r *xactShardIndex) checkIdx(lom *core.LOM) (core.ShardIndexStatus, error) {
+	if r.msg.Cache {
+		idx, err := lom.LoadCachedShardIndex() // shared - do not Free
+		if idx != nil {
+			r.stats.cached.Inc()
+			return core.ShardIndexExisting, nil
+		}
+		if !errors.Is(err, core.ErrShardIdxNotCached) {
+			return idxLoadStatus(err)
+		}
+	}
+	if r.msg.SkipVerify {
+		return core.ShardIndexExisting, nil
+	}
+	idx, err := lom.LoadShardIndex()
+	if idx != nil {
+		idx.Free()
+		return core.ShardIndexExisting, nil
+	}
+	return idxLoadStatus(err)
+}
+
+// failed or empty load => status
+func idxLoadStatus(err error) (core.ShardIndexStatus, error) {
+	switch {
+	case err == nil:
+		return core.ShardIndexNew, nil // index object gone
+	case errors.Is(err, archive.ErrShardIdxStale):
+		return core.ShardIndexStale, nil
+	case errors.Is(err, archive.ErrShardIdxCorrupt):
+		return core.ShardIndexCorrupt, nil
+	default:
+		return core.ShardIndexLoadFailed, err
+	}
+}
+
+// best effort: load just-saved index in memory
+func (r *xactShardIndex) cacheSavedIdx(lom *core.LOM) error {
+	lom.Lock(false)
+	defer lom.Unlock(false)
+	if r.Context().Err() != nil {
+		return nil
+	}
+	if err := lom.Load(false /*cache*/, true /*locked*/); err != nil {
+		if cos.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if lom.IsCopy() {
+		return nil
+	}
+	idx, err := lom.LoadCachedShardIndex()
+	switch {
+	case idx != nil:
+		debug.AssertNoErr(err)
+		r.stats.cached.Inc()
+		return nil
+	case errors.Is(err, core.ErrShardIdxNotCached), errors.Is(err, archive.ErrShardIdxStale):
+		return nil // gone, not admitted, changed
+	default:
+		return err // return nil or error
+	}
 }
 
 func (r *xactShardIndex) addIndexErr(err error, status core.ShardIndexStatus) {
@@ -234,6 +326,9 @@ func (r *xactShardIndex) CtlMsg() string {
 	if r.msg.SkipVerify {
 		idxAppend(&sb, "skip-verify", "true")
 	}
+	if r.msg.Cache {
+		idxAppend(&sb, "cache", "true")
+	}
 	if n := r.stats.skipNonTar.Load(); n > 0 {
 		idxAppend(&sb, "skip-nontar", strconv.FormatInt(n, 10))
 	}
@@ -248,6 +343,9 @@ func (r *xactShardIndex) CtlMsg() string {
 	}
 	if n := r.stats.corrupt.Load(); n > 0 {
 		idxAppend(&sb, "re-corrupt", strconv.FormatInt(n, 10))
+	}
+	if n := r.stats.cached.Load(); n > 0 {
+		idxAppend(&sb, "cached", strconv.FormatInt(n, 10))
 	}
 	if n := r.stats.skipBusy.Load(); n > 0 {
 		idxAppend(&sb, "skip-busy", strconv.FormatInt(n, 10))

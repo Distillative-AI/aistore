@@ -5,6 +5,7 @@
 package backend
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/NVIDIA/aistore/api"
@@ -13,7 +14,8 @@ import (
 	"github.com/NVIDIA/aistore/core"
 )
 
-func (m *AISbp) StartMpt(lom *core.LOM, _ *http.Request) (id string, ecode int, err error) {
+func (m *AISbp) StartMpt(ctx context.Context, lom *core.LOM, _ *http.Request) (id string, ecode int, err error) {
+	ctx = mptContext(ctx)
 	var (
 		remAis    *remAis
 		remoteBck = lom.Bck().Clone()
@@ -23,7 +25,12 @@ func (m *AISbp) StartMpt(lom *core.LOM, _ *http.Request) (id string, ecode int, 
 	}
 	unsetUUID(&remoteBck)
 
-	uploadID, err := api.CreateMultipartUpload(remAis.bpL, remoteBck, lom.ObjName)
+	uploadID, err := api.CreateMultipartUpload(&api.MptArgs{
+		Context:    ctx,
+		BaseParams: remAis.bpL,
+		Bck:        remoteBck,
+		ObjName:    lom.ObjName,
+	})
 	if err != nil {
 		return "", http.StatusInternalServerError, err
 	}
@@ -31,7 +38,8 @@ func (m *AISbp) StartMpt(lom *core.LOM, _ *http.Request) (id string, ecode int, 
 	return uploadID, http.StatusOK, err
 }
 
-func (m *AISbp) PutMptPart(lom *core.LOM, r cos.ReadOpenCloser, _ *http.Request, uploadID string, size int64, partNum int32) (string, int, error) {
+func (m *AISbp) PutMptPart(ctx context.Context, lom *core.LOM, r cos.ReadOpenCloser, _ *http.Request, uploadID string, size int64, partNum int32) (string, int, error) {
+	ctx = mptContext(ctx)
 	var (
 		remAis    *remAis
 		remoteBck = lom.Bck().Clone()
@@ -46,6 +54,7 @@ func (m *AISbp) PutMptPart(lom *core.LOM, r cos.ReadOpenCloser, _ *http.Request,
 
 	err = api.UploadPart(&api.PutPartArgs{
 		PutArgs: api.PutArgs{
+			Context:    ctx,
 			BaseParams: remAis.bpL,
 			Bck:        remoteBck,
 			ObjName:    lom.ObjName,
@@ -59,10 +68,13 @@ func (m *AISbp) PutMptPart(lom *core.LOM, r cos.ReadOpenCloser, _ *http.Request,
 		return "", http.StatusInternalServerError, err
 	}
 
-	return uploadID, http.StatusOK, nil
+	// The remote AIS native UploadPart API exposes no part ETag;
+	// leave it empty so the caller can generate the S3 ETag.
+	return "", http.StatusOK, nil
 }
 
-func (m *AISbp) CompleteMpt(lom *core.LOM, _ *http.Request, uploadID string, _ []byte, parts apc.MptCompletedParts) (version, etag string, _ int, _ error) {
+func (m *AISbp) CompleteMpt(ctx context.Context, lom *core.LOM, _ *http.Request, uploadID string, _ []byte, parts apc.MptCompletedParts) (version, etag string, _ int, _ error) {
+	ctx = mptContext(ctx)
 	var (
 		remAis    *remAis
 		remoteBck = lom.Bck().Clone()
@@ -78,7 +90,16 @@ func (m *AISbp) CompleteMpt(lom *core.LOM, _ *http.Request, uploadID string, _ [
 		pns[i] = part.PartNumber
 	}
 
-	err = api.CompleteMultipartUpload(remAis.bpL, remoteBck, lom.ObjName, uploadID, pns)
+	err = api.CompleteMultipartUpload(&api.CompleteMptArgs{
+		MptArgs: api.MptArgs{
+			Context:    ctx,
+			BaseParams: remAis.bpL,
+			Bck:        remoteBck,
+			ObjName:    lom.ObjName,
+		},
+		UploadID:    uploadID,
+		PartNumbers: pns,
+	})
 	if err != nil {
 		return "", "", http.StatusInternalServerError, err
 	}
@@ -86,7 +107,8 @@ func (m *AISbp) CompleteMpt(lom *core.LOM, _ *http.Request, uploadID string, _ [
 	return "", "", http.StatusOK, nil
 }
 
-func (m *AISbp) AbortMpt(lom *core.LOM, _ *http.Request, uploadID string) (ecode int, err error) {
+func (m *AISbp) AbortMpt(ctx context.Context, lom *core.LOM, _ *http.Request, uploadID string) (ecode int, err error) {
+	ctx = mptContext(ctx)
 	var (
 		remAis    *remAis
 		remoteBck = lom.Bck().Clone()
@@ -96,7 +118,14 @@ func (m *AISbp) AbortMpt(lom *core.LOM, _ *http.Request, uploadID string) (ecode
 	}
 	unsetUUID(&remoteBck)
 
-	err = api.AbortMultipartUpload(remAis.bpL, remoteBck, lom.ObjName, uploadID)
+	err = api.AbortMultipartUpload(&api.AbortMptArgs{
+		MptArgs: api.MptArgs{
+			Context:    ctx,
+			BaseParams: remAis.bpL,
+			Bck:        remoteBck,
+			ObjName:    lom.ObjName},
+		UploadID: uploadID,
+	})
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}

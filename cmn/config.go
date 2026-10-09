@@ -1444,11 +1444,10 @@ func (ctu *ConfigToSet) Merge(update *ConfigToSet) {
 func (ctu *ConfigToSet) FillFromKVS(kvs []string) (err error) {
 	const format = "failed to parse `-config_custom` flag (invalid entry: %q)"
 	for _, kv := range kvs {
-		entry := strings.SplitN(kv, "=", 2)
-		if len(entry) != 2 {
+		name, value, found := strings.Cut(kv, "=")
+		if !found {
 			return fmt.Errorf(format, kv)
 		}
-		name, value := entry[0], entry[1]
 		if err := UpdateFieldValue(ctu, _fromLegacyConfName(name), value); err != nil {
 			return fmt.Errorf(format, kv)
 		}
@@ -2125,7 +2124,8 @@ func (c *ChunksConf) Validate() error {
 	case c.MaxMonolithicSize == 0:
 		c.MaxMonolithicSize = MaxMonolithicSize
 	default:
-		if c.MaxMonolithicSize < minMaxMonolithicSize || c.MaxMonolithicSize > MaxMonolithicSize {
+		if (c.MaxMonolithicSize < minMaxMonolithicSize && !Rom.TestingEnv()) ||
+			c.MaxMonolithicSize > MaxMonolithicSize {
 			return fmt.Errorf("invalid %s: %d (%s) - must be in range [%s, %s]",
 				chunksmms, c.MaxMonolithicSize, c.MaxMonolithicSize,
 				cos.IEC(minMaxMonolithicSize, 0), cos.IEC(MaxMonolithicSize, 0))
@@ -3308,6 +3308,27 @@ const (
 
 	// and a few more hardcoded below
 )
+
+// GET deadlines - minimum transfer rate, data path in both directions:
+// - write deadline: clients that stop (or nearly stop) reading (ais/tgtobj.go)
+// - read deadline: remote backends that stop (or nearly stop) sending (ais/backend/rdl.go)
+//
+// terminology (same as docs/configuration.md, "Minimum transfer rate"):
+// - window: timeout.send_file_time - time allowed to transfer the next renewal size
+// - renewal size: XferRenewSize(window) bytes - each one transferred renews the deadline for another window
+// - minimum transfer rate: renewal size / window = XferMinRate, until clamped
+//
+// e.g.: 1m => 3.75MiB (config-validated minimum, see TimeoutConf.Validate); 5m => 18.75MiB;
+// >= ~17m => 64MiB (max; the minimum transfer rate then decreases: 64MiB/window)
+const (
+	XferMinRate  = 64 * cos.KiB // bytes per second
+	XferMinRenew = cos.MiB      // (takes effect only below 16s - i.e., in tests)
+	XferMaxRenew = 64 * cos.MiB
+)
+
+func XferRenewSize(window time.Duration) int64 {
+	return cos.ClampI64(int64(window/time.Second)*XferMinRate, XferMinRenew, XferMaxRenew)
+}
 
 func (c *TimeoutConf) Validate() error {
 	debug.Assert(SharedStreamsDflt >= 2*hk.Prune2mIval)

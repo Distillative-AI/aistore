@@ -8,22 +8,61 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 
 ### Fixed
 
+- `Object.get_url()` builds its ETL query parameters the way the rest of the SDK does.
+  It wrote `etl_name` straight from `ETLConfig.name`, so a pipeline built with
+  `etl_a >> etl_b` went into the URL as the `repr()` of an `Etl` object and
+  `etl_pipeline` was dropped, and dict `args` were written as a Python repr instead
+  of JSON. `Bucket.list_urls()` and `ObjectGroup.list_urls()` are the callers.
+- A bucket qualified by a namespace is recognized in an AIS error message. The FQN
+  pattern stopped at the first slash, so `ais://@uuid#ns/bucket` and
+  `ais://@remote123/bucket` parsed as the bucket `@uuid#ns` or `@remote123` with an
+  object after it, and a 404 or 409 about such a bucket came back as `ErrObjNotFound`
+  or a plain `AISError`.
+- `Bucket.delete(missing_ok=True)` also ignores `ErrRemoteBckNotFound`, which is what
+  a bucket in a remote cluster's namespace reports and is not a subclass of
+  `ErrBckNotFound`. Together with the above, `create(exist_ok=True)` and
+  `delete(missing_ok=True)` work for buckets outside the global namespace.
+- `ObjectGroup.list_urls()` honors its `prefix` argument. It accepted and documented
+  one and then yielded a URL for every object in the group, while
+  `ObjectGroup.list_all_objects_iter()` next to it filtered correctly.
+- `Object.get_reader()` refuses `num_workers` together with `archive_config`, as it
+  already does for `etl`. A parallel read issues raw byte ranges, and the target
+  rejects a range read of archived content, so the combination failed one worker
+  request at a time instead of being refused before the download started.
 - Object file readers and writers report their actual open or closed state
   through `.closed`. Writer state remains open if its final flush fails.
 - Entering a closed object file writer raises `ValueError` before sending a request.
+- Entering a write-mode object file writer context no longer truncates the object
+  again, which erased data the same writer had already flushed. Write mode
+  truncates only when the writer is created.
 - `ObjectIterator` no longer raises `IndexError` when a remote listing returns a page with no
   entries and a continuation token, which happens when a filter such as `NOT_CACHED` excludes
   every entry on that page. The iterator now continues to the next page, matching
   `Bucket.list_all_objects()`.
+- `ParallelBuffer.close()` no longer raises `BufferError` and leaks the shared memory
+  segment when the caller still holds a view of the zero-copy buffer, such as a slice
+  or a `numpy.frombuffer` array. The segment is unlinked first, and the mapping is
+  dropped with the last view. Shared-memory finalization also closes the file
+  descriptor when a live view prevents immediate cleanup, so the allocation is
+  released after the last view without a second `close()` call.
+- `ErrGETConflict` and `ErrObjNotFound` are retried by `RetryConfig.network_retry` again.
 
 ### Changed
 
+- `ObjectReader.as_file(max_resume=...)` now limits consecutive interruptions without forward
+  progress instead of counting all interruptions over a file's lifetime.
 - Reduced per-chunk bookkeeping in `ResumableStream` and avoided list/join
   overhead for `ObjectFileReader` reads satisfied by one chunk, reusing whole
   immutable byte buffers without copying.
 - `ObjectFileWriter` uses `io.BufferedIOBase` so inherited file methods work
   correctly. Update explicit `BufferedWriter` type checks to `BufferedIOBase`.
   Unclosed writers emit `ResourceWarning` without sending requests.
+
+### Removed
+
+- Removed `DynamicBatchSampler.__len__()` since PyTorch expects length
+  to mirror the number of batches. Use `DynamicBatchSampler.num_samples()`
+  to get the number of samples instead.
 
 ## [2.0.0] - 2026-09-28
 

@@ -6,6 +6,9 @@ package integration_test
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -321,9 +324,9 @@ func TestCopyObject(t *testing.T) {
 
 	// HEAD both source and destination to ensure existence
 	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
-	_, err = api.HeadObject(baseParams, bckFrom, objFrom, hargs)
+	_, err = api.HeadObjectV2(baseParams, bckFrom, objFrom, apc.GetPropsName, hargs)
 	tassert.CheckFatal(t, err)
-	_, err = api.HeadObject(baseParams, bckTo, objTo, hargs)
+	_, err = api.HeadObjectV2(baseParams, bckTo, objTo, apc.GetPropsName, hargs)
 	tassert.CheckFatal(t, err)
 
 	// Attempt to copy to a nonexistent bucket
@@ -345,11 +348,11 @@ func TestCopyObject(t *testing.T) {
 }
 
 func TestCopyObjectChunksAboveMaxMonolithicSize(t *testing.T) {
-	t.Skip("TODO: use a reduced test threshold instead of provisioning a 1GiB object")
 	const (
-		objSize   = int64(cos.GiB + 1)
-		chunkSize = int64(128 * cos.MiB)
-		srcName   = "legacy"
+		maxMonoSize = int64(64 * cos.MiB)
+		objSize     = maxMonoSize + 1
+		chunkSize   = int64(16 * cos.MiB)
+		srcName     = "legacy"
 	)
 	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, MinTargets: 2})
 
@@ -361,23 +364,23 @@ func TestCopyObjectChunksAboveMaxMonolithicSize(t *testing.T) {
 	orig, err := api.HeadBucket(bp, bck, true /*dontAddRemote*/)
 	tassert.CheckFatal(t, err)
 	t.Cleanup(func() {
-		_, err := api.SetBucketProps(bp, bck, &cmn.BpropsToSet{Chunks: &cmn.ChunksConfToSet{
+		err := setBucketChunksAndWait(bp, bck, &cmn.ChunksConfToSet{
 			ObjSizeLimit:      apc.Ptr(orig.Chunks.ObjSizeLimit),
 			MaxMonolithicSize: apc.Ptr(orig.Chunks.MaxMonolithicSize),
 			ChunkSize:         apc.Ptr(orig.Chunks.ChunkSize),
-		}})
+		})
 		tassert.CheckError(t, err)
 	})
 
 	// Disable auto-chunking and set the hard limit above objSize, so the initial PUT is monolithic.
-	_, err = api.SetBucketProps(bp, bck, &cmn.BpropsToSet{Chunks: &cmn.ChunksConfToSet{
+	err = setBucketChunksAndWait(bp, bck, &cmn.ChunksConfToSet{
 		ObjSizeLimit:      apc.Ptr(cos.SizeIEC(0)),
-		MaxMonolithicSize: apc.Ptr(cos.SizeIEC(2 * cos.GiB)),
+		MaxMonolithicSize: apc.Ptr(cos.SizeIEC(2 * maxMonoSize)),
 		ChunkSize:         apc.Ptr(cos.SizeIEC(chunkSize)),
-	}})
+	})
 	tassert.CheckFatal(t, err)
 
-	// PUT a 1GiB+1 object and confirm its initial monolithic layout.
+	// PUT an object above the final hard limit and confirm its initial monolithic layout.
 	r, err := readers.New(&readers.Arg{Type: readers.Rand, Size: objSize, CksumType: cos.ChecksumOneXxh})
 	tassert.CheckFatal(t, err)
 	defer r.Close()
@@ -390,15 +393,15 @@ func TestCopyObjectChunksAboveMaxMonolithicSize(t *testing.T) {
 	tassert.Fatalf(t, src.Chunks != nil && src.Chunks.ChunkCount == 0,
 		"expected monolithic source, got %+v", src.Chunks)
 
-	// Lowering the hard limit changes policy for future writes; it does not rewrite existing objects.
-	_, err = api.SetBucketProps(bp, bck, &cmn.BpropsToSet{Chunks: &cmn.ChunksConfToSet{
-		MaxMonolithicSize: apc.Ptr(cos.SizeIEC(cos.GiB)),
-	}})
+	// Lowering the hard limit automatically rechunks the existing source.
+	err = setBucketChunksAndWait(bp, bck, &cmn.ChunksConfToSet{
+		MaxMonolithicSize: apc.Ptr(cos.SizeIEC(maxMonoSize)),
+	})
 	tassert.CheckFatal(t, err)
 	src, err = api.HeadObjectV2(bp, bck, srcName, props, api.HeadArgs{})
 	tassert.CheckFatal(t, err)
-	tassert.Fatalf(t, src.Chunks != nil && src.Chunks.ChunkCount == 0,
-		"expected existing source to remain monolithic, got %+v", src.Chunks)
+	tassert.Fatalf(t, src.Chunks != nil && src.Chunks.ChunkCount > 0,
+		"expected existing source to be rechunked, got %+v", src.Chunks)
 
 	// Exercise both copy paths by selecting destination names whose HRW target is known.
 	smap := tools.GetClusterMap(t, proxyURL)
@@ -415,7 +418,7 @@ func TestCopyObjectChunksAboveMaxMonolithicSize(t *testing.T) {
 			}
 			dstName := tools.GenerateObjectNameForTarget(srcName, test.name+"-copied", bck, smap, test.sameTarget)
 
-			// COPY is a new write and must apply the current 1GiB hard limit and configured chunk size.
+			// COPY is a new write and must apply the current hard limit and configured chunk size.
 			copyObjectAndCheckChunks(t, bp, bck, srcName, bck, dstName, objSize, chunkSize)
 
 			srcLock, err := api.CheckObjectLock(bp, bck, srcName)
@@ -460,10 +463,8 @@ func TestCopyObjectAutoChunks(t *testing.T) {
 func copyObjectsAndCheckPolicy(t *testing.T, m *ioContext, sizeLimit, chunkSize int64, chunked bool) {
 	t.Helper()
 	bp := tools.BaseAPIParams(m.proxyURL)
-	_, err := api.SetBucketProps(bp, m.bck, &cmn.BpropsToSet{
-		Chunks: &cmn.ChunksConfToSet{
-			ObjSizeLimit: apc.Ptr(cos.SizeIEC(sizeLimit)),
-		},
+	err := setBucketChunksAndWait(bp, m.bck, &cmn.ChunksConfToSet{
+		ObjSizeLimit: apc.Ptr(cos.SizeIEC(sizeLimit)),
 	})
 	tassert.CheckFatal(t, err)
 
@@ -480,7 +481,11 @@ func copyObjectsAndCheckPolicy(t *testing.T, m *ioContext, sizeLimit, chunkSize 
 			if err != nil {
 				return fmt.Errorf("head source %s: %w", m.bck.Cname(srcName), err)
 			}
-			if src.Chunks == nil || src.Chunks.ChunkCount != 0 {
+			wantCount := int(cos.DivCeil(src.Size, chunkSize))
+			if chunked && (src.Chunks == nil || src.Chunks.ChunkCount != wantCount || src.Chunks.MaxChunkSize != chunkSize) {
+				return fmt.Errorf("expected chunked source %s, got %+v", m.bck.Cname(srcName), src.Chunks)
+			}
+			if !chunked && (src.Chunks == nil || src.Chunks.ChunkCount != 0) {
 				return fmt.Errorf("expected monolithic source %s, got %+v", m.bck.Cname(srcName), src.Chunks)
 			}
 			if err := api.CopyObject(bp, &api.CopyArgs{
@@ -501,7 +506,6 @@ func copyObjectsAndCheckPolicy(t *testing.T, m *ioContext, sizeLimit, chunkSize 
 				}
 				return sameObjectContent(bp, m.bck, srcName, dstName)
 			}
-			wantCount := int(cos.DivCeil(src.Size, chunkSize))
 			if dst.Chunks == nil || dst.Chunks.ChunkCount != wantCount || dst.Chunks.MaxChunkSize != chunkSize {
 				return fmt.Errorf("%s: expected size %d and %d chunks of up to %s, got %+v",
 					m.bck.Cname(dstName), src.Size, wantCount, cos.ToSizeIEC(chunkSize, 0), dst)
@@ -663,9 +667,9 @@ func TestSameBucketName(t *testing.T) {
 
 	// Check that ais bucket has 2 objects
 	tlog.Logfln("Validating that ais bucket contains %s and %s ...", fileName1, fileName2)
-	_, err = api.HeadObject(baseParams, bckLocal, fileName1, hargs)
+	_, err = api.HeadObjectV2(baseParams, bckLocal, fileName1, apc.GetPropsName, hargs)
 	tassert.CheckFatal(t, err)
-	_, err = api.HeadObject(baseParams, bckLocal, fileName2, hargs)
+	_, err = api.HeadObjectV2(baseParams, bckLocal, fileName2, apc.GetPropsName, hargs)
 	tassert.CheckFatal(t, err)
 
 	// Prefetch/Evict should work
@@ -701,14 +705,14 @@ func TestSameBucketName(t *testing.T) {
 	err = api.WaitForXaction(baseParams, &args)
 	tassert.CheckFatal(t, err)
 
-	_, err = api.HeadObject(baseParams, bckLocal, fileName1, hargs)
+	_, err = api.HeadObjectV2(baseParams, bckLocal, fileName1, apc.GetPropsName, hargs)
 	if err == nil {
 		t.Errorf("Object %s not deleted", fileName1)
 	} else if !isErrNotFound(err) {
 		t.Errorf("HEAD(deleted-object %q) returns a wrong error type: %v (%T)", fileName1, err, err)
 	}
 
-	_, err = api.HeadObject(baseParams, bckLocal, fileName2, hargs)
+	_, err = api.HeadObjectV2(baseParams, bckLocal, fileName2, apc.GetPropsName, hargs)
 	if err == nil {
 		t.Errorf("Object %s not deleted", fileName2)
 	} else if status := api.HTTPStatus(err); status != http.StatusNotFound {
@@ -716,11 +720,11 @@ func TestSameBucketName(t *testing.T) {
 	}
 
 	hargsRemote := api.HeadArgs{FltPresence: apc.FltExists}
-	_, err = api.HeadObject(baseParams, bckRemote, fileName1, hargsRemote)
+	_, err = api.HeadObjectV2(baseParams, bckRemote, fileName1, apc.GetPropsName, hargsRemote)
 	if err == nil {
 		t.Errorf("remote file %s not deleted", fileName1)
 	}
-	_, err = api.HeadObject(baseParams, bckRemote, fileName2, hargsRemote)
+	_, err = api.HeadObjectV2(baseParams, bckRemote, fileName2, apc.GetPropsName, hargsRemote)
 	if err == nil {
 		t.Errorf("remote file %s not deleted", fileName2)
 	}
@@ -826,7 +830,7 @@ func Test_SameAISAndRemoteBucketName(t *testing.T) {
 	}
 
 	// Check that cloud object is deleted
-	_, err = api.HeadObject(baseParams, bckRemote, fileName, api.HeadArgs{FltPresence: apc.FltExistsOutside})
+	_, err = api.HeadObjectV2(baseParams, bckRemote, fileName, apc.GetPropsName, api.HeadArgs{FltPresence: apc.FltExistsOutside})
 	if err == nil {
 		t.Errorf("Remote object %s not deleted", fileName)
 	} else if !isErrNotFound(err) {
@@ -947,7 +951,7 @@ func TestColdGetChunked(t *testing.T) {
 		autoLimit = 32 * cos.MiB
 		smallSize = 24 * cos.MiB
 		largeSize = 48 * cos.MiB
-		hardLimit = 1 * cos.GiB
+		hardLimit = 64 * cos.MiB
 	)
 
 	tests := []struct {
@@ -956,6 +960,7 @@ func TestColdGetChunked(t *testing.T) {
 		objSizeLimit  uint64 // auto-chunking threshold (zero disables)
 		maxMonoSize   uint64 // hard limit (zero uses the default)
 		multipart     bool   // explicitly upload multipart objects
+		contentSHA    bool   // regular PUT with a whole-object SHA256 header
 		evict         bool   // evict after provision
 		expectChunked bool
 		longOnly      bool // run only with long tests
@@ -980,7 +985,7 @@ func TestColdGetChunked(t *testing.T) {
 		{name: "objsize/multipart-warm-below", objSize: smallSize, objSizeLimit: autoLimit, multipart: true, expectChunked: true},
 		{name: "objsize/multipart-warm-above", objSize: largeSize, objSizeLimit: autoLimit, multipart: true, expectChunked: true},
 		{name: "objsize/put-warm-below", objSize: smallSize, objSizeLimit: autoLimit},
-		{name: "objsize/put-warm-above", objSize: largeSize, objSizeLimit: autoLimit, expectChunked: true},
+		{name: "objsize/put-warm-above", objSize: largeSize, objSizeLimit: autoLimit, expectChunked: true, contentSHA: true},
 
 		// Both limits set: cold GET follows the policy; warm GET preserves the source layout.
 		{name: "both/multipart-cold-below-soft", objSize: smallSize, objSizeLimit: autoLimit, maxMonoSize: hardLimit, multipart: true, evict: true},
@@ -992,9 +997,6 @@ func TestColdGetChunked(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.objSize > hardLimit {
-				t.Skip("TODO: use a reduced test threshold instead of provisioning a 1GiB object")
-			}
 			var (
 				numObjs  = 1
 				proxyURL = tools.RandomProxyURL(t)
@@ -1028,31 +1030,46 @@ func TestColdGetChunked(t *testing.T) {
 			p, err := api.HeadBucket(baseParams, m.bck, false)
 			tassert.CheckFatal(t, err)
 
-			// Configure bucket chunking properties
-			_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{
-				Chunks: &cmn.ChunksConfToSet{
-					ObjSizeLimit:      apc.Ptr(cos.SizeIEC(tt.objSizeLimit)),
-					MaxMonolithicSize: apc.Ptr(cos.SizeIEC(tt.maxMonoSize)),
-					ChunkSize:         apc.Ptr(cos.SizeIEC(chunkSize)),
-				},
+			// Configure bucket chunking properties and wait for the automatic rechunk.
+			err = setBucketChunksAndWait(baseParams, m.bck, &cmn.ChunksConfToSet{
+				ObjSizeLimit:      apc.Ptr(cos.SizeIEC(tt.objSizeLimit)),
+				MaxMonolithicSize: apc.Ptr(cos.SizeIEC(tt.maxMonoSize)),
+				ChunkSize:         apc.Ptr(cos.SizeIEC(chunkSize)),
 			})
 			tassert.CheckFatal(t, err)
-			// TODO: Wait for automatically triggered rechunk before provisioning objects
 
 			t.Cleanup(func() {
-				_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{
-					Chunks: &cmn.ChunksConfToSet{
-						ObjSizeLimit:      apc.Ptr(p.Chunks.ObjSizeLimit),
-						MaxMonolithicSize: apc.Ptr(p.Chunks.MaxMonolithicSize),
-						ChunkSize:         apc.Ptr(p.Chunks.ChunkSize),
-					},
+				err := setBucketChunksAndWait(baseParams, m.bck, &cmn.ChunksConfToSet{
+					ObjSizeLimit:      apc.Ptr(p.Chunks.ObjSizeLimit),
+					MaxMonolithicSize: apc.Ptr(p.Chunks.MaxMonolithicSize),
+					ChunkSize:         apc.Ptr(p.Chunks.ChunkSize),
 				})
 				tassert.CheckError(t, err)
 			})
 
 			// Provision objects to remote backend
 			tlog.Logfln("Provisioning %d objects (multipart=%v, size=%s, evict=%v)...", numObjs, tt.multipart, cos.ToSizeIEC(int64(tt.objSize), 0), tt.evict)
-			m.remotePuts(false /*evict*/)
+			var wholeSHA string
+			if tt.contentSHA {
+				reader, err := readers.New(&readers.Arg{Type: readers.Rand, Size: int64(tt.objSize), CksumType: p.Cksum.Type})
+				tassert.CheckFatal(t, err)
+				h := sha256.New()
+				_, err = io.Copy(h, reader)
+				tassert.CheckFatal(t, err)
+				wholeSHA = hex.EncodeToString(h.Sum(nil))
+				_, err = reader.Seek(0, io.SeekStart)
+				tassert.CheckFatal(t, err)
+				m.objNames = append(m.objNames, m.prefix+"-sha256")
+				// Automatic parts must not validate against the whole-object digest.
+				_, err = api.PutObject(&api.PutArgs{
+					BaseParams: baseParams, Bck: m.bck, ObjName: m.objNames[0],
+					Reader: reader, Size: tt.objSize, Cksum: reader.Cksum(),
+					Header: http.Header{cos.S3HdrContentSHA256: []string{wholeSHA}},
+				})
+				tassert.CheckFatal(t, err)
+			} else {
+				m.remotePuts(false /*evict*/)
+			}
 
 			if tt.evict {
 				err = api.EvictRemoteBucket(baseParams, m.bck, true /*keepMD*/)
@@ -1061,7 +1078,13 @@ func TestColdGetChunked(t *testing.T) {
 			} else {
 				tlog.Logln("Performing warm GET...")
 			}
-			m.gets(nil, true)
+			if tt.contentSHA {
+				h := sha256.New()
+				m.gets(&api.GetArgs{Writer: h}, true)
+				tassert.Errorf(t, hex.EncodeToString(h.Sum(nil)) == wholeSHA, "automatic chunk upload changed object content")
+			} else {
+				m.gets(nil, true)
+			}
 
 			if tt.expectChunked {
 				expectedChunkSize := int64(chunkSize)
@@ -1087,10 +1110,9 @@ func TestColdGetChunked(t *testing.T) {
 }
 
 func TestCopyRemoteObjectHardLimitSameTarget(t *testing.T) {
-	t.Skip("TODO: use a reduced test threshold instead of provisioning a 1GiB object")
 	const (
 		chunkSize   = 16 * cos.MiB
-		maxMonoSize = 1 * cos.GiB
+		maxMonoSize = 64 * cos.MiB
 		objSize     = maxMonoSize + 1
 	)
 	var (
@@ -1113,18 +1135,18 @@ func TestCopyRemoteObjectHardLimitSameTarget(t *testing.T) {
 	orig, err := api.HeadBucket(baseParams, m.bck, true /*dontAddRemote*/)
 	tassert.CheckFatal(t, err)
 	t.Cleanup(func() {
-		_, err := api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{Chunks: &cmn.ChunksConfToSet{
+		err := setBucketChunksAndWait(baseParams, m.bck, &cmn.ChunksConfToSet{
 			ObjSizeLimit:      apc.Ptr(orig.Chunks.ObjSizeLimit),
 			MaxMonolithicSize: apc.Ptr(orig.Chunks.MaxMonolithicSize),
 			ChunkSize:         apc.Ptr(orig.Chunks.ChunkSize),
-		}})
+		})
 		tassert.CheckError(t, err)
 	})
-	_, err = api.SetBucketProps(baseParams, m.bck, &cmn.BpropsToSet{Chunks: &cmn.ChunksConfToSet{
+	err = setBucketChunksAndWait(baseParams, m.bck, &cmn.ChunksConfToSet{
 		ObjSizeLimit:      apc.Ptr(cos.SizeIEC(0)),
 		MaxMonolithicSize: apc.Ptr(cos.SizeIEC(maxMonoSize)),
 		ChunkSize:         apc.Ptr(cos.SizeIEC(chunkSize)),
-	}})
+	})
 	tassert.CheckFatal(t, err)
 
 	srcName := m.prefix + "0"
@@ -2207,7 +2229,7 @@ func TestPutObjectWithChecksum(t *testing.T) {
 			t.Error("Bad checksum provided by the user, Expected an error")
 		}
 
-		_, err = api.HeadObject(baseParams, bck, fileName, api.HeadArgs{FltPresence: apc.FltExists})
+		_, err = api.HeadObjectV2(baseParams, bck, fileName, apc.GetPropsName, api.HeadArgs{FltPresence: apc.FltExists})
 		if err == nil {
 			t.Errorf("Object %s exists despite bad checksum", fileName)
 		} else if !isErrNotFound(err) {
@@ -2215,13 +2237,10 @@ func TestPutObjectWithChecksum(t *testing.T) {
 		}
 		putArgs.Cksum = cos.NewCksum(cksumType, cksumValue)
 		oah, err := api.PutObject(&putArgs)
-		if err != nil {
-			t.Errorf("Correct checksum provided, Err encountered %v", err)
-		}
-		op, err := api.HeadObject(baseParams, bck, fileName, api.HeadArgs{FltPresence: apc.FltPresent})
-		if err != nil {
-			t.Errorf("Object %s does not exist despite correct checksum", fileName)
-		}
+		tassert.CheckFatal(t, err)
+		props := apc.JoinProps(apc.GetPropsChecksum, apc.GetPropsAtime, apc.GetPropsVersion, apc.GetPropsCustom)
+		op, err := api.HeadObjectV2(baseParams, bck, fileName, props, api.HeadArgs{FltPresence: apc.FltPresent})
+		tassert.CheckFatal(t, err)
 		attrs1 := oah.Attrs()
 		attrs2 := op.ObjAttrs
 		tassert.Errorf(t, attrs1.CheckEq(&attrs2) == nil, "PUT(obj) attrs %s != %s HEAD\n", attrs1.String(), attrs2.String())
@@ -2229,35 +2248,35 @@ func TestPutObjectWithChecksum(t *testing.T) {
 }
 
 func TestMultipartUpload(t *testing.T) {
+	runProviderTests(t, testMultipartUpload)
+}
+
+func testMultipartUpload(t *testing.T, mbck *meta.Bck) {
 	var (
 		proxyURL   = tools.RandomProxyURL(t)
 		baseParams = tools.BaseAPIParams(proxyURL)
-		bck        = cmn.Bck{
-			Name:     trand.String(10),
-			Provider: apc.AIS,
-		}
-		objName = "test-multipart-object"
+		bck        = mbck.Clone()
+		objName    = "test-multipart-object-" + trand.String(8)
 
-		// Test data to upload in 3 parts
+		// Test data to upload in up to 3 parts
 		part1Data = []byte("This is the first part of the multipart upload test. ")
 		part2Data = []byte("This is the second part containing more test data. ")
 		part3Data = []byte("This is the final third part to complete the upload.")
 
-		// Complete expected content
-		expectedContent = append(append(part1Data, part2Data...), part3Data...)
-		partNumbers     = make([]int, 0, 3)
+		partNumbers = make([]int, 0, 3)
 	)
-
-	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
+	defer api.DeleteObject(baseParams, bck, objName)
 
 	tlog.Logfln("multipart upload: %s/%s", bck.Name, objName)
 
 	// Step 1: Create multipart upload
-	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	mptArgs := api.MptArgs{Context: t.Context(), BaseParams: baseParams, Bck: bck, ObjName: objName}
+	uploadID, err := api.CreateMultipartUpload(&mptArgs)
 	tassert.CheckFatal(t, err)
 	tassert.Fatalf(t, uploadID != "", "upload ID should not be empty")
+	defer api.AbortMultipartUpload(&api.AbortMptArgs{MptArgs: mptArgs, UploadID: uploadID})
 
-	// Step 2: Upload three parts
+	// Step 2: Upload parts
 	testParts := []struct {
 		partNum int
 		data    []byte
@@ -2266,10 +2285,15 @@ func TestMultipartUpload(t *testing.T) {
 		{2, part2Data},
 		{3, part3Data},
 	}
+	if remote := mbck.RemoteBck(); remote != nil && remote.IsCloud() {
+		testParts = testParts[:1] // cloud backends require non-final parts to be at least 5MiB
+	}
+	expectedContent := make([]byte, 0)
 
 	for _, part := range testParts {
 		putPartArgs := &api.PutPartArgs{
 			PutArgs: api.PutArgs{
+				Context:    t.Context(),
 				BaseParams: baseParams,
 				Bck:        bck,
 				ObjName:    objName,
@@ -2284,17 +2308,19 @@ func TestMultipartUpload(t *testing.T) {
 		tassert.CheckFatal(t, err)
 
 		partNumbers = append(partNumbers, part.partNum)
+		expectedContent = append(expectedContent, part.data...)
 	}
 
 	// Step 3: Complete multipart upload
-	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+	completeArgs := &api.CompleteMptArgs{MptArgs: mptArgs, UploadID: uploadID, PartNumbers: partNumbers}
+	err = api.CompleteMultipartUpload(completeArgs)
 	tassert.CheckFatal(t, err)
 
 	// Step 4: Verify the uploaded object
 
 	// Check object exists
 	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
-	objAttrs, err := api.HeadObject(baseParams, bck, objName, hargs)
+	objAttrs, err := api.HeadObjectV2(baseParams, bck, objName, apc.GetPropsSize, hargs)
 	tassert.CheckFatal(t, err)
 
 	// Verify object size matches expected content
@@ -2304,13 +2330,51 @@ func TestMultipartUpload(t *testing.T) {
 
 	// Download and verify content
 	writer := bytes.NewBuffer(nil)
-	getArgs := api.GetArgs{Writer: writer}
+	getArgs := api.GetArgs{Context: t.Context(), Writer: writer}
 	_, err = api.GetObject(baseParams, bck, objName, &getArgs)
 	tassert.CheckFatal(t, err)
 
 	downloadedContent := writer.Bytes()
 	tassert.Errorf(t, bytes.Equal(downloadedContent, expectedContent),
 		"content mismatch: expected %q, got %q", string(expectedContent), string(downloadedContent))
+}
+
+func TestMultipartUploadContextCancellation(t *testing.T) {
+	runProviderTests(t, testMultipartUploadContextCancellation)
+}
+
+func testMultipartUploadContextCancellation(t *testing.T, mbck *meta.Bck) {
+	var (
+		proxyURL = tools.RandomProxyURL(t)
+		baseArgs = tools.BaseAPIParams(proxyURL)
+		bck      = mbck.Clone()
+		objName  = "mpt-context-cancel-" + trand.String(8)
+		mptArgs  = api.MptArgs{Context: t.Context(), BaseParams: baseArgs, Bck: bck, ObjName: objName}
+	)
+
+	uploadID, err := api.CreateMultipartUpload(&mptArgs)
+	tassert.CheckFatal(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	mptArgs.Context = ctx
+
+	mptArgs.ObjName = "mpt-context-cancel-create"
+	_, err = api.CreateMultipartUpload(&mptArgs)
+	herr := cmn.AsErrHTTP(err)
+	tassert.Fatalf(t, herr != nil && herr.Message == context.Canceled.Error(), "expected canceled create, got %v", err)
+
+	mptArgs.ObjName = objName
+	err = api.CompleteMultipartUpload(&api.CompleteMptArgs{MptArgs: mptArgs, UploadID: uploadID})
+	herr = cmn.AsErrHTTP(err)
+	tassert.Fatalf(t, herr != nil && herr.Message == context.Canceled.Error(), "expected canceled complete, got %v", err)
+
+	err = api.AbortMultipartUpload(&api.AbortMptArgs{MptArgs: mptArgs, UploadID: uploadID})
+	herr = cmn.AsErrHTTP(err)
+	tassert.Fatalf(t, herr != nil && herr.Message == context.Canceled.Error(), "expected canceled abort, got %v", err)
+
+	mptArgs.Context = t.Context()
+	tassert.CheckFatal(t, api.AbortMultipartUpload(&api.AbortMptArgs{MptArgs: mptArgs, UploadID: uploadID}))
 }
 
 func TestMultipartUploadParallel(t *testing.T) {
@@ -2339,7 +2403,8 @@ func TestMultipartUploadParallel(t *testing.T) {
 	tlog.Logfln("multipart upload (parallel): %s/%s", bck.Name, objName)
 
 	// Step 1: Create multipart upload
-	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	mptArgs := api.MptArgs{BaseParams: baseParams, Bck: bck, ObjName: objName}
+	uploadID, err := api.CreateMultipartUpload(&mptArgs)
 	tassert.CheckFatal(t, err)
 	tassert.Fatalf(t, uploadID != "", "upload ID should not be empty")
 
@@ -2384,12 +2449,13 @@ func TestMultipartUploadParallel(t *testing.T) {
 
 	// Step 3: Complete multipart upload with parts in correct order
 	partNumbers := []int{1, 2, 3, 4, 5} // Parts must be completed in correct order
-	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+	completeArgs := &api.CompleteMptArgs{MptArgs: mptArgs, UploadID: uploadID, PartNumbers: partNumbers}
+	err = api.CompleteMultipartUpload(completeArgs)
 	tassert.CheckFatal(t, err)
 
 	// Step 4: Verify the uploaded object
 	hargs := api.HeadArgs{FltPresence: apc.FltPresent}
-	objAttrs, err := api.HeadObject(baseParams, bck, objName, hargs)
+	objAttrs, err := api.HeadObjectV2(baseParams, bck, objName, apc.GetPropsSize, hargs)
 	tassert.CheckFatal(t, err)
 
 	expectedSize := int64(len(expectedContent))
@@ -2429,7 +2495,8 @@ func TestMultipartMaxChunks(t *testing.T) {
 			numParts = core.MaxChunkCount + 100 // Exceed limit by 100
 		)
 
-		uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+		mptArgs := api.MptArgs{BaseParams: baseParams, Bck: bck, ObjName: objName}
+		uploadID, err := api.CreateMultipartUpload(&mptArgs)
 		tassert.CheckFatal(t, err)
 
 		err = uploadPartsInParallel(objName, uploadID, numParts, bck, miniPartData)
@@ -2444,7 +2511,8 @@ func TestMultipartMaxChunks(t *testing.T) {
 		tlog.Logfln("multipart upload correctly rejected when exceeding MaxChunkCount (%d)", core.MaxChunkCount)
 
 		// Cleanup: abort the upload
-		_ = api.AbortMultipartUpload(baseParams, bck, objName, uploadID)
+		abortArgs := &api.AbortMptArgs{MptArgs: mptArgs, UploadID: uploadID}
+		_ = api.AbortMultipartUpload(abortArgs)
 	})
 
 	t.Run("equal-to-limit", func(t *testing.T) {
@@ -2453,7 +2521,8 @@ func TestMultipartMaxChunks(t *testing.T) {
 			numParts = core.MaxChunkCount // Exactly at the limit
 		)
 
-		uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+		mptArgs := api.MptArgs{BaseParams: baseParams, Bck: bck, ObjName: objName}
+		uploadID, err := api.CreateMultipartUpload(&mptArgs)
 		tassert.CheckFatal(t, err)
 		tassert.Fatalf(t, uploadID != "", "upload ID should not be empty")
 
@@ -2466,14 +2535,15 @@ func TestMultipartMaxChunks(t *testing.T) {
 		for i := range numParts {
 			partNumbers[i] = i + 1
 		}
-		err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+		completeArgs := &api.CompleteMptArgs{MptArgs: mptArgs, UploadID: uploadID, PartNumbers: partNumbers}
+		err = api.CompleteMultipartUpload(completeArgs)
 		tassert.CheckFatal(t, err)
 
 		tlog.Logfln("multipart upload completed successfully with %d parts at MaxChunkCount", numParts)
 
 		// Verify the uploaded object
 		hargs := api.HeadArgs{FltPresence: apc.FltPresent}
-		objAttrs, err := api.HeadObject(baseParams, bck, objName, hargs)
+		objAttrs, err := api.HeadObjectV2(baseParams, bck, objName, apc.GetPropsSize, hargs)
 		tassert.CheckFatal(t, err)
 
 		expectedSize := int64(numParts * len(miniPartData))
@@ -2547,9 +2617,11 @@ func testMultipartUploadAbort(t *testing.T, mbck *meta.Bck) {
 	tlog.Logfln("multipart upload abort test: %s/%s", bck.Name, objName)
 
 	// Step 1: Create multipart upload
-	uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+	mptArgs := api.MptArgs{BaseParams: baseParams, Bck: bck, ObjName: objName}
+	uploadID, err := api.CreateMultipartUpload(&mptArgs)
 	tassert.CheckFatal(t, err)
 	tassert.Fatalf(t, uploadID != "", "upload ID should not be empty")
+	abortArgs := &api.AbortMptArgs{MptArgs: mptArgs, UploadID: uploadID}
 
 	// Step 2: Upload first two parts successfully
 	testParts := []struct {
@@ -2580,7 +2652,7 @@ func testMultipartUploadAbort(t *testing.T, mbck *meta.Bck) {
 
 	// Step 3: Abort the multipart upload
 	tlog.Logfln("aborting multipart upload with ID: %s", uploadID)
-	err = api.AbortMultipartUpload(baseParams, bck, objName, uploadID)
+	err = api.AbortMultipartUpload(abortArgs)
 	tassert.CheckFatal(t, err)
 
 	// Negative tests below
@@ -2608,7 +2680,8 @@ func testMultipartUploadAbort(t *testing.T, mbck *meta.Bck) {
 	// Step 5: Try to complete multipart upload after abort - should fail
 	tlog.Logfln("attempting to complete upload after abort (should fail)")
 	partNumbers := []int{1, 2}
-	err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+	completeArgs := &api.CompleteMptArgs{MptArgs: mptArgs, UploadID: uploadID, PartNumbers: partNumbers}
+	err = api.CompleteMultipartUpload(completeArgs)
 	tassert.Errorf(t, err != nil, "complete multipart upload after abort should fail, but succeeded")
 	if err != nil {
 		tlog.Logfln("correctly failed to complete upload after abort: %v", err)
@@ -2616,7 +2689,7 @@ func testMultipartUploadAbort(t *testing.T, mbck *meta.Bck) {
 
 	// Step 6: Try to abort again - should be idempotent or fail gracefully
 	tlog.Logfln("attempting to abort again (should be idempotent)")
-	err = api.AbortMultipartUpload(baseParams, bck, objName, uploadID)
+	err = api.AbortMultipartUpload(abortArgs)
 	if mbck.IsRemoteGCP() {
 		tassert.Fatalf(t, err == nil, "GCP second abort must be idempotent, got %v", err)
 	}
@@ -2639,12 +2712,14 @@ func testMultipartUploadAbort(t *testing.T, mbck *meta.Bck) {
 	// Step 8: Test abort workflow with immediate abort (no parts uploaded)
 	tlog.Logfln("testing immediate abort without uploading parts")
 	objName2 := "test-multipart-immediate-abort-" + trand.String(8)
-	uploadID2, err := api.CreateMultipartUpload(baseParams, bck, objName2)
+	mptArgs.ObjName = objName2
+	uploadID2, err := api.CreateMultipartUpload(&mptArgs)
 	tassert.CheckFatal(t, err)
 	tassert.Fatalf(t, uploadID2 != "", "upload ID should not be empty")
 
 	// Immediately abort without uploading any parts
-	err = api.AbortMultipartUpload(baseParams, bck, objName2, uploadID2)
+	abortArgs = &api.AbortMptArgs{MptArgs: mptArgs, UploadID: uploadID2}
+	err = api.AbortMultipartUpload(abortArgs)
 	tassert.CheckFatal(t, err)
 	tlog.Logfln("successfully aborted upload immediately without any parts")
 
@@ -2693,7 +2768,8 @@ func TestMultipartUploadAndCopyBucket(t *testing.T) {
 		createdObjects[i] = objName
 
 		// Create multipart upload
-		uploadID, err := api.CreateMultipartUpload(baseParams, bck, objName)
+		mptArgs := api.MptArgs{BaseParams: baseParams, Bck: bck, ObjName: objName}
+		uploadID, err := api.CreateMultipartUpload(&mptArgs)
 		tassert.CheckFatal(t, err)
 		tassert.Fatalf(t, uploadID != "", "upload ID should not be empty for object %d", i)
 
@@ -2728,7 +2804,8 @@ func TestMultipartUploadAndCopyBucket(t *testing.T) {
 		}
 
 		// Complete multipart upload
-		err = api.CompleteMultipartUpload(baseParams, bck, objName, uploadID, partNumbers)
+		completeArgs := &api.CompleteMptArgs{MptArgs: mptArgs, UploadID: uploadID, PartNumbers: partNumbers}
+		err = api.CompleteMultipartUpload(completeArgs)
 		tassert.CheckFatal(t, err)
 	}
 
@@ -2760,7 +2837,7 @@ func TestMultipartUploadAndCopyBucket(t *testing.T) {
 
 	for i, objName := range createdObjects {
 		// Check object exists in destination
-		objAttrs, err := api.HeadObject(baseParams, dstBck, objName, hargs)
+		objAttrs, err := api.HeadObjectV2(baseParams, dstBck, objName, apc.GetPropsSize, hargs)
 		tassert.CheckFatal(t, err)
 
 		// Verify size

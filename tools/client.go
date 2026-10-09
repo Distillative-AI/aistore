@@ -22,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
@@ -355,6 +356,10 @@ func EnsureObjectsExist(t *testing.T, params api.BaseParams, bck cmn.Bck, object
 
 func putMultipartObjectSequential(bp api.BaseParams, bck cmn.Bck, objName, uploadID string, size uint64, args *PutObjectsArgs) error {
 	partNumbers := make([]int, args.MultipartNumChunks)
+	mptArgs := api.MptArgs{Context: args.Context, BaseParams: bp, Bck: bck, ObjName: objName}
+	abortMptArgs := mptArgs
+	abortMptArgs.Context = context.Background()
+	abortArgs := &api.AbortMptArgs{MptArgs: abortMptArgs, UploadID: uploadID}
 
 	for i := range args.MultipartNumChunks {
 		var (
@@ -368,7 +373,7 @@ func putMultipartObjectSequential(bp api.BaseParams, bck cmn.Bck, objName, uploa
 		buf := make([]byte, partSize)
 		n, err := args.Reader.Read(buf)
 		if err != nil && err != io.EOF {
-			if abortErr := api.AbortMultipartUpload(bp, bck, objName, uploadID); abortErr != nil {
+			if abortErr := api.AbortMultipartUpload(abortArgs); abortErr != nil {
 				return fmt.Errorf("failed to read part %d and failed to abort %s: read error: %w, abort error: %v", partNum, objName, err, abortErr)
 			}
 			return fmt.Errorf("failed to read part %d of %s: %w", partNum, objName, err)
@@ -379,6 +384,7 @@ func putMultipartObjectSequential(bp api.BaseParams, bck cmn.Bck, objName, uploa
 
 		putPartArgs := &api.PutPartArgs{
 			PutArgs: api.PutArgs{
+				Context:    args.Context,
 				BaseParams: bp,
 				Bck:        bck,
 				ObjName:    objName,
@@ -392,7 +398,7 @@ func putMultipartObjectSequential(bp api.BaseParams, bck cmn.Bck, objName, uploa
 		}
 
 		if err := api.UploadPart(putPartArgs); err != nil {
-			if abortErr := api.AbortMultipartUpload(bp, bck, objName, uploadID); abortErr != nil {
+			if abortErr := api.AbortMultipartUpload(abortArgs); abortErr != nil {
 				return fmt.Errorf("failed to upload part %d and failed to abort %s: upload err: %w, abort err: %v",
 					partNum, objName, err, abortErr)
 			}
@@ -401,8 +407,11 @@ func putMultipartObjectSequential(bp api.BaseParams, bck cmn.Bck, objName, uploa
 		partNumbers[partNum-1] = partNum
 	}
 
-	if err := api.CompleteMultipartUpload(bp, bck, objName, uploadID, partNumbers); err != nil {
-		if abortErr := api.AbortMultipartUpload(bp, bck, objName, uploadID); abortErr != nil {
+	completeArgs := &api.CompleteMptArgs{
+		MptArgs: mptArgs, UploadID: uploadID, PartNumbers: partNumbers,
+	}
+	if err := api.CompleteMultipartUpload(completeArgs); err != nil {
+		if abortErr := api.AbortMultipartUpload(abortArgs); abortErr != nil {
 			return fmt.Errorf("failed to complete multipart upload and failed to abort %s: complete err: %w, abort err: %v",
 				objName, err, abortErr)
 		}
@@ -426,6 +435,7 @@ func uploadPart(bp api.BaseParams, bck cmn.Bck, objName, uploadID string,
 
 	putPartArgs := &api.PutPartArgs{
 		PutArgs: api.PutArgs{
+			Context:    args.Context,
 			BaseParams: bp,
 			Bck:        bck,
 			ObjName:    objName,
@@ -450,7 +460,8 @@ func uploadPart(bp api.BaseParams, bck cmn.Bck, objName, uploadID string,
 }
 
 func PutMultipartObject(bp api.BaseParams, bck cmn.Bck, objName string, size uint64, args *PutObjectsArgs) error {
-	uploadID, err := api.CreateMultipartUpload(bp, bck, objName)
+	mptArgs := api.MptArgs{Context: args.Context, BaseParams: bp, Bck: bck, ObjName: objName}
+	uploadID, err := api.CreateMultipartUpload(&mptArgs)
 	if err != nil {
 		return fmt.Errorf("failed to create multipart upload for %s: %w", objName, err)
 	}
@@ -479,17 +490,24 @@ func PutMultipartObject(bp api.BaseParams, bck cmn.Bck, objName string, size uin
 		})
 	}
 
+	abortMptArgs := mptArgs
+	abortMptArgs.Context = context.Background()
+	abortArgs := &api.AbortMptArgs{MptArgs: abortMptArgs, UploadID: uploadID}
+
 	// Wait for all parts to complete
 	if err := group.Wait(); err != nil {
-		if abortErr := api.AbortMultipartUpload(bp, bck, objName, uploadID); abortErr != nil {
+		if abortErr := api.AbortMultipartUpload(abortArgs); abortErr != nil {
 			return fmt.Errorf("failed to upload parts and failed to abort upload %s: upload error: %w, abort error: %v", objName, err, abortErr)
 		}
 		return fmt.Errorf("failed to upload parts of %s: %w", objName, err)
 	}
 
 	// Complete multipart upload
-	if err := api.CompleteMultipartUpload(bp, bck, objName, uploadID, partNumbers); err != nil {
-		if abortErr := api.AbortMultipartUpload(bp, bck, objName, uploadID); abortErr != nil {
+	completeArgs := &api.CompleteMptArgs{
+		MptArgs: mptArgs, UploadID: uploadID, PartNumbers: partNumbers,
+	}
+	if err := api.CompleteMultipartUpload(completeArgs); err != nil {
+		if abortErr := api.AbortMultipartUpload(abortArgs); abortErr != nil {
 			return fmt.Errorf("failed to complete multipart upload and failed to abort %s: complete error: %w, abort error: %v", objName, err, abortErr)
 		}
 		return fmt.Errorf("failed to complete multipart upload for %s: %w", objName, err)
@@ -728,7 +746,11 @@ func WaitForRebalAndResil(t testing.TB, bp api.BaseParams, timeouts ...time.Dura
 	go func() {
 		defer wg.Done()
 		xargs := xact.ArgsMsg{Kind: apc.ActRebalance, OnlyRunning: true, Timeout: timeout}
-		if _, err := api.WaitForXactionIC(bp, &xargs); err != nil {
+		// Wait for an empty running set (404), not just one finished rebalance.
+		_, err := api.WaitForStatus(bp, &xargs, func(status *nl.Status) (bool, bool, error) {
+			return false, status.IsFinished(), nil
+		})
+		if err != nil {
 			if cmn.IsStatusNotFound(err) {
 				return
 			}

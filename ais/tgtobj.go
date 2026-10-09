@@ -74,6 +74,8 @@ type (
 	getOI struct {
 		req        *http.Request
 		w          http.ResponseWriter
+		wctrl      wdeadliner // non-nil: write deadline enabled (see initWdl)
+		wtout      time.Duration
 		ctx        context.Context // context used when getting object from remote backend (access creds)
 		ktls       ktlsState       // connection-scoped TX state, if any
 		t          *target         // this
@@ -249,6 +251,7 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 		chunkReader := io.NopCloser(limitedReader)
 
 		args := partArgs{
+			ctx:         mptRequestContext(poi.oreq),
 			reader:      chunkReader,
 			size:        thisChunkSize,
 			lom:         lom,
@@ -1247,7 +1250,7 @@ func (goi *getOI) _txrng(fqn string, lmfh cos.LomReader, whdr http.Header, hrng 
 	}
 
 	// sendfile path
-	if sgl == nil && lmfh != nil && goi.canSendfile(lmfh) {
+	if sgl == nil && lmfh != nil && goi.canSendfile(lmfh, size) {
 		rocs, ok := lmfh.(io.Seeker)
 		debug.Assert(ok)
 		if _, err := rocs.Seek(hrng.Start, io.SeekStart); err != nil {
@@ -1373,10 +1376,15 @@ func (goi *getOI) setwhdr(whdr http.Header, cksum *cos.Cksum, size int64) {
 func (goi *getOI) _txreg(fqn string, lmfh cos.LomReader, whdr http.Header) (err error) {
 	// set response header
 	size := goi.lom.Lsize()
+	sendfile := goi.canSendfile(lmfh, size)
 	goi.setwhdr(whdr, goi.lom.Checksum(), size)
 
+	// stalled client vs. (rlock, open file, goroutine)
+	// TODO: range, arch, cold-stream
+	goi.initWdl()
+
 	// Tx
-	if goi.canSendfile(lmfh) {
+	if sendfile {
 		// NOTE: net.sendFile unwraps io.LimitedReader before the syscall,
 		// so the wrap is free; ktlsConn.ReadFrom requires it (see ais/ktls)
 		err = goi.sendfile(&io.LimitedReader{R: lmfh, N: size}, fqn, size, false /*committed*/)
@@ -1458,15 +1466,11 @@ func (goi *getOI) _txarch(fqn string, lmfh cos.LomReader, whdr http.Header) erro
 }
 
 func (goi *getOI) transmit(r io.Reader, buf []byte, fqn string, size int64, committed bool) error {
-	var (
-		errTx error
-	)
-	written, err := cos.CopyBuffer(goi.w, r, buf)
+	written, err := goi._copyWdl(r, buf, size)
 	if err != nil || written != size {
-		errTx = goi._txerr(err, fqn /*lbget*/, written, size, committed)
-	}
-	if errTx != nil {
-		return errTx
+		if errTx := goi._txerr(err, fqn /*lbget*/, written, size, committed); errTx != nil {
+			return errTx
+		}
 	}
 
 	//
@@ -1476,12 +1480,33 @@ func (goi *getOI) transmit(r io.Reader, buf []byte, fqn string, size int64, comm
 	return nil
 }
 
+// same rule as _sendfileWdl: up to one renewal size, the initial deadline alone enforces
+// the minimum transfer rate - no wrapper, no renewal
+func (goi *getOI) _copyWdl(r io.Reader, buf []byte, size int64) (int64, error) {
+	renewSize := cmn.XferRenewSize(goi.wtout)
+	if goi.wctrl == nil || (size >= 0 && size <= renewSize) {
+		return cos.CopyBuffer(goi.w, r, buf)
+	}
+	w := &wdlWriter{w: goi.w, rc: goi.wctrl, tout: goi.wtout, renewSize: renewSize}
+	return cos.CopyBuffer(w, r, buf)
+}
+
 //
 // fast (sendfile) path
 //
 
-func (goi *getOI) sendfile(r io.Reader, fqn string, size int64, committed bool) error {
-	written, err := cos.CopySendfile(goi.w, r)
+// `lr` must be io.LimitedReader over file -  ktlsConn.ReadFrom requires it
+// and _sendfileWdl splits it (see below)
+func (goi *getOI) sendfile(lr *io.LimitedReader, fqn string, size int64, committed bool) error {
+	var (
+		written int64
+		err     error
+	)
+	if goi.wctrl != nil {
+		written, err = goi._sendfileWdl(lr)
+	} else {
+		written, err = cos.CopySendfile(goi.w, lr)
+	}
 	if err != nil || written != size {
 		if errTx := goi._txerr(err, fqn, written, size, committed); errTx != nil {
 			return errTx
@@ -1491,27 +1516,78 @@ func (goi *getOI) sendfile(r io.Reader, fqn string, size int64, committed bool) 
 	return nil
 }
 
-// source must be monolithic file-backed (see assert)
-func (goi *getOI) canSendfile(lmfh cos.LomReader) bool {
+// initial write deadline: one window (timeout.send_file_time; terminology: see cmn.XferRenewSize)
+// - net/http clears the write deadline after each request (keep-alive safe)
+// - deadline exceeded => cmn.ErrSlowReadingClient: counted, logged, and returned as cmn.ErrGetTxBenign (see _txerr)
+func (goi *getOI) initWdl() {
+	if cmn.Rom.Features().IsSet(feat.DisableGetDeadline) {
+		return
+	}
+	tout := cmn.Rom.SendFile()
+	if tout <= 0 {
+		return
+	}
+
+	// *http.response implements it directly - no allocation;
+	// otherwise, ResponseController to unwrap (compare w/ x-moss)
+	wd, ok := goi.w.(wdeadliner)
+	if !ok {
+		wd = http.NewResponseController(goi.w)
+	}
+	if err := wd.SetWriteDeadline(time.Now().Add(tout)); err != nil {
+		// proceed w/o deadline: http.ErrNotSupported (wrapped writer w/o Unwrap(), test recorder)
+		// or connection already closed - the latter fails at the first write anyway
+		return
+	}
+	goi.wctrl, goi.wtout = wd, tout
+}
+
+// sendfile one renewal size at a time, renewing the deadline in between
+// (a single ReadFrom would otherwise be bound by one absolute deadline);
+// relies on initWdl's initial deadline for small responses and the first renewal size
+func (goi *getOI) _sendfileWdl(lr *io.LimitedReader) (written int64, err error) {
+	renewSize := cmn.XferRenewSize(goi.wtout)
+	if lr.N <= renewSize {
+		return cos.CopySendfile(goi.w, lr) // initial deadline covers the entire response
+	}
+	for lr.N > 0 {
+		remaining := lr.N
+		lr.N = min(remaining, renewSize)
+		var n int64
+		n, err = cos.CopySendfile(goi.w, lr)
+		written += n
+		lr.N = remaining - n
+		if err != nil || n == 0 {
+			break
+		}
+		if lr.N > 0 {
+			if err = goi.wctrl.SetWriteDeadline(time.Now().Add(goi.wtout)); err != nil {
+				return written, err
+			}
+		}
+	}
+	return written, err
+}
+
+// source must be monolithic file-backed (see assert);
+// on HTTPS, also decides kTLS offload for the connection - once (see ktlsConn.tryArm)
+func (goi *getOI) canSendfile(lmfh cos.LomReader, size int64) bool {
 	if goi.lom.IsChunked() {
 		return false
 	}
-	if !canSendfileConn(goi.ktls, cmn.Rom.UseHTTPS()) {
-		return false
-	}
-
 	debug.Func(func() {
 		_, ok := lmfh.(*os.File)
 		debug.Assertf(ok, "expecting file-backed, got %T", lmfh)
 	})
 
 	_, ok := goi.w.(io.ReaderFrom)
-	return ok
-}
-
-// TODO: keeping it separate only for unit tests
-func canSendfileConn(state ktlsState, useHTTPS bool) bool {
-	return !useHTTPS || (state != nil && state.isArmed())
+	if !ok {
+		return false
+	}
+	if !cmn.Rom.UseHTTPS() {
+		return true
+	}
+	return goi.ktls != nil && goi.ktls.tryArm(size)
 }
 
 func (goi *getOI) _txerr(err error, fqn string, written, size int64, committed bool) error {
@@ -1535,6 +1611,12 @@ func (goi *getOI) _txerr(err error, fqn string, written, size int64, committed b
 
 	// [failure to transmit] return cmn.ErrGetTxBenign
 	switch {
+	case goi.wctrl != nil && errors.Is(err, os.ErrDeadlineExceeded):
+		// installed write deadline expired
+		// - see net.Conn.SetDeadline
+		// - must be matched first - and prior to cos.IsErrRetriableConn (next)
+		goi.slowClient(err)
+		return cmn.ErrGetTxBenign // client not keeping up is not a server-side error
 	case cos.IsErrRetriableConn(err):
 		if cmn.Rom.V(5, cos.ModAIS) {
 			nlog.WarningDepth(1, act, cname, "err:", err)
@@ -1555,6 +1637,17 @@ func (goi *getOI) _txerr(err error, fqn string, written, size int64, committed b
 		return cmn.ErrGetTxBenign
 	}
 	return err
+}
+
+// client reading below minimum transfer rate: count and (sparsely) log
+func (goi *getOI) slowClient(err error) {
+	var (
+		t     = goi.t
+		vlabs = map[string]string{stats.VlabBucket: goi.lom.Bck().Cname("")}
+		e     = cmn.NewErrSlowReadingClient(err, goi.wtout, cmn.XferRenewSize(goi.wtout))
+	)
+	t.statsT.IncWith(stats.ErrGetSlowClientCount, vlabs)
+	cmn.SparseWarn(cos.ModAIS, t.statsT.Get(stats.ErrGetSlowClientCount), "(transmit)", goi.lom.Cname(), "err:", e)
 }
 
 func (goi *getOI) stats(written int64) {
@@ -2552,4 +2645,32 @@ func allocSnda() *sendArgs {
 func freeSnda(a *sendArgs) {
 	*a = snd0
 	sndPool.Put(a)
+}
+
+///////////////
+// wdlWriter //
+///////////////
+
+type wdeadliner interface {
+	SetWriteDeadline(time.Time) error // *http.response, *http.ResponseController
+}
+
+// buffered transmit:
+// - renew the deadline once per renewal size (cmn.XferRenewSize bytes) written (compare w/ backend rdl.Read)
+// - intentionally Write-only - masks the underlying writer's io.ReaderFrom, http.Flusher, etc.
+type wdlWriter struct {
+	w         io.Writer
+	rc        wdeadliner
+	tout      time.Duration
+	renewSize int64
+	n         int64 // bytes past the last renewal boundary (overshoot carries over; see Write)
+}
+
+func (d *wdlWriter) Write(p []byte) (n int, err error) {
+	n, err = d.w.Write(p)
+	if d.n += int64(n); err == nil && d.n >= d.renewSize {
+		d.n %= d.renewSize // keep the bytes past the boundary: renewal k at cumulative k*renewSize
+		err = d.rc.SetWriteDeadline(time.Now().Add(d.tout))
+	}
+	return n, err
 }

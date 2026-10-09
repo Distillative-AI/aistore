@@ -24,6 +24,7 @@ For the complete CLI syntax, see [CLI: configuration](/docs/cli/config.md). This
   - [Managing mountpaths](#managing-mountpaths)
   - [Reducing extended-attribute usage](#reducing-extended-attribute-usage)
   - [Upgrades and metadata backup](#upgrades-and-metadata-backup)
+  - [Minimum transfer rate](#minimum-transfer-rate)
   - [Production checklist](#production-checklist)
 - [For developers](#for-developers)
   - [Data model and update paths](#data-model-and-update-paths)
@@ -295,6 +296,9 @@ Two possibilities. The default for that setting changed in the new release and y
 **"`.ais.conf` doesn't contain the section I configured."**
 Expected - see [What AIStore stores on disk](#what-aistore-stores-on-disk). Verify with `ais config cluster SECTION --json`.
 
+**"Large GETs fail midway: truncated responses to some clients, or cold GETs failing with `remote GET timeout` (504)."**
+The transfer may have missed a write or read deadline: covered GET paths enforce a minimum transfer rate of 64 KiB/s per window (`timeout.send_file_time`) by default. See [Minimum transfer rate](#minimum-transfer-rate) for the window semantics and other possible causes.
+
 **"One target behaves differently from the others."**
 Compare `ais show config t[ID] inherited` against `ais config cluster`. In the flat output, any row with a value in the `DEFAULT` column is an override on that node.
 
@@ -425,6 +429,68 @@ Depending on node role this includes cluster maps, bucket metadata, rebalance st
 
 **Downgrade is not supported.** Configuration written by a newer release is not valid input to an older binary: starting with v5.0, an older version may refuse to start on a section it doesn't find, or reconstruct a different value for it. This has never been a supported operation in AIStore, but v5.0 makes the failure sharper. To return to the previous release, restore its matching metadata backup together with its binaries. See [v5.0 release notes](/docs/relnotes/5.0.md).
 
+### Minimum transfer rate
+
+> **Starting v5.2, covered GET paths enforce a minimum transfer rate by default, in both directions.**
+>
+> - **AIS => client:** a response that fails to transfer its next renewal size before the write deadline is aborted.
+> - **Cloud backend => AIS:** a remote read that fails to transfer its next renewal size before the read deadline has its request context canceled.
+>
+> The default minimum transfer rate is **64 KiB/s, averaged over each window**. To tolerate longer pauses, raise `timeout.send_file_time`; windows above ~17m also lower the rate (see the table below). Feature flag `Disable-GET-Deadline` disables both deadlines.
+
+**Terminology.**
+
+| Term | Meaning |
+| --- | --- |
+| deadline | per-transfer time limit: *write deadline* (AIS => client) and *read deadline* (cloud backend => AIS) |
+| window | `timeout.send_file_time` (default 5m, minimum 1m): the time allowed to transfer the next renewal size |
+| renewal size | window x 64 KiB/s, clamped to [1 MiB, 64 MiB]: each renewal size transferred renews the deadline for another window |
+| minimum transfer rate | renewal size / window: 64 KiB/s for windows up to ~17m, lower above that |
+
+**How it works.** Each covered response or remote reader starts with a deadline one window away. The deadline is renewed each time another renewal size (18.75 MiB at the default 5m window) has been transferred. The initial read deadline also covers response headers and SDK retries.
+
+The minimum transfer rate is averaged over a full window, not enforced as an instantaneous rate or checked every second. Transfers can burst, pause, or temporarily run slower, provided each renewal size completes before the current deadline.
+
+Short responses and the final partial renewal size need only finish within the current deadline; they can complete below 64 KiB/s. Each backend range reader starts its own window. For example, a default 4 MiB blob-download range can finish within five minutes at about 13.7 KiB/s without reaching the renewal size. The policy does not impose an aggregate bandwidth limit across readers.
+
+For backend reads, progress counts bytes consumed by AIS. Local processing, disk delays, and other pauses between reads count against the same deadline, so a timeout does not by itself prove that the backend was slow. Cancellation interrupts context-aware network requests; it cannot interrupt arbitrary local work.
+
+| Window (`timeout.send_file_time`) | Renewal size | Minimum transfer rate |
+| --- | --- | --- |
+| 1m (minimum) | 3.75 MiB | 64 KiB/s |
+| 5m (default) | 18.75 MiB | 64 KiB/s |
+| 15m | 56.25 MiB | 64 KiB/s |
+| 30m | 64 MiB (max) | ~36 KiB/s |
+| 1h | 64 MiB (max) | ~18 KiB/s |
+
+Above ~17m, the renewal size is capped at 64 MiB, and raising the window lowers the minimum transfer rate.
+
+**What is covered.**
+
+| Direction | Covered | Not covered |
+| --- | --- | --- |
+| AIS => client | GET of a whole object (both sendfile and buffered transmit) | range reads, reads from archives (shards), streaming cold GET |
+| Cloud backend => AIS | object readers from `aws`, `gcp`, `azure`, and `oci` buckets: cold GET, prefetch, blob download, copying and transforming remote buckets | remote AIS cluster (bounded end to end by `client.client_long_timeout`); PUT, list, and standalone HEAD requests to backends |
+
+**What you see when it fires.**
+
+- AIS => client: the client receives a truncated response (connection closed before `Content-Length` bytes). The target treats it as a client-side transmit error - not a local I/O error - counts it in `err.get.n` and `err.get.slow.client.n` (Prometheus: `err_get_slow_client_count`), and logs it (sparsely) as `slow reading client: sent less than <renewal size> in <window> (timeout.send_file_time)`.
+- Cloud backend => AIS: a read interrupted by the read deadline fails with `remote GET timeout: received less than <renewal size> in <window> (timeout.send_file_time)`. Each such remote read is counted once per backend in `err.<backend>.get.timeout.n` (Prometheus: `remote_get_timeout_count{backend="..."}`), regardless of the operation that issued it. A cold GET that has not yet sent its response fails with **504 Gateway Timeout** (native and S3 API); streaming cold GET may have already sent the response header, in which case the client receives a truncated response. Client GET failures are also counted in `err.get.n`; background operations also report through their job error counters. An existing parent timeout or cancellation retains its original error (not counted, no 504).
+
+**Changing it.**
+
+```console
+# loosen: e.g., 15m keeps the 64 KiB/s minimum transfer rate but tolerates longer pauses; 30m and above lowers it
+$ ais config cluster timeout.send_file_time=30m
+
+# disable both deadlines (note: replaces the entire feature set - include the flags already enabled)
+$ ais config cluster features Disable-GET-Deadline
+```
+
+Changes apply to new transfers. The flag disables the write and read deadlines only: other timeouts, including blob-download chunk timeouts, remain in force.
+
+Disabling is not recommended. Without these deadlines, a stalled client can hold the object's read lock, an open file, and a goroutine indefinitely. A stalled cold-GET backend can hold the object's *write* lock, blocking every access to that object unless another timeout or cancellation ends the operation.
+
 ### Production checklist
 
 | Area | Recommendation |
@@ -434,6 +500,7 @@ Depending on node role this includes cluster maps, bucket metadata, rebalance st
 | **Filesystem health** | Keep FSHC enabled unless you have a specific reason not to; tune its thresholds for the storage environment. See [FSHC](/docs/fshc.md). |
 | **TLS and authentication** | Configure public and intra-cluster TLS deliberately; configure token validation when authentication is enabled. See [HTTPS](/docs/https.md) and [Token validation](/docs/auth_validation.md). |
 | **Backends** | Enable only the providers you need; manage credentials through the environment's secret mechanism. See [Backend providers](/docs/providers.md). |
+| **Slow clients and backends** | Covered GET paths enforce write and read deadlines in both directions: a minimum transfer rate of 64 KiB/s per window by default. Raise the window (`timeout.send_file_time`) for legitimate slow transfers and pauses. See [Minimum transfer rate](#minimum-transfer-rate). |
 | **Memory** | Size `memsys` for the actual node. Never copy its settings between a development box and a production target. |
 | **Performance** | Size file-descriptor limits, networking, and filesystems for the intended workload. See [Performance](/docs/performance.md). |
 | **Templates** | Omit only reconstructible sections; keep bootstrap values and intentional choices explicit. |

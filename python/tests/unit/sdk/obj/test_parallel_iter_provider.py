@@ -6,6 +6,7 @@ import os
 import signal
 import multiprocessing as mp
 import unittest
+from multiprocessing import shared_memory
 from concurrent.futures.process import BrokenProcessPool
 from unittest.mock import Mock, patch
 
@@ -536,4 +537,22 @@ class TestParallelContentIterProviderReadAll(unittest.TestCase):
         result = provider.read_all()
         result.close()
         result.close()  # must not raise
+        self.assertEqual(mp.active_children(), [])
+
+    def test_read_all_close_with_a_view_still_exported(self):
+        """close() closes the descriptor while an existing view stays readable."""
+        provider = ParallelContentIterProvider(
+            self.mock_client, self.chunk_size, self.num_workers
+        )
+        result = provider.read_all()
+        name = result.name
+        descriptor = result._shm._fd  # pylint: disable=protected-access
+        with result.buf[:10] as view:
+            result.close()
+            self.assertEqual(bytes(view), self.expected[:10])
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+        with self.assertRaises(FileNotFoundError):
+            shared_memory.SharedMemory(name=name)
         self.assertEqual(mp.active_children(), [])

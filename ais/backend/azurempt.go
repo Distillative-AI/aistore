@@ -39,7 +39,7 @@ func azureBlockID(uploadID string, partNum int) string {
 	return base64.StdEncoding.EncodeToString(fmt.Appendf(nil, azureBlockIDFmt, uploadID, partNum))
 }
 
-func (*azbp) StartMpt(lom *core.LOM, _ *http.Request) (id string, ecode int, err error) {
+func (*azbp) StartMpt(_ context.Context, lom *core.LOM, _ *http.Request) (id string, ecode int, err error) {
 	// Azure doesn't have an explicit "start multipart upload" operation.
 	// Multipart upload is initiated by staging blocks, and we use a generated
 	// upload ID to track the block IDs for this upload session.
@@ -53,7 +53,8 @@ func (*azbp) StartMpt(lom *core.LOM, _ *http.Request) (id string, ecode int, err
 	return uploadID, 0, nil
 }
 
-func (azbp *azbp) PutMptPart(lom *core.LOM, r cos.ReadOpenCloser, _ *http.Request, uploadID string, _ int64, partNum int32) (string, int, error) {
+func (azbp *azbp) PutMptPart(ctx context.Context, lom *core.LOM, r cos.ReadOpenCloser, _ *http.Request, uploadID string, _ int64, partNum int32) (string, int, error) {
+	ctx = mptContext(ctx)
 	var (
 		cloudBck = lom.Bck().RemoteBck()
 		blURL    = azbp.u + "/" + cloudBck.Name + "/" + lom.ObjName
@@ -72,7 +73,7 @@ func (azbp *azbp) PutMptPart(lom *core.LOM, r cos.ReadOpenCloser, _ *http.Reques
 	rsc, ok := r.(io.ReadSeekCloser)
 	debug.Assertf(ok, "Azure backend requires io.ReadSeekCloser, but got %T", r)
 
-	_, err = client.StageBlock(context.Background(), blockID, rsc, nil)
+	_, err = client.StageBlock(ctx, blockID, rsc, nil)
 
 	if err != nil {
 		ecode, err := azureErrorToAISError(err, cloudBck, lom.ObjName)
@@ -87,7 +88,8 @@ func (azbp *azbp) PutMptPart(lom *core.LOM, r cos.ReadOpenCloser, _ *http.Reques
 	return "", 0, nil
 }
 
-func (azbp *azbp) CompleteMpt(lom *core.LOM, _ *http.Request, uploadID string, _ []byte, parts apc.MptCompletedParts) (version, etag string, _ int, _ error) {
+func (azbp *azbp) CompleteMpt(ctx context.Context, lom *core.LOM, _ *http.Request, uploadID string, _ []byte, parts apc.MptCompletedParts) (version, etag string, _ int, _ error) {
+	ctx = mptContext(ctx)
 	var (
 		cloudBck = lom.Bck().RemoteBck()
 		blURL    = azbp.u + "/" + cloudBck.Name + "/" + lom.ObjName
@@ -107,7 +109,7 @@ func (azbp *azbp) CompleteMpt(lom *core.LOM, _ *http.Request, uploadID string, _
 	}
 
 	// Commit the block list to create the final blob
-	resp, err := client.CommitBlockList(context.Background(), blockIDs, nil)
+	resp, err := client.CommitBlockList(ctx, blockIDs, nil)
 	if err != nil {
 		ecode, err := azureErrorToAISError(err, cloudBck, lom.ObjName)
 		return "", "", ecode, err
@@ -129,7 +131,7 @@ func (azbp *azbp) CompleteMpt(lom *core.LOM, _ *http.Request, uploadID string, _
 	return version, etag, 0, nil
 }
 
-func (*azbp) AbortMpt(lom *core.LOM, _ *http.Request, uploadID string) (ecode int, err error) {
+func (*azbp) AbortMpt(_ context.Context, lom *core.LOM, _ *http.Request, uploadID string) (ecode int, err error) {
 	// Azure doesn't have an explicit "abort multipart upload" operation.
 	// Uncommitted blocks are automatically garbage collected after 7 days.
 	// We could optionally try to list and delete uncommitted blocks here,
