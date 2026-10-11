@@ -73,6 +73,8 @@ import (
 //  2. Body-carrying requests without GetBody. Standard net/http cannot replay a request body across a
 //     307, and aws-sdk-go-v2 does not set GetBody by default. PUT / UploadPart therefore fail
 //     on redirect unless the client installs `addGetBodyMiddleware` (see TestS3ETag).
+//     Over HTTPS, the default trailing checksum also makes the body non-seekable. Clients from
+//     config.LoadDefaultConfig and s3manager.Uploader must set RequestChecksumCalculationWhenRequired.
 //
 // Listing (ListObjects, ListBuckets) never redirects at all - the proxy serves it end to
 // end - so listing tests need none of the above.
@@ -1087,6 +1089,7 @@ func TestS3SpecialObjectKeys(t *testing.T) {
 	cfg, err := config.LoadDefaultConfig(t.Context(),
 		config.WithCredentialsProvider(getS3Credentials(t)),
 		config.WithRegion(env.AwsDefaultRegion()),
+		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 	)
 	tassert.CheckFatal(t, err)
 	cfg.HTTPClient = newS3Client(false /*pathStyle*/)
@@ -1179,6 +1182,7 @@ func TestS3ObjMetadataLocal(t *testing.T) {
 		t.Context(),
 		config.WithCredentialsProvider(getS3Credentials(t)),
 		config.WithRegion(env.AwsDefaultRegion()),
+		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 	)
 	tassert.CheckFatal(t, err)
 	cfg.HTTPClient = newS3Client(false /*pathStyle*/)
@@ -1221,6 +1225,7 @@ func TestS3ObjMetadataLocal(t *testing.T) {
 		tassert.CheckFatal(t, err)
 		uploader := s3manager.NewUploader(s3Client, func(uploader *s3manager.Uploader) {
 			uploader.PartSize = partSize
+			uploader.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		})
 		_, err = uploader.Upload(t.Context(), &s3.PutObjectInput{
 			Bucket: aws.String(bck.Name), Key: aws.String(objName), Body: reader,
@@ -1361,6 +1366,95 @@ func TestS3ContentTypeGCP(t *testing.T) {
 	}
 }
 
+func TestS3ObjMetadataGCP(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: cliBck, RequiredCloudProvider: apc.GCP})
+
+	var (
+		bck             = cliBck
+		objName         = "metadata-" + trand.String(8)
+		metadata        = map[string]string{"env": "triage", "version": "1"}
+		requestMetadata = map[string]string{
+			"env": "triage", "version": "1",
+			"ais-cksum-type": "forged", "x-goog-meta-ais-cksum-val": "forged",
+		}
+		s3Client = s3.New(s3.Options{
+			HTTPClient:   newS3Client(true /*pathStyle*/),
+			Region:       env.AwsDefaultRegion(),
+			BaseEndpoint: aws.String(proxyURL),
+			UsePathStyle: true,
+			Credentials:  getS3Credentials(t),
+		}, func(options *s3.Options) {
+			options.APIOptions = append(options.APIOptions, func(stack *middleware.Stack) error {
+				return stack.Finalize.Add(&addGetBodyMiddleware{}, middleware.After)
+			})
+		})
+	)
+
+	checkS3 := func(t *testing.T) {
+		out, err := s3Client.HeadObject(t.Context(), &s3.HeadObjectInput{
+			Bucket: aws.String(bck.Name), Key: aws.String(objName),
+		})
+		tassert.CheckFatal(t, err)
+		for k, v := range metadata {
+			tassert.Errorf(t, out.Metadata[k] == v,
+				"S3 HEAD metadata %q: expected %q, got %q", k, v, out.Metadata[k])
+		}
+		for _, k := range []string{"ais-cksum-type", "ais-cksum-val"} {
+			tassert.Errorf(t, out.Metadata[k] != "forged",
+				"S3 HEAD returned forged checksum metadata %q=%q", k, out.Metadata[k])
+		}
+	}
+	checkNative := func(t *testing.T) {
+		op, err := api.HeadObjectV2(baseParams, bck, objName, apc.GetPropsCustom, api.HeadArgs{})
+		tassert.CheckFatal(t, err)
+		var userCount int
+		for k, v := range op.CustomMD {
+			if !strings.HasPrefix(k, aiss3.HeaderMetaPrefix) {
+				continue
+			}
+			userCount++
+			key := strings.ToLower(strings.TrimPrefix(k, aiss3.HeaderMetaPrefix))
+			tassert.Errorf(t, metadata[key] == v,
+				"native HEAD returned unexpected metadata %q=%q", k, v)
+		}
+		tassert.Errorf(t, userCount == len(metadata),
+			"native HEAD returned %d user metadata entries, expected %d: %v", userCount, len(metadata), op.CustomMD)
+	}
+
+	body := strings.NewReader("metadata round trip")
+	_, err := s3Client.PutObject(t.Context(), &s3.PutObjectInput{
+		Bucket: aws.String(bck.Name), Key: aws.String(objName), Body: body,
+		ContentLength: aws.Int64(int64(body.Len())), Metadata: requestMetadata,
+	})
+	tassert.CheckFatal(t, err)
+	t.Cleanup(func() { _ = api.DeleteObject(baseParams, bck, objName) })
+
+	t.Run("Warm", func(t *testing.T) {
+		checkS3(t)
+		checkNative(t)
+	})
+
+	// Eviction proves that subsequent checks reconstruct metadata from GCP,
+	// rather than from AIStore's cached LOM.
+	tassert.CheckFatal(t, api.EvictObject(baseParams, bck, objName))
+	t.Run("ColdHEAD", func(t *testing.T) {
+		checkS3(t)
+		checkNative(t)
+	})
+
+	t.Run("ColdNativeGET", func(t *testing.T) {
+		oah, err := api.GetObject(baseParams, bck, objName, nil)
+		tassert.CheckFatal(t, err)
+		attrs := oah.Attrs()
+		for k, v := range metadata {
+			key := http.CanonicalHeaderKey(aiss3.HeaderMetaPrefix + k)
+			tassert.Errorf(t, attrs.CustomMD[key] == v,
+				"native GET metadata %q: expected %q, got %q", key, v, attrs.CustomMD[key])
+		}
+		checkS3(t) // warm after the native cold GET
+	})
+}
+
 // export AWS_PROFILE=default; export AIS_ENDPOINT="http://localhost:8080"; export BUCKET="aws://..."; go test -v -run="TestS3ObjMetadata" -count=1 ./ais/test/.
 func TestS3ObjMetadata(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true, Bck: cliBck, RequiredCloudProvider: apc.AWS})
@@ -1443,6 +1537,7 @@ func TestS3ObjMetadata(t *testing.T) {
 		aisClient := s3.NewFromConfig(cfg)
 		uploader := s3manager.NewUploader(aisClient, func(uploader *s3manager.Uploader) {
 			uploader.PartSize = partSize
+			uploader.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 			uploader.ClientOptions = []func(*s3.Options){
 				func(opts *s3.Options) {
 					opts.BaseEndpoint = aws.String(proxyURL)
@@ -1647,6 +1742,7 @@ func TestS3JWTAuth(t *testing.T) {
 		context.Background(),
 		config.WithCredentialsProvider(getS3Credentials(t)),
 		config.WithRegion(env.AwsDefaultRegion()),
+		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 	)
 	tassert.CheckFatal(t, err)
 
