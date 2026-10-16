@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"math/bits"
 	"slices"
 	"strconv"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 )
 
 // Target placement weights (v5.2)
@@ -21,17 +23,11 @@ import (
 // - require a same-version cluster (see ais/pversion.go)
 
 // TODO, in order:
-// - primary startup: reconcile weights after mergeNodeProps, including targets that
-//   joined before any weighted peers; compute their mean from the recovered weighted set;
-//   reject pre-5.2 joiners before publishing a weighted Smap
-//
 // - weighted HRW: object placement only (HrwName2T, HrwHash2T, HrwTargetList);
 //   reduces to uniform HRW when not weighted; honors bucket placement.weighting
 //
 // - bucket placement.weighting: reject while node versions differ; rebalance the bucket on change
 //
-// - primary reelection: verify every Smap member's version before setting weights;
-//   an absent verMismatch entry may mean unknown; ordinary keepalives must refresh versions
 // - integration test: set, proportional, clear, restart, join
 // - API and CLI: show weights and normalized shares (`ais show cluster`); set weights
 // - Python SDK: get/set weights (quoted int64)
@@ -78,10 +74,11 @@ func (m *Smap) _mean(activeOnly bool) int64 {
 	)
 	for _, tsi := range m.Tmap {
 		w := tsi.PlacementWeight()
+		debug.Assert(w >= 0)
 		if w <= 0 || (activeOnly && tsi.InMaintOrDecomm()) {
 			continue
 		}
-		g = _gcd(g, w)
+		g = cos.GCD(g, w)
 		n++
 	}
 	if n == 0 {
@@ -101,6 +98,7 @@ func (m *Smap) _mean(activeOnly bool) int64 {
 	lo, carry = bits.Add64(lo, n/2, 0)
 	hi += carry
 	q, _ := bits.Div64(hi, lo, n)
+	debug.Assert(q > 0 && q <= math.MaxInt64/uint64(g))
 	return max(int64(q), 1) * g
 }
 
@@ -170,13 +168,14 @@ func (m *Smap) reducedWeights() map[string]int64 {
 			continue
 		}
 		w := tsi.PlacementWeight()
+		debug.Assert(w >= 0)
 		if n == 0 {
 			first = w
 		} else if w != first {
 			uniform = false
 		}
 		n++
-		g = _gcd(g, w)
+		g = cos.GCD(g, w)
 	}
 	if uniform || g == 0 {
 		return nil
@@ -188,13 +187,6 @@ func (m *Smap) reducedWeights() map[string]int64 {
 		}
 	}
 	return reduced
-}
-
-func _gcd(a, b int64) int64 {
-	for b != 0 {
-		a, b = b, a%b
-	}
-	return a
 }
 
 // formats weights and normalized shares of active targets, e.g. "t[a]=1(10.0%), t[b]=3(30.0%)"

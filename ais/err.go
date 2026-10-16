@@ -7,7 +7,9 @@ package ais
 import (
 	"errors"
 	"fmt"
+	"net/http"
 
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/core/meta"
 )
 
@@ -25,6 +27,12 @@ const (
 	fmtSelfNotPresent = "%s (self) not present in %s" // compare w/ errSelfNotFound
 
 	fmtErrInvIntraObj = "%s: intra-cluster %s(obj) failed sender validation (remaddr: %s, err: %v)"
+)
+
+// private rejection codes
+const (
+	tcodeKaliveRejected = "ErrKaliveRejected"
+	tcodeJoinRejected   = "ErrJoinRejected" // the joining node must fix its request (e.g., placement weight)
 )
 
 // error types
@@ -71,6 +79,7 @@ var (
 	errRebalanceDisabled = errors.New("rebalance is disabled")
 	errForwarded         = errors.New("forwarded")
 	errFastKalive        = errors.New("cannot fast-keepalive")
+	errKaliveRejected    = errors.New(tcodeKaliveRejected)
 
 	// sentinel - do not wrap; compare w/ errInvIntraControl
 	errNotIntraControl = errors.New("not an intra-control request")
@@ -80,6 +89,24 @@ var (
 
 // BMD uuid errs
 var errNoBMD = errors.New("no bucket metadata")
+
+// recognize admission failure separately from an unreachable primary
+func isErrKaliveRejected(err error) bool {
+	herr := cmn.AsErrHTTP(err)
+	return herr != nil && herr.Status == http.StatusConflict && herr.TypeCode == tcodeKaliveRejected
+}
+
+// reject join outright: retrying with the same request won't help
+func newErrJoinRejected(r *http.Request, err error) *cmn.ErrHTTP {
+	herr := cmn.NewErrHTTP(r, err, http.StatusBadRequest)
+	herr.TypeCode = tcodeJoinRejected
+	return herr
+}
+
+func isErrJoinRejected(err error) bool {
+	herr := cmn.AsErrHTTP(err)
+	return herr != nil && herr.Status == http.StatusBadRequest && herr.TypeCode == tcodeJoinRejected
+}
 
 func (e *errTgtBmdUUIDDiffer) Error() string { return e.detail }
 func (e *errBmdUUIDSplit) Error() string     { return e.detail }

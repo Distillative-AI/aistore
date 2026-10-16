@@ -25,6 +25,8 @@ There are two main configuration-managing commands, each with multiple subcomman
 
 > As always, subcommands will reveal themselves via tab completion (`<TAB-TAB>`).
 
+For assignment separators, quoting, and escapes, see [Name/value arguments](/docs/cli.md#namevalue-arguments).
+
 In brief:
 
 ```console
@@ -66,7 +68,7 @@ NAME:
      - 'ais config cluster log.modules none'          - reset log modules
 
 USAGE:
-   ais config cluster KEY=VALUE [KEY=VALUE...] [command options]
+   ais config cluster NAME=VALUE [NAME=VALUE...] [command options]
 
 OPTIONS:
    --json, -j   JSON input/output
@@ -91,7 +93,7 @@ NAME:
      - 'ais config node NODE disk.iostat_time_long=4s'  - update disk timing (in re: "disk utilization smoothing")
 
 USAGE:
-   ais config node NODE_ID KEY=VALUE [KEY=VALUE...] [command options]
+   ais config node NODE_ID NAME=VALUE [NAME=VALUE...] [command options]
 
 OPTIONS:
    --json, -j   JSON input/output
@@ -126,8 +128,8 @@ $ ais config cluster checksum
 # update one value (e.g., checksum type)
 $ ais config cluster checksum.type=md5
 
-# same using JSON-formatted values
-$ ais config cluster checksum.type='{"type":"md5"}'
+# update one or more values in a section (or sub-section) using JSON
+$ ais config cluster checksum='{"type":"md5","validate_warm_get":true}'
 ```
 
 More examples:

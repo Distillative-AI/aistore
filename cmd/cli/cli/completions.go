@@ -260,6 +260,33 @@ func suggestTargets(c *cli.Context)  { suggestNode(c, allTargets) }
 func suggestProxies(c *cli.Context)  { suggestNode(c, allProxies) }
 func suggestAllNodes(c *cli.Context) { suggestNode(c, allNodes) }
 
+func placementWeightsCompletions(c *cli.Context) {
+	pairs, err := parseNVPairs(c.Args(), nil)
+	if err != nil {
+		return // name awaiting its weight
+	}
+	assigned := make(map[string]struct{}, len(pairs))
+	for _, pair := range pairs {
+		if pair.Value == "" {
+			return // name awaiting its weight
+		}
+		assigned[meta.N2ID(pair.Name)] = struct{}{}
+	}
+	smap, err := getClusterMap(c)
+	if err != nil {
+		completionErr(c, err)
+		return
+	}
+	if _, set := assigned[placementRest]; !set {
+		fmt.Println(placementRest)
+	}
+	for tid := range smap.Tmap {
+		if _, set := assigned[tid]; !set {
+			fmt.Println(meta.Tname(tid))
+		}
+	}
+}
+
 func suggestAllNodesMulti(c *cli.Context) { suggestNodeMulti(c, allNodes, false /*inMaint*/) }
 
 func suggestNode(c *cli.Context, ty int) {
@@ -327,7 +354,9 @@ func suggestNodeMulti(c *cli.Context, ty int, inMaint bool) {
 func showClusterCompletions(c *cli.Context) {
 	switch c.NArg() {
 	case 0:
-		fmt.Println(apc.Proxy, apc.Target, cmdSmap, cmdBMD, cmdConfig, cmdShowStats, cmdCPU, cmdMemory)
+		for _, name := range []string{apc.Proxy, apc.Target, cmdSmap, cmdBMD, cmdConfig, cmdShowStats, cmdCPU, cmdMemory, cmdPlacement} {
+			fmt.Println(name)
+		}
 	case 1:
 		switch c.Args().Get(0) {
 		case apc.Proxy:
@@ -558,6 +587,16 @@ func bpropsFilterExtra(c *cli.Context, tag string) bool {
 	return false
 }
 
+// 'ais bucket props': subcommands and buckets, followed by property names
+func bpropsCmdCompletions(c *cli.Context) {
+	if c.NArg() == 0 {
+		fmt.Println(cmdSetBprops)
+		fmt.Println(cmdResetBprops)
+		fmt.Println(commandShow)
+	}
+	bucketCompletions(bcmplop{additionalCompletions: []cli.BashCompleteFunc{bpropCompletions}})(c)
+}
+
 func bucketAndPropsCompletions(c *cli.Context) {
 	opts := cmn.IterOpts{OnlyRead: true}
 	if c.NArg() == 0 {
@@ -624,7 +663,7 @@ func runningJobCompletions(c *cli.Context) {
 	case 0: // 1. NAME
 		if flagIsSet(c, allJobsFlag) {
 			names := xact.ListDisplayNames(false /*only-startable*/)
-			fmt.Println(strings.Join(names, " "))
+			fmt.Println(strings.Join(names, "\n"))
 			return
 		}
 		kindIDs, err := api.GetAllRunningXactions(apiBP, "")

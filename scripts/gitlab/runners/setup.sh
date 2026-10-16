@@ -80,6 +80,14 @@ if ! command -v gitlab-runner &>/dev/null; then
 fi
 
 configure_inotify_limits
+load_tls_module
+
+# Check if the runner is eligible for the `ktls` tag
+if "$SCRIPTS_DIR/../../check-ktls.sh"; then
+  echo "Runner is eligible for the 'ktls' tag"
+else
+  echo "Runner is not eligible for the 'ktls' tag"
+fi
 
 # Create a docker network for both the registry and the runner
 docker network inspect ci-net >/dev/null 2>&1 || \

@@ -23,6 +23,8 @@ Hit `<TAB>` after typing `aisÂ ` and Bash/Zsh completion reveals *namespaces* â€
 
 Drill into any namespace with `<TAB>` and `--help` to discover its verbs, flags, and usage examples.
 
+Commands that accept name/value assignments share [assignment and escaping rules](#namevalue-arguments).
+
 ### `ais show`
 
 Given an existing AIS instance, maybe the very first command you run would be `ais show cluster`. For example:
@@ -76,6 +78,7 @@ Next, monitoring-wise, you'd maybe run `ais show performance`, etc.
 - [Backend Provider](#backend-provider)
 - [Verbose errors](#verbose-errors)
 - [Special keywords](#special-keywords)
+- [Name/value arguments](#namevalue-arguments)
 - [CLI Help Paging](#cli-help-paging)
 
 AIS command-line interface (CLI) is a tool to easily manage and monitor every aspect of the AIS clusters' lifecycle.
@@ -373,6 +376,188 @@ Error: {"tcode":"ErrBckNotFound","message":"bucket \"ais://ddd\" does not exist"
 4. slices (a.k.a. multi-value fields) embedded in nested configuration structures (e.g., "auth.required_claims.aud", "auth.oidc.allowed_iss", etc.).
 
 and more.
+
+## Name/value arguments
+
+Commands that set cluster, node, or CLI configuration, bucket properties, object custom
+metadata, mountpaths, remote-cluster aliases, or target placement weights share the
+same name/value syntax.
+
+### Assignment forms
+
+The following are equivalent:
+
+```console
+ais config cluster log.level=4
+ais config cluster log.level 4
+ais config cluster log.level= 4
+ais config cluster log.level =4
+ais config cluster log.level = 4
+ais config cluster "log.level = 4"
+```
+
+Whitespace around `=` is ignored. Separate assignments with whitespace; forms can be
+mixed within one command:
+
+```console
+ais config cluster log.level=4 space.highwm 90 checksum.type = md5
+ais bucket props set ais://bucket mirror.enabled=true mirror.copies 2 checksum.type=md5
+```
+
+Commas are part of a value, as in `log.modules=ec,xs`; they do not separate
+assignments.
+
+### Quoting and spaces
+
+The shell removes quotes and keeps each quoted string together as one argument, so
+names and values may contain spaces. Quote the value, the name, or the entire
+assignment:
+
+```console
+ais bucket props set ais://bucket extra.custom="owner: team-a; project: research"
+ais object set-custom ais://bucket/obj "display name"="two words" owner=team-a
+ais object set-custom ais://bucket/obj "display name" "two words"
+ais object set-custom ais://bucket/obj "display name = two words"
+```
+
+All three `set-custom` commands store the name `display name` with the value
+`two words`.
+
+### Values containing `=`
+
+The first unescaped `=` separates the name and value. Additional `=` characters in
+the value are literal:
+
+```console
+ais object set-custom ais://bucket/obj query="a=1&b=2"
+ais object set-custom ais://bucket/obj query "a=1&b=2"
+ais cluster remote-attach remais=https://remais.example.com:51080
+```
+
+To include `=` in a name, escape it with a backslash:
+
+```console
+ais object set-custom ais://bucket/obj 'name\=with\ spaces=value\=with\ spaces'
+```
+
+This stores the name `name=with spaces` and value `value=with spaces`. The parser
+recognizes `\=`, backslash followed by whitespace, and `\\` (a literal backslash).
+Other backslash sequences are retained. Escaped whitespace at the beginning or end
+of a name or value is retained; unescaped boundary whitespace is ignored.
+
+Use single quotes to keep these backslashes from being consumed by the shell, or
+escape the backslashes themselves. Shell quoting alone cannot protect `=` in a name:
+`'name=value'` still reaches the CLI as an assignment.
+
+Object-metadata HEAD responses currently use unescaped `key=value` headers, so
+metadata names containing `=` cannot be read back faithfully through HEAD. Use
+spaces in metadata names and keep literal `=` in their values until that format
+supports escaping; CLI parsing does not change the response format.
+
+### Empty values
+
+Use an empty value to clear a property that supports resetting:
+
+```console
+ais bucket props set s3://bucket extra.aws.endpoint=
+ais bucket props set s3://bucket extra.aws.endpoint ""
+ais bucket props set s3://bucket extra.aws.endpoint="" checksum.type=md5
+```
+
+`name= other=value` means an empty `name` value followed by a second assignment.
+For a single value containing `=`, use `name other=value`, `name = other=value`, or
+escape that `=` when continuing after `name=`. To reset a value before another
+space-separated pair, use an explicit empty argument: `name "" other value`.
+
+Configuration and bucket-property commands treat a known property assignment that
+follows a bare name as a missing value: `checksum.type mirror.enabled=true` reports
+a missing `checksum.type` value. To store such text literally, keep it in the same
+argument as its name: `extra.custom=checksum.type=md5`.
+
+### List values
+
+Feature flags, log modules, and bucket access permissions accept several members.
+Separate members with commas or whitespace within one argument, or pass them as
+separate arguments:
+
+```console
+ais config cluster log.modules="ec xs"
+ais config cluster log.modules=ec,xs
+ais config cluster log.modules ec xs log.level=4
+ais config cluster features="S3-API-via-Root Disable-Cold-GET"
+ais bucket props set ais://bucket access="GET PUT HEAD-OBJECT" checksum.type=md5
+ais bucket props set ais://bucket access GET PUT checksum.type md5
+```
+
+Use `none` to reset a list:
+
+```console
+ais config cluster log.modules=none
+ais config cluster features=none
+```
+
+When members are separate arguments, the list ends at the next property name.
+Configuration and bucket-property commands reject any other argument that is not a
+member of the list, e.g. `invalid access value "HEAD"`.
+
+### Assignments in a flag
+
+A flag such as `--props` takes several assignments in one string. The string is
+split at unescaped whitespace, so escape spaces that belong to a value; JSON values
+are kept whole:
+
+```console
+ais bucket create ais://bucket --props "checksum.type=md5 mirror.enabled=true mirror.copies=2"
+ais bucket create ais://bucket --props 'checksum.type = md5 extra.custom=owner:\ team-a'
+ais bucket create ais://bucket --props 'extra.custom={"team": "a b"} checksum.type=md5'
+```
+
+### JSON
+
+Bucket-property and object-metadata commands also accept a single JSON object
+instead of name/value pairs:
+
+```console
+ais bucket props set ais://bucket '{"mirror":{"enabled":true,"copies":2},"checksum":{"type":"md5"}}'
+ais bucket create ais://bucket --props '{"checksum":{"type":"md5"}}'
+ais object set-custom ais://bucket/obj '{"owner":"team-a","query":"a=1&b=2"}'
+```
+
+Cluster configuration accepts JSON values for a section or sub-section. The name is
+a path, and the JSON value is applied at that path:
+
+```console
+ais config cluster checksum='{"type":"md5","validate_warm_get":true}'
+ais config cluster space '{"highwm":92,"lowwm":80}'
+ais config cluster net.http='{"idle_conns":64}'
+```
+
+When JSON paths overlap, the more specific path overrides its enclosing section, regardless of argument order.
+
+Leaf names take plain values: `checksum.type=md5`, not `checksum.type='{"type":"md5"}'`.
+JSON and plain values cannot be mixed in one command. Node configuration accepts
+plain values only.
+
+Elsewhere, a JSON value is opaque: its quotes and backslashes are preserved as is.
+For example, the following stores the JSON text verbatim as object metadata:
+
+```console
+ais object set-custom ais://bucket/obj labels='{"team":"a b","tier":"hot"}'
+```
+
+### Placement weights, mountpaths, remote clusters
+
+The same forms apply to node IDs and aliases. Quote node IDs, since `[...]` is a
+glob pattern in most shells:
+
+```console
+ais cluster placement set-weights 't[abc]=3' 't[def]' 1 rest=2
+ais storage mountpath attach 't[abc]=/mnt/disk1'
+ais storage mountpath attach 't[abc]' /mnt/disk1 't[def]=/mnt/disk2'
+ais cluster remote-attach remais https://remais.example.com:51080
+```
+
+Placement weights are scalar: each target takes exactly one value.
 
 ## CLI Help Paging
 

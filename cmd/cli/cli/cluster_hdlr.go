@@ -92,6 +92,12 @@ const setPrimaryUsage = "Select a new primary proxy/gateway.\n" +
 	indent1 + "\t- 'AIS_ENDPOINT=http://SRC:PORT ais cluster set-primary p[dst] http://DST:PORT --force'\t- same, with the source endpoint explicit.\n" +
 	indent1 + "After cross-cluster force-join, re-enable rebalance and consider 'ais start rebalance' and, for remote backends, 'ais prefetch'."
 
+const remoteAttachUsage = "Attach remote ais cluster, e.g.:\n" +
+	indent1 + "\t- 'ais cluster remote-attach remais=https://remais.example.com:51080'\t- attach under alias 'remais';\n" +
+	indent1 + "\t- 'ais cluster remote-attach remais https://remais.example.com:51080'\t- same;\n" +
+	indent1 + "\t- 'ais show remote-cluster'\t- show attached clusters.\n" +
+	nvUsageRef
+
 var (
 	clusterCmdsFlags = map[string][]cli.Flag{
 		cmdCluAttach: {},
@@ -108,6 +114,7 @@ var (
 		cmdJoin: {
 			roleFlag,
 			nonElectableFlag,
+			joinWeightFlag,
 		},
 		cmdStartMaint: {
 			noRebalanceFlag,
@@ -168,7 +175,7 @@ var (
 			}),
 			{
 				Name:      cmdCluAttach,
-				Usage:     "Attach remote ais cluster",
+				Usage:     remoteAttachUsage,
 				ArgsUsage: attachRemoteAISArgument,
 				Flags:     sortFlags(clusterCmdsFlags[cmdAttach]),
 				Action:    attachRemoteAISHandler,
@@ -271,6 +278,7 @@ var (
 					},
 				},
 			},
+			placementCmd,
 			{
 				Name:         cmdResetStats,
 				Usage:        "Reset cluster or node stats (all cumulative metrics or only errors)",
@@ -433,6 +441,13 @@ func joinNodeHandler(c *cli.Context) (err error) {
 	}
 
 	var flags cos.BitFlags
+	if flagIsSet(c, joinWeightFlag) {
+		weight := c.Int64(joinWeightFlag.Name)
+		if daemonType != apc.Target || weight <= 0 {
+			return fmt.Errorf("option %s requires a positive target placement weight", qflprn(joinWeightFlag))
+		}
+		nodeInfo.SetPlacementWeight(weight)
+	}
 	if flagIsSet(c, nonElectableFlag) {
 		if daemonType == apc.Target {
 			return fmt.Errorf("option %s does not apply - targets are non-electable", qflprn(nonElectableFlag))

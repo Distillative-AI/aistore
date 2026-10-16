@@ -42,11 +42,6 @@ const (
 
 const hdbPerItem = 10 * time.Millisecond // head-batch: timeout budget per requested object
 
-type delb struct {
-	obck    *meta.Bck
-	present bool
-}
-
 func (t *target) joinCluster(action string, primaryURLs ...string) (status int, err error) {
 	var cm *cluMeta
 	cm, status, err = t.htrun.joinCluster(t /*htext*/, primaryURLs)
@@ -863,10 +858,11 @@ skip:
 		createErrs []error
 		nilbmd     = bmd.version() == 0 || t.regstate.prevbmd.Load()
 	)
-	newBMD.Range(nil, nil, func(bck *meta.Bck) bool {
-		if _, present := bmd.Get(bck); present {
+	newBMD.RangeProps(func(name, provider string, ns cmn.Ns, props *cmn.Bprops) bool {
+		if _, present := bmd.Providers[provider][ns.Uname()][name]; present {
 			return false
 		}
+		bck := meta.NewBck(name, provider, ns, props)
 		errs := fs.CreateBucket(bck.Bucket(), nilbmd)
 		if len(errs) > 0 {
 			createErrs = append(createErrs, errs...)
@@ -891,14 +887,15 @@ skip:
 		rmbcks      []*meta.Bck
 		emsg        string
 	)
-	bmd.Range(nil, nil, func(obck *meta.Bck) bool {
-		f := &delb{obck: obck}
-		newBMD.Range(nil, nil, f.do)
-		if !f.present {
-			rmbcks = append(rmbcks, obck)
-			if errD := fs.DestroyBucket("recv-bmd-"+msg.Action, obck.Bucket(), obck.Props.BID); errD != nil {
-				destroyErrs = append(destroyErrs, errD)
-			}
+	bmd.RangeProps(func(name, provider string, ns cmn.Ns, oprops *cmn.Bprops) bool {
+		if nprops, present := newBMD.Providers[provider][ns.Uname()][name]; present {
+			_abortDisabled(name, provider, ns, oprops, nprops)
+			return false
+		}
+		obck := meta.NewBck(name, provider, ns, oprops)
+		rmbcks = append(rmbcks, obck)
+		if errD := fs.DestroyBucket("recv-bmd-"+msg.Action, obck.Bucket(), obck.Props.BID); errD != nil {
+			destroyErrs = append(destroyErrs, errD)
 		}
 		return false
 	})
@@ -909,23 +906,19 @@ skip:
 	return rmbcks, oldVer, emsg, nil
 }
 
-func (f *delb) do(nbck *meta.Bck) bool {
-	if !f.obck.Equal(nbck, false /*same BID*/, false /* same backend */) {
-		return false // keep going
-	}
-	f.present = true
-
-	// assorted props changed?
-	if f.obck.Props.Mirror.Enabled && !nbck.Props.Mirror.Enabled {
+// abort mirroring and EC encoding disabled by the new BMD
+func _abortDisabled(name, provider string, ns cmn.Ns, oprops, nprops *cmn.Bprops) {
+	if oprops.Mirror.Enabled && !nprops.Mirror.Enabled {
+		nbck := meta.NewBck(name, provider, ns, nprops)
 		flt := xreg.Flt{Kind: apc.ActPutCopies, Bck: nbck}
 		xreg.DoAbort(&flt, errors.New("apply-bmd"))
 		// NOTE: apc.ActMakeNCopies takes care of itself
 	}
-	if f.obck.Props.EC.Enabled && !nbck.Props.EC.Enabled {
+	if oprops.EC.Enabled && !nprops.EC.Enabled {
+		nbck := meta.NewBck(name, provider, ns, nprops)
 		flt := xreg.Flt{Kind: apc.ActECEncode, Bck: nbck}
 		xreg.DoAbort(&flt, errors.New("apply-bmd"))
 	}
-	return true // break
 }
 
 func (t *target) _postBMD(newBMD *bucketMD, tag string, rmbcks []*meta.Bck) {

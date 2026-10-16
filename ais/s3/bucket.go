@@ -11,7 +11,6 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
-	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
 )
 
@@ -23,6 +22,8 @@ type (
 		Ns      string    `xml:"xmlns,attr"`
 		Owner   BckOwner  `xml:"Owner"`
 		Buckets []*Bucket `xml:"Buckets>Bucket"`
+
+		names map[string]*Bucket // name => last added (see Add)
 	}
 	BckOwner struct {
 		ID   string `xml:"ID"`
@@ -55,26 +56,26 @@ func NewListBucketResult() (r *ListBucketResult) {
 		Ns:      s3Namespace,
 		Owner:   BckOwner{Name: "ListAllMyBucketsResult"},
 		Buckets: make([]*Bucket, 0, 8),
+		names:   make(map[string]*Bucket, 8),
 	}
 	r.Owner.ID = "1" // to satisfy s3
 	return
 }
 
-func (r *ListBucketResult) Add(bck *meta.Bck) {
+func (r *ListBucketResult) Add(name, provider string, created int64) {
 	var warn string
-	for _, b := range r.Buckets {
-		if b.Name == bck.Name {
-			// NOTE: when bck.Name is not unique
-			warn = fmt.Sprintf(" (WARNING: {%s, %s} and {%s, Provider: %s} share the same name)",
-				b.Name, b.String, bck.Name, bck.Provider)
-		}
+	if prev, ok := r.names[name]; ok {
+		// NOTE: when name is not unique
+		warn = fmt.Sprintf(" (WARNING: {%s, %s} and {%s, Provider: %s} share the same name)",
+			prev.Name, prev.String, name, provider)
 	}
 	b := &Bucket{
-		Name:    bck.Name,
-		Created: cos.FormatTime(time.Unix(0, bck.Props.Created), cos.ISO8601),
-		String:  "Provider: " + bck.Provider + warn,
+		Name:    name,
+		Created: cos.FormatTime(time.Unix(0, created), cos.ISO8601),
+		String:  "Provider: " + provider + warn,
 	}
 	r.Buckets = append(r.Buckets, b)
+	r.names[name] = b
 }
 
 func (r *ListBucketResult) MustMarshal(sgl *memsys.SGL) {

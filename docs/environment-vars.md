@@ -153,11 +153,13 @@ This group of environment variables is used exclusively by development scripts a
 
 | name         | comment |
 |--------------|---------|
+| `AIS_SKIP_IP_DISCOVERY` | when true in a local playground (`test_fspaths.count > 0`), skip interface discovery and use loopback (`127.0.0.1` or `::1`); MTU remains unknown |
 | `NUM_TARGET` | number of targets in a test cluster |
 | `NUM_PROXY`  | number of proxies (gateways) in a test cluster |
 | `NUM_CHUNKS` | when greater than zero, specifies the number of chunks each new PUT operation will produce |
 | `SIGN_HMAC`  | when "true", enables HMAC signing and validation of all HTTP redirects |
 | `RAND_NS`  | when "true", generate buckets with random namespaces, e.g.: `ais://#ns123/bucket1`, `s3://#ns456/bucket2`, etc.  |
+| `AIS_FEATURES` | initial cluster feature flags as a decimal number, e.g.: `268435456` enables `System-Reserved-KTLS` |
 
 See also:
 * [scripts/clean_deploy.sh](https://github.com/NVIDIA/aistore/blob/main/scripts/clean_deploy.sh)

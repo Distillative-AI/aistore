@@ -427,6 +427,10 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 	si := p.si.Clone()
 	smap.Primary = si
 	smap.addProxy(si)
+	p.primary().startingUp = true
+	if loadedSmap != nil && loadedSmap.IsWeighted() {
+		p.primary().wver.Store(-1)
+	}
 	if loadedSmap != nil {
 		smap.UUID = loadedSmap.UUID
 		smap.Version = loadedSmap.Version
@@ -445,6 +449,7 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 			}
 			maxVerSmap.Pmap[p.SID()] = p.si
 			p.owner.smap.put(maxVerSmap)
+			p.clearRegpool()
 			nlog.Infof("%s: change-of-mind #1: joining via %s[P])", p.si, maxVerSmap.Primary.StringEx())
 			if err := p.secondaryStartup(maxVerSmap); err != nil {
 				cos.ExitLogf("%s: %v", cmn.BadSmapPrefix, err)
@@ -453,6 +458,7 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 		}
 	}
 
+	p.owner.smap.mu.Lock()
 	smap = p.owner.smap.get()
 	haveJoins = smap.CountTargets() > 0 || smap.CountProxies() > 1
 
@@ -466,14 +472,27 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 			before, after cluMeta
 			added         int
 		)
-		p.owner.smap.mu.Lock()
-
 		// NOTE: use regpool to try to upgrade all the four revs: Smap, BMD, RMD, and global Config
 		before.Smap, before.BMD, before.RMD, before.EtlMD = smap, p.owner.bmd.get(), p.owner.rmd.get(), p.owner.etl.get()
 		before.Config, _ = p.owner.config.get()
 
 		forcePrimaryChange := prim.isCfg || prim.isEP
 		smap = p.regpoolMaxVer(&before, &after, forcePrimaryChange)
+		if !smap.isPrimary(p.si) {
+			p.owner.smap.put(smap)
+			p.owner.smap.mu.Unlock()
+			p.clearRegpool()
+			nlog.Infof("%s: change-of-mind #3: joining via %s", p, smap.Primary.StringEx())
+			if err := p.secondaryStartup(smap); err != nil {
+				cos.ExitLogf("%s: %v", cmn.BadSmapPrefix, err)
+			}
+
+			// TODO:
+			// - nodes admitted prior to change-of-mind (#1, #3) never get Smap from us (no step-2 metasync);
+			// - those nodes may wait out `join_startup_time` for the promised Smap and exit (K8s restart => clean rejoin)
+			// - fix on the joining node's side likely requires not marking cluster-started until Smap is valid
+			return
+		}
 
 		uuid, created = smap.UUID, smap.CreationTime
 
@@ -493,13 +512,14 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 		nlog.Infoln("after: ", smap.StringEx())
 		wg.Wait()
 	} else {
+		if loadedSmap != nil {
+			smap = loadedSmap
+			p.owner.smap.put(smap)
+		}
+		p.owner.smap.mu.Unlock()
 		nlog.Infoln(p.String() + ": no registrations yet")
 		if loadedSmap != nil {
 			nlog.Infoln(p.String()+": keep going w/ local", loadedSmap.StringEx())
-			p.owner.smap.mu.Lock()
-			smap = loadedSmap
-			p.owner.smap.put(smap)
-			p.owner.smap.mu.Unlock()
 		}
 	}
 
@@ -507,7 +527,7 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 	p.discoverMeta(smap)
 
 	// 4: still primary?
-	p.owner.smap.mu.Lock()
+	p.owner.smap.mu.Lock() // -------------------------------------------- begin
 	smap = p.owner.smap.get()
 	if !smap.isPrimary(p.si) {
 		p.owner.smap.mu.Unlock()
@@ -516,6 +536,16 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 			cos.ExitLog(err)
 		}
 		return
+	}
+
+	// 4.5: resolve placement weights (added in v5.2)
+	s, placementMsgs := p.startupWeights(smap)
+	if primary := p.primary(); primary.wver.Load() != 0 || smap.IsWeighted() {
+		primary.wver.Store(s.Version)
+	}
+	if s != smap {
+		p.owner.smap.put(s)
+		smap = s
 	}
 
 	// 5:  persist and finalize w/ sync + BMD
@@ -547,7 +577,10 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 	if err := p.owner.smap.persist(smap); err != nil {
 		cos.ExitLog(p.String(), "(primary):", err)
 	}
-	p.owner.smap.mu.Unlock()
+	p.owner.smap.mu.Unlock() // ----------------------------------------------- end
+	for _, msg := range placementMsgs {
+		nlog.Errorln(msg)
+	}
 
 	// 7. initialize BMD
 	bmd := p.owner.bmd.get().clone()
@@ -595,17 +628,80 @@ func (p *proxy) primaryStartup(loadedSmap *smapX, config *cmn.Config, ntargets i
 	}
 
 	// 12. clear regpool
-	primary := p.primary()
-	primary.reg.mpl.Lock()
-	primary.reg.pool = primary.reg.pool[:0]
-	primary.reg.pool = nil
-	primary.reg.mpl.Unlock()
+	p.clearRegpool()
 
 	// 13. resume rebalance if needed
 	if config.Rebalance.Enabled {
 		p.resumeReb(smap, config)
 	}
 	p.owner.rmd.starting.Store(false)
+}
+
+func (p *proxy) clearRegpool() {
+	primary := p.primary()
+	primary.reg.mpl.Lock()
+	primary.reg.pool = nil
+	primary.reg.mpl.Unlock()
+}
+
+// resolve unweighted targets once the Smap is assembled (under Smap lock)
+// - weighted when a super-majority of targets is: assign the mean to the rest
+// - otherwise, or when the resulting weights are invalid: start unweighted
+// - remove pre-5.2 members before counting weights; return diagnostics to log after unlocking
+func (p *proxy) startupWeights(smap *smapX) (*smapX, []string) {
+	p.primary().startingUp = false
+	if !smap.IsWeighted() {
+		return smap, nil
+	}
+
+	clone := smap.clone()
+	msgs := p._rmPre52(clone)
+	if !clone.IsWeighted() {
+		return clone, msgs
+	}
+	var (
+		n, nw   = len(clone.Tmap), 0
+		mean    = clone.MeanPlacementWeight()
+		weights = make(map[string]int64, n)
+	)
+	for tid, tsi := range clone.Tmap {
+		w := tsi.PlacementWeight()
+		if w > 0 {
+			nw++
+		} else {
+			w = mean
+		}
+		weights[tid] = w
+	}
+
+	// use weighted placement if there's a strict supermajority
+	// otherwise, clear weights and log an error
+	if nw < n*2/3+1 {
+		msgs = append(msgs, fmt.Sprintf("%s starting unweighted: %d out of %d targets are weighted (no super-majority)", p, nw, n))
+		_clearWeights(clone)
+		clone.Version++
+		return clone, msgs
+	}
+	if _, err := meta.CheckPlacementWeights(weights); err != nil {
+		msgs = append(msgs, fmt.Sprintf("%s starting unweighted: %v", p, err))
+		_clearWeights(clone)
+		clone.Version++
+		return clone, msgs
+	}
+	if len(msgs) == 0 && nw == n {
+		return smap, nil
+	}
+	for tid, tsi := range clone.Tmap {
+		tsi.SetPlacementWeight(weights[tid])
+	}
+	clone.Version++
+	return clone, msgs
+}
+
+func _clearWeights(clone *smapX) {
+	for _, tsi := range clone.Tmap {
+		tsi.SetPlacementWeight(0)
+	}
 }
 
 func _newCluUUID() (uuid, creationTime string) {
@@ -1076,18 +1172,114 @@ func (p *proxy) bcastMaxVerBestEffort(smap *smapX) *smapX {
 	return nil
 }
 
-func (p *proxy) regpoolMaxVer(before, after *cluMeta, forcePrimaryChange bool) (smap *smapX) {
-	var (
-		voteInProgress bool
-		cloned         bool
-	)
+// reconcile registration metadata and finalize the startup Smap under the caller's Smap lock
+func (p *proxy) regpoolMaxVer(before, after *cluMeta, forcePrimaryChange bool) *smapX {
+	voteInProgress := p.regpoolMeta(before, after)
+	if !voteInProgress && !forcePrimaryChange {
+		local := p.owner.smap.get()
+		primary := p.primary()
+		primary.reg.mpl.RLock()
+		nreg := len(primary.reg.pool)
+		primary.reg.mpl.RUnlock()
+
+		confirmed := p.regpoolConfirmPrimary(before.Smap, after.Smap)
+
+		primary.reg.mpl.RLock()
+		changed := p.owner.smap.get() != local || len(primary.reg.pool) != nreg
+		primary.reg.mpl.RUnlock()
+		if changed {
+			// the handshake released the Smap lock: recover current state before deciding
+			// - re-apply node props merged from the loaded Smap (flags, weights)
+			before.Smap = p.owner.smap.get().mergeNodeProps(before.Smap)
+			before.BMD, before.RMD, before.EtlMD = p.owner.bmd.get(), p.owner.rmd.get(), p.owner.etl.get()
+			before.Config, _ = p.owner.config.get()
+			voteInProgress = p.regpoolMeta(before, after)
+		}
+		// reuse the confirmation only if it covers the latest recovered leadership
+		if confirmed != nil && !voteInProgress && after.Smap.validate() == nil &&
+			after.Smap.Primary.IsProxy() && !after.Smap.Primary.InMaintOrDecomm() &&
+			after.Smap.UUID == confirmed.UUID && after.Smap.Primary.ID() == confirmed.Primary.ID() &&
+			after.Smap.Version <= confirmed.Version {
+			return confirmed
+		}
+	}
+
+	// not interfering with elections
+	if voteInProgress {
+		before.Smap.UUID, before.Smap.CreationTime = after.Smap.UUID, after.Smap.CreationTime
+		nlog.Errorln("voting is in progress, continuing with potentially older", before.Smap.StringEx())
+		return before.Smap
+	}
+
+	runtime.Gosched()
+
+	return p.regpoolSmap(before, after, forcePrimaryChange)
+}
+
+// confirm recovered leadership, temporarily releasing the caller's Smap lock
+func (p *proxy) regpoolConfirmPrimary(local, recovered *smapX) *smapX {
+	if recovered.Primary == nil || !recovered.Primary.IsProxy() || recovered.isPrimary(p.si) {
+		return nil
+	}
+	if err := recovered.validate(); err != nil || recovered.Primary.InMaintOrDecomm() {
+		return nil
+	}
+	psi := recovered.Primary
+	if fresh := local.GetProxy(psi.ID()); fresh != nil {
+		psi = fresh // recovered Smap may carry obsolete endpoints and verifying key
+	}
+	if err := psi.Validate(); err != nil {
+		return nil
+	}
+
+	p.owner.smap.mu.Unlock()
+	defer p.owner.smap.mu.Lock()
+
+	cargs := allocCargs()
+	cargs.si = psi
+	cargs.req = cmn.HreqArgs{
+		Method: http.MethodGet,
+		Path:   apc.URLPathDae.S,
+		Query:  url.Values{apc.QparamWhat: []string{apc.WhatSmapVote}},
+	}
+	cargs.timeout = cmn.Rom.CplaneOperation()
+	cargs.cresv = cresjGeneric[cluMeta]{}
+	res := p.call(cargs, local)
+	freeCargs(cargs)
+	defer freeCR(res)
+	if res.err != nil {
+		nlog.Warningf("%s: cannot confirm primary %s: %v - proceeding with primary startup", p, psi, res.err)
+		return nil
+	}
+
+	cm := res.v.(*cluMeta)
+	smap := cm.Smap
+	if cm.SI.Validate() != nil || !cm.SI.IsProxy() || cm.SI.ID() != psi.ID() || cm.SI.NetEq(psi) != nil ||
+		!cm.Flags.IsSet(cos.ClusterStarted) || cm.Flags.IsSet(cos.VoteInProgress) || smap.validate() != nil {
+		return nil
+	}
+	if !smap.Primary.IsProxy() || !smap.isPrimary(cm.SI) || smap.Primary.InMaintOrDecomm() ||
+		smap.Primary.NetEq(cm.SI) != nil || smap.UUID != recovered.UUID || smap.Version < recovered.Version {
+		return nil
+	}
+	if _, err := smap.IsDupNet(p.si); err != nil {
+		nlog.Warningf("%s: cannot adopt confirmed %s: %v - proceeding with primary startup", p, smap, err)
+		return nil
+	}
+	smap.Pmap[p.SID()] = p.si
+	return smap
+}
+
+// recover max-version metadata from registrations and apply BMD, RMD, and config updates
+func (p *proxy) regpoolMeta(before, after *cluMeta) (voteInProgress bool) {
 	*after = *before
 
 	primary := p.primary()
 	primary.reg.mpl.RLock()
+	defer primary.reg.mpl.RUnlock()
 
 	if len(primary.reg.pool) == 0 {
-		goto ret
+		return false
 	}
 	for _, regReq := range primary.reg.pool {
 		nsi := regReq.SI
@@ -1156,17 +1348,13 @@ func (p *proxy) regpoolMaxVer(before, after *cluMeta, forcePrimaryChange bool) (
 		}
 	}
 
-ret:
-	primary.reg.mpl.RUnlock()
+	return voteInProgress
+}
 
-	// not interfering with elections
-	if voteInProgress {
-		before.Smap.UUID, before.Smap.CreationTime = after.Smap.UUID, after.Smap.CreationTime
-		nlog.Errorln("voting is in progress, continuing with potentially older", before.Smap.StringEx())
-		return before.Smap
-	}
-
-	runtime.Gosched()
+// reconcile joining nodes and finalize primary ownership, Smap version, and primary URL
+func (p *proxy) regpoolSmap(before, after *cluMeta, forcePrimaryChange bool) *smapX {
+	var cloned bool
+	primary := p.primary()
 
 	// NOTE [ref0417]:
 	// - always update joining nodes' net-infos;
@@ -1174,7 +1362,7 @@ ret:
 
 	primary.reg.mpl.RLock()
 	for _, regReq := range primary.reg.pool {
-		after.Smap, cloned = _updSnode(after.Smap, regReq.SI, cloned)
+		after.Smap, cloned = _updSnode(after.Smap, regReq.SI, cloned, regReq.JoinWeight)
 	}
 	primary.reg.mpl.RUnlock()
 
@@ -1217,16 +1405,34 @@ ret:
 	return after.Smap
 }
 
-func _updSnode(smap *smapX, nsi *meta.Snode, cloned bool) (*smapX, bool) {
+func _updSnode(smap *smapX, nsi *meta.Snode, cloned bool, weight int64) (*smapX, bool) {
 	if nsi.Validate() != nil {
 		return smap, cloned
 	}
+	if weight == 0 {
+		weight = nsi.PlacementWeight()
+	}
 	osi := smap.GetNode(nsi.ID())
-	if osi == nil || osi.Type() != nsi.Type() {
+	if osi == nil {
+		// admitted during startup but absent from the adopted (regpool) Smap
+		if !cloned {
+			smap = smap.clone()
+			cloned = true
+		}
+		nsi = nsi.Clone()
+		smap.putNode(nsi, nsi.Flags)
+		nsi.SetPlacementWeight(weight)
+		nlog.Warningln("adding", nsi.StringEx(), "to", smap.StringEx())
+		return smap, cloned
+	}
+	if osi.Type() != nsi.Type() {
 		return smap, cloned
 	}
 
-	var renew bool
+	if assigned := osi.PlacementWeight(); assigned > 0 {
+		weight = assigned // recovered assignment wins; otherwise retain the join request
+	}
+	renew := weight != osi.PlacementWeight()
 	if err := osi.NetEq(nsi); err != nil {
 		nlog.Warningln("renewing", err)
 		renew = true
@@ -1244,6 +1450,8 @@ func _updSnode(smap *smapX, nsi *meta.Snode, cloned bool) (*smapX, bool) {
 		smap = smap.clone()
 		cloned = true
 	}
+	nsi = nsi.Clone()
 	smap.putNode(nsi, osi.Flags) // logged above ("renewing")
+	nsi.SetPlacementWeight(weight)
 	return smap, cloned
 }

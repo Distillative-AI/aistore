@@ -6,6 +6,7 @@ Setup scripts for Docker-based GitLab CI runners for AIStore:
 - Sets up local pull-through registry cache for container images
 - Registers the runner with Docker executor and privileged mode
 - Configures `inotify` limits
+- Loads the kernel `tls` module (kTLS for the HTTPS CI jobs)
 
 ## Usage
 
@@ -22,6 +23,12 @@ sudo ./setup.sh [--data-root <absolute_path>] [--registry-username <username>] [
 ```
 
 > **Note:** This script will prompt for `sudo` access when needed for specific operations.
+
+### 3. Tag kTLS Runners
+
+The `test:short:https` and `test:long:https` jobs run only on runners with the `ktls` tag.
+
+`setup.sh` runs [check-ktls.sh](../../check-ktls.sh) after it loads the `tls` module and prints whether the runner is eligible for the `ktls` tag. If eligible, add the `ktls` tag to the runner in GitLab.
 
 ## Options
 

@@ -55,6 +55,9 @@ type (
 		SI        *meta.Snode        `json:"si"`
 		PrimeTime int64              `json:"prime_time"`
 		Flags     cos.NodeStateFlags `json:"flags"`
+
+		// v5.2
+		JoinWeight int64 `json:"join_weight,string,omitempty"`
 	}
 
 	// extend control msg: ActionMsg with an extra information for node <=> node control plane communications
@@ -779,6 +782,19 @@ func apiReqFree(a *apiRequest) {
 	}
 	*a = apireq0
 	apiReqPool.Put(a)
+}
+
+// validates the POST object name at its action-defined wire location
+func validateObjPostName(msg *apc.ActMsg, apireq *apiRequest) error {
+	switch {
+	case msg.Action == apc.ActBlobDl:
+		debug.Assert(apireq.after == 1)
+		return cos.ValidateOname(msg.Name)
+	case apireq.after == 2:
+		return cos.ValidateOname(apireq.items[1])
+	default:
+		return nil // bucket-only action (promote or unsupported)
+	}
 }
 
 //

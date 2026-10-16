@@ -15,8 +15,7 @@ import (
 )
 
 type (
-	// interface to Get current (versioned, immutable) BMD instance
-	// (for implementation, see ais/bucketmeta.go)
+	// access the current immutable BMD (implemented in ais/bucketmeta.go)
 	Bowner interface {
 		Get() (bmd *BMD)
 	}
@@ -120,17 +119,47 @@ func (m *BMD) IsEmpty() bool {
 	return na+nar+nc+no == 0
 }
 
-func (m *BMD) IsECUsed() (yes bool) {
-	m.Range(nil, nil, func(bck *Bck) (stop bool) {
-		if bck.Props.EC.Enabled {
-			yes, stop = true, true
+// return whether any bucket has EC enabled
+func (m *BMD) IsECUsed() bool {
+	var used bool
+	m.RangeProps(func(_, _ string, _ cmn.Ns, props *cmn.Bprops) bool {
+		if props.EC.Enabled {
+			used = true
+			return true // stop
 		}
-		return
+		return false
 	})
-	return
+	return used
 }
 
-// providerQuery == nil: all providers; nsQuery == nil: all namespaces
+func (m *BMD) GetBucketWithPlacement() (found *Bck) {
+	m.RangeProps(func(name, provider string, ns cmn.Ns, props *cmn.Bprops) bool {
+		if props.Placement != nil {
+			found = NewBck(name, provider, ns, props)
+			return true // stop
+		}
+		return false
+	})
+	return found
+}
+
+// visit immutable bucket properties without constructing buckets; stop when the callback returns true
+func (m *BMD) RangeProps(callback func(name, provider string, ns cmn.Ns, props *cmn.Bprops) bool) {
+	for provider, namespaces := range m.Providers {
+		for nsUname, buckets := range namespaces {
+			ns := cmn.ParseNsUname(nsUname)
+			for name, props := range buckets {
+				if callback(name, provider, ns, props) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// visit matching buckets until the callback returns true
+// - nil filter matches all providers (namespaces)
+// - every iteration allocates meta.Bck; callback may retain the latter
 func (m *BMD) Range(providerQuery *string, nsQuery *cmn.Ns, callback func(*Bck) bool) {
 	var qname string
 	if nsQuery != nil {
@@ -144,10 +173,10 @@ func (m *BMD) Range(providerQuery *string, nsQuery *cmn.Ns, callback func(*Bck) 
 			if nsQuery != nil && nsUname != qname {
 				continue
 			}
+			ns := cmn.ParseNsUname(nsUname)
 			for name, props := range buckets {
-				ns := cmn.ParseNsUname(nsUname)
 				bck := NewBck(name, provider, ns, props)
-				if callback(bck) { // break?
+				if callback(bck) {
 					return
 				}
 			}
@@ -155,30 +184,31 @@ func (m *BMD) Range(providerQuery *string, nsQuery *cmn.Ns, callback func(*Bck) 
 	}
 }
 
+// return matching buckets in sorted order, optionally including system buckets
 func (m *BMD) Select(qbck *cmn.QueryBcks, includeSystem bool) cmn.Bcks {
-	var (
-		cp   *string
-		bcks = cmn.Bcks{} // nil slice != empty slice
-	)
-	if qbck.Provider != "" {
-		cp = &qbck.Provider
+	bcks := cmn.Bcks{} // nil slice != empty slice
+	for provider, namespaces := range m.Providers {
+		if qbck.Provider != "" && provider != qbck.Provider {
+			continue
+		}
+		for nsUname, buckets := range namespaces {
+			ns := cmn.ParseNsUname(nsUname)
+			for name, props := range buckets {
+				bck := cmn.Bck{Name: name, Provider: provider, Ns: ns, Props: props}
+				if !qbck.Equal(&bck) && !qbck.Contains(&bck) {
+					continue
+				}
+				if !includeSystem && bck.IsSystem() {
+					continue
+				}
+
+				if len(bcks) == 0 {
+					bcks = make(cmn.Bcks, 0, 16)
+				}
+				bcks = append(bcks, bck)
+			}
+		}
 	}
-	m.Range(cp, nil, func(bck *Bck) bool {
-		b := bck.Bucket()
-		if !qbck.Equal(b) && !qbck.Contains(b) {
-			return false
-		}
-
-		if !includeSystem && b.IsSystem() {
-			return false
-		}
-
-		if len(bcks) == 0 {
-			bcks = make(cmn.Bcks, 0, 16)
-		}
-		bcks = append(bcks, bck.Clone())
-		return false
-	})
 	sort.Sort(bcks)
 	return bcks
 }
@@ -219,7 +249,7 @@ func (m *BMD) numBuckets(checkEmpty bool) (na, nar, nc, no int) {
 	return na, nar, nc, no
 }
 
-// ais:// and cloud buckets with implicit global namespace
+// initialize AIS and cloud buckets in the global namespace
 func (m *BMD) initBckGlob(bck *Bck) bool {
 	namespaces, ok := m.Providers[bck.Provider]
 	if !ok {

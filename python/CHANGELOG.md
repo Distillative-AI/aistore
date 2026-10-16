@@ -8,6 +8,10 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 
 ### Fixed
 
+- `AISShardReader` preserves multi-dot extensions, preventing sample members
+  such as `sample.left.jpg` and `sample.right.jpg` from silently overwriting each other.
+- `MultipartDecoder` no longer truncates bodies containing `\r\n\r\n` when part
+  headers use Unix line endings.
 - `AISShardReader.__len__()` now streams raw shards and counts samples without
   buffering full shard payloads. The count matches iteration when ETL preserves
   the sample count.
