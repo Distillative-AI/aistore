@@ -144,6 +144,7 @@ const listAnyUsage = "List buckets, objects in buckets, and files in (.tar, .tgz
 	indent1 + "with summary (bucket sizes and numbers of objects):\n" +
 	indent1 + "\t* ais ls ais://nnn --summary --prefix=aaa/bbb \t- summarize objects matching the given prefix;\n" +
 	indent1 + "\t* ais ls ais://nnn/aaa/bbb --summary \t- same as above;\n" +
+	indent1 + "\t* 'ais ls ais://nnn --summary --per-target' \t- show per-target object counts, sizes, and shares;\n" +
 	indent1 + "\t* ais ls az://azure-bucket --count-only \t- fastest way to count objects in a bucket;\n" +
 	indent1 + "\t* ais ls s3 --summary \t- for each s3 bucket: print object count and total size;\n" +
 	indent1 + "\t* ais ls s3 --summary --all \t- summary report for all s3 buckets including remote/non-present;\n" +
@@ -250,6 +251,7 @@ var (
 		maxPagesFlag,
 		startAfterFlag,
 		bckSummaryFlag,
+		bsummPerTargetFlag,
 		nonRecursFlag,
 		noDirsFlag,
 		dontHeadRemoteFlag,
@@ -1041,6 +1043,23 @@ func _clearFmt(v string) string {
 //
 
 func listAnyHandler(c *cli.Context) error {
+	if flagIsSet(c, bsummPerTargetFlag) {
+		if !flagIsSet(c, bckSummaryFlag) {
+			return incorrectUsageMsg(c, "%s requires %s", qflprn(bsummPerTargetFlag), qflprn(bckSummaryFlag))
+		}
+		if c.NArg() > 1 {
+			return incorrectUsageMsg(c, "", c.Args()[1:])
+		}
+		for _, flag := range c.Command.Flags {
+			if !flagIsSet(c, flag) || fl1n(flag.GetName()) == bckSummaryFlag.Name || fl1n(flag.GetName()) == fl1n(noFooterFlag.Name) {
+				continue
+			}
+			if !slices.ContainsFunc(storageSummFlags, func(f cli.Flag) bool { return fl1n(f.GetName()) == fl1n(flag.GetName()) }) {
+				return incorrectUsageMsg(c, "%s is not supported with %s", qflprn(flag), qflprn(bsummPerTargetFlag))
+			}
+		}
+		return summaryStorageHandler(c)
+	}
 	var (
 		opts = cmn.ParseURIOpts{IsQuery: true}
 		uri  = c.Args().Get(0)
