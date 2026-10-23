@@ -5,8 +5,10 @@
 package ais
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -28,6 +30,7 @@ import (
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/ext/etl"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/reb"
 	"github.com/NVIDIA/aistore/xact"
@@ -1316,7 +1319,10 @@ func (t *target) receiveConfig(newConfig *globalConfig, msg *actMsgExt, payload 
 		return nil
 	}
 
-	if *oldConfig.Space != *newConfig.Space {
+	if *oldConfig.Space != *newConfig.Space ||
+		oldConfig.LRU.CapacityUpdTime != newConfig.LRU.CapacityUpdTime ||
+		oldConfig.Periodic.StatsTime != newConfig.Periodic.StatsTime ||
+		oldConfig.Disk.IostatTimeShort != newConfig.Disk.IostatTimeShort {
 		fs.ExpireCapCache()
 	}
 
@@ -1522,7 +1528,7 @@ func (t *target) headt2t(lom *core.LOM, tsi *meta.Snode, smap *smapX, reqProps [
 		cargs.req = cmn.HreqArgs{
 			Method: http.MethodHead,
 			Base:   tsi.URL(cmn.NetIntraControl),
-			Path:   apc.URLPathObjects.Join(lom.Bck().Name, lom.ObjName),
+			Path:   apc.URLPathObjects.Join(lom.Bck().Name, lom.OrigObjName()),
 			Query:  q,
 		}
 		cargs.timeout = cmn.Rom.CplaneOperation()
@@ -1546,6 +1552,7 @@ func (t *target) headBatcht2t(req *cmn.HdbReq, tsi *meta.Snode, smap *smapX) (*a
 		return nil, err
 	}
 	q := url.Values{apc.QparamSilent: []string{"true"}}
+	body, bodyR := hdbPack(t.gmm, req)
 
 	cargs := allocCargs()
 	{
@@ -1556,7 +1563,10 @@ func (t *target) headBatcht2t(req *cmn.HdbReq, tsi *meta.Snode, smap *smapX) (*a
 			Path:   apc.URLPathObjects.S, // no bucket in the URL
 			Query:  q,
 			Header: http.Header{cos.HdrContentType: []string{cos.ContentBinary}},
-			Body:   req.NewPack(),
+			Body:   body,
+		}
+		if bodyR != nil {
+			cargs.req.BodyR = bodyR
 		}
 		cargs.timeout = hdbTimeout(len(req.In))
 	}
@@ -1579,14 +1589,61 @@ func (t *target) headBatcht2t(req *cmn.HdbReq, tsi *meta.Snode, smap *smapX) (*a
 	return resp, nil
 }
 
+// pack the request into a buffer from the allocator
+func hdbPack(mm *memsys.MMSA, req *cmn.HdbReq) (body []byte, bodyR io.ReadCloser) {
+	size := req.PackedSize()
+	if size > memsys.MaxPageSlabSize {
+		return req.NewPack(), nil
+	}
+	buf, slab := mm.AllocSize(int64(size))
+	body = buf[:size]
+	req.PackTo(body)
+
+	b := &hdbBody{buf: body, slab: slab}
+	b.r.Reset(body)
+	return body, b
+}
+
+// TODO: consolidate into a reusable slab-backed reader in memsys
+// (compare GuardReader for SGL)
+type hdbBody struct {
+	mu   sync.Mutex
+	r    bytes.Reader
+	buf  []byte // nil after Close
+	slab *memsys.Slab
+}
+
+func (b *hdbBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.buf == nil {
+		return 0, io.ErrClosedPipe
+	}
+	return b.r.Read(p)
+}
+
+func (b *hdbBody) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.buf != nil {
+		b.slab.Free(b.buf)
+		b.buf = nil
+	}
+	return nil
+}
+
 // NOTE:
 // - pre-5.2 peer will return 400 => fall back to per-object HEADs
+// - peer under critical load will return 429 (see objHeadBatch) => no fallback, count peer-busy
 // - generally, intra-cluster protocols across nodes running incompatible software versions -
 //   and the respective deployments - are not supported
 
 func _hdbErr(err error, status int, tsi *meta.Snode) error {
-	if status == http.StatusBadRequest {
+	switch status {
+	case http.StatusBadRequest:
 		return fmt.Errorf("%s: %w (%v)", tsi.StringEx(), cmn.ErrHdbUnsupported, err)
+	case http.StatusTooManyRequests:
+		return fmt.Errorf("%s: %w", tsi.StringEx(), cmn.NewErrTooManyRequests(err, status))
 	}
 	return fmt.Errorf("%s: %w", tsi.StringEx(), err)
 }
@@ -1609,7 +1666,7 @@ func (t *target) headObjBcast(lom *core.LOM, smap *smapX) *meta.Snode {
 	args := allocBcArgs()
 	args.req = cmn.HreqArgs{
 		Method: http.MethodHead,
-		Path:   apc.URLPathObjects.Join(lom.Bck().Name, lom.ObjName),
+		Path:   apc.URLPathObjects.Join(lom.Bck().Name, lom.OrigObjName()),
 		Query:  q,
 	}
 	args.ignoreMaintenance = true

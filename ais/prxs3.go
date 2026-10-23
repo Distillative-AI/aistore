@@ -62,6 +62,13 @@ func (p *proxy) s3Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// reject empty path components
+	if strings.Contains(r.URL.Path, "//") {
+		err := fmt.Errorf("invalid URL %q: consecutive slashes (\"//\") are not supported", r.URL.Path)
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Code: s3.ErrCodeInvalidArgument})
+		return
+	}
+
 	switch r.Method {
 	case http.MethodHead:
 		if len(apiItems) == 0 {
@@ -267,7 +274,7 @@ func (p *proxy) handleMptUpload(w http.ResponseWriter, r *http.Request, items []
 	}
 
 	smap := p.owner.smap.get()
-	tsi, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
+	tsi, netPub, err := smap.HrwObjMultiHome(bck, objName)
 	if err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
 		return
@@ -582,14 +589,14 @@ func (p *proxy) copyObjS3(w http.ResponseWriter, r *http.Request, items []string
 	if bckDst == nil {
 		return
 	}
-	if err := bckDst.Allow(apc.AcePUT); err != nil {
+	if err := p.access(r, bckDst, apc.AcePUT); err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
 
 	objName := strings.Trim(srcObj, "/")
 	smap := p.owner.smap.get()
-	tsi, err := smap.HrwName2T(bckSrc.MakeUname(objName))
+	tsi, err := smap.HrwObjName2T(bckSrc, objName)
 	if err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
 		return
@@ -623,7 +630,7 @@ func (p *proxy) directPutObjS3(w http.ResponseWriter, r *http.Request, items []s
 	}
 
 	smap := p.owner.smap.get()
-	tsi, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
+	tsi, netPub, err := smap.HrwObjMultiHome(bck, objName)
 	if err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
 		return
@@ -662,7 +669,7 @@ func (p *proxy) getObjS3(w http.ResponseWriter, r *http.Request, items []string,
 	}
 
 	smap := p.owner.smap.get()
-	tsi, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
+	tsi, netPub, err := smap.HrwObjMultiHome(bck, objName)
 	if err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
 		return
@@ -695,7 +702,7 @@ func (p *proxy) listMultipart(w http.ResponseWriter, r *http.Request, bck *meta.
 	// Although ListMultipartUploads is metadata-only, both the single-target redirect and
 	// the internal fanout below must use intra-data when addressing a target's /s3 endpoint.
 	if smap.CountActiveTs() == 1 {
-		si, err := smap.HrwName2T(bck.MakeUname(""))
+		si, err := smap.HrwObjName2T(bck, "")
 		if err != nil {
 			s3.WriteErr(w, r, s3.ErrInfo{Err: err})
 			return
@@ -779,7 +786,7 @@ func (p *proxy) headObjS3(w http.ResponseWriter, r *http.Request, items []string
 	}
 
 	smap := p.owner.smap.get()
-	tsi, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
+	tsi, netPub, err := smap.HrwObjMultiHome(bck, objName)
 	if err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusInternalServerError})
 		return
@@ -826,7 +833,7 @@ func (p *proxy) delObjS3(w http.ResponseWriter, r *http.Request, items []string)
 	}
 
 	smap := p.owner.smap.get()
-	tsi, err := smap.HrwName2T(bck.MakeUname(objName))
+	tsi, err := smap.HrwObjName2T(bck, objName)
 	if err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
 		return
@@ -844,6 +851,10 @@ func (p *proxy) delObjS3(w http.ResponseWriter, r *http.Request, items []string)
 func (p *proxy) getBckVersioningS3(w http.ResponseWriter, r *http.Request, bucket string) {
 	bck := p.initByNameOnly(w, r, bucket)
 	if bck == nil {
+		return
+	}
+	if err := p.access(r, bck, apc.AceBckHEAD); err != nil {
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
 		return
 	}
 	resp := s3.NewVersioningConfiguration(bck.Props.Versioning.Enabled)

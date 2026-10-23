@@ -894,7 +894,7 @@ func (p *proxy) httpobjget(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. redirect
-	tsi, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
+	tsi, netPub, err := smap.HrwObjMultiHome(bck, objName)
 	if err != nil {
 		p.statsT.IncBck(stats.ErrGetCount, bck.Bucket())
 		p.writeErr(w, r, err)
@@ -986,7 +986,7 @@ func (p *proxy) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiRe
 	}
 
 	if nodeID == "" {
-		tsi, netPub, err = smap.HrwMultiHome(bck.MakeUname(objName))
+		tsi, netPub, err = smap.HrwObjMultiHome(bck, objName)
 		if err != nil {
 			p.statsT.IncWith(errcnt, vlabs)
 			p.writeErr(w, r, err)
@@ -1041,7 +1041,7 @@ func (p *proxy) httpobjdelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tsi, err := smap.HrwName2T(bck.MakeUname(objName))
+	tsi, err := smap.HrwObjName2T(bck, objName)
 	if err != nil {
 		p.statsT.IncBck(stats.ErrDeleteCount, bck.Bucket())
 		p.writeErr(w, r, err)
@@ -1890,6 +1890,10 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 			return
 		}
 	case apc.ActCreateNBI:
+		if !bck.IsRemote() {
+			p.writeErr(w, r, errRemoteOnlyNBI(bck))
+			return
+		}
 		if err := p.initTrySysBck(w, r, msg, meta.SysBckNBI()); err != nil {
 			return
 		}
@@ -2513,7 +2517,7 @@ func (p *proxy) httpobjhead(w http.ResponseWriter, r *http.Request) {
 	// TODO: control plane multihoming: return LRU data plane interface - here and elsewhere (bcast)
 
 	smap := p.owner.smap.get()
-	si, err := smap.HrwName2T(bck.MakeUname(objName))
+	si, err := smap.HrwObjName2T(bck, objName)
 	if err != nil {
 		p.writeErr(w, r, err, http.StatusInternalServerError)
 		return
@@ -2546,7 +2550,7 @@ func (p *proxy) httpobjpatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	smap := p.owner.smap.get()
-	si, err := smap.HrwName2T(bck.MakeUname(objName))
+	si, err := smap.HrwObjName2T(bck, objName)
 	if err != nil {
 		p.writeErr(w, r, err, http.StatusInternalServerError)
 		return

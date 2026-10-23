@@ -30,6 +30,7 @@ import (
 	"github.com/NVIDIA/aistore/xact/xreg"
 	"github.com/NVIDIA/aistore/xact/xs"
 
+	onexxh "github.com/OneOfOne/xxhash"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -478,6 +479,9 @@ func (t *target) validateNprops(bck *meta.Bck, msg *actMsgExt) (nprops *cmn.Bpro
 		}
 	}
 	if !nprops.EC.Enabled && bck.Props.EC.Enabled {
+		err = nil
+	}
+	if nprops.LRU.Enabled && !bck.Props.LRU.Enabled {
 		err = nil
 	}
 	return
@@ -1174,7 +1178,7 @@ func (t *target) prmNumFiles(c *txnSrv, txnPrm *txnPromote, confirmedFshare bool
 		// file share == true: promote only the part of the txnPrm.fqns that "lands" locally
 		if confirmedFshare {
 			uname := append(ubuf, objName...) //nolint:gocritic // reusing ubuf - intentionally not assigning
-			si, err := smap.HrwName2T(uname)
+			si, err := smap.HrwObjHash2T(c.bck, onexxh.Checksum64S(uname, cos.MLCG32))
 			if err != nil {
 				return err
 			}
@@ -1208,6 +1212,9 @@ func (t *target) createNBI(c *txnSrv) (string, error) {
 	case apc.Begin2PC:
 		if err := c.bck.Init(t.owner.bmd); err != nil {
 			return "", err
+		}
+		if !c.bck.IsRemote() {
+			return "", errRemoteOnlyNBI(c.bck)
 		}
 
 		// only one (create-inventory, bucket) at a time

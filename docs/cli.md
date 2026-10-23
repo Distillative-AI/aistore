@@ -3,7 +3,7 @@ initial bootstrap to day‑to-day operations, and from single-object I/O to dist
 
 In addition, CLI provides dataset management commands, performance monitoring, advanced operations, and more.
 
-The entire (diverse and growing) command set is partitioned into top-level _namespaces_:
+With shell completion installed, press `<TAB-TAB>` to discover commands. Output below is a snapshot; use `ais --help` and `ais <command> --help` for your installed version:
 
 ```console
 $ ais <TAB-TAB>
@@ -55,7 +55,7 @@ Summary:
 
 > Use `--verbose` to additionally show `LOAD AVERAGE` columns.
 
-> Press <TAB-TAB> to see all `ais show` subcommands:
+> Use `<TAB-TAB>` or `ais show --help` to discover subcommands:
 
 ```
 $ ais show <TAB>
@@ -149,10 +149,7 @@ blob-download    download         job              prefetch         search      
 bucket           dsort            log              put              show             wait
 ```
 
-These are the current set of top-level commands. Each command has its own extended help (the `--help` option) and, usually, multiple sub-commands
-(which, in turn, have their respective inline helps and subcommands).
-
-The list of top-level commands provides an overview of the supported functionality and functional grouping. The following is a brief (non-exhaustive and possibly slightly outdated) **summary**:
+Each command has `--help` for its subcommands and flags. The following is a brief **summary**:
 
 | Command | Use Case |
 |---------|----------|
@@ -276,7 +273,7 @@ In addition, environment can be used to **override** client-side TLS (aka, HTTPS
 | `AIS_CRT`             | X.509 certificate | "cluster.client_crt" |
 | `AIS_CRT_KEY`         | X.509 certificate's private key | "cluster.client_crt_key"|
 | `AIS_CLIENT_CA`       | Certificate authority that authorized (signed) the certificate | "cluster.client_ca_tls" |
-| `AIS_SKIP_VERIFY_CRT` | true: skip X.509 cert verification (usually enabled to circumvent limitations of self-signed certs) | "cluster.skip_verify_crt" |
+| `AIS_SKIP_VERIFY_CRT` | true: bypass server certificate verification (insecure; use a trusted CA instead) | "cluster.skip_verify_crt" |
 
 ### Further references
 
@@ -330,7 +327,7 @@ $ ais ls ais://bck --props all --no-color
 
 The syntax `provider://BUCKET_NAME` (referred to as `BUCKET` in help messages) works across all commands.
 For more details, please refer to each specific command's documentation.
-`provider://` can be omitted if the `default_provider` config value is set (in such case the config value will be used implicitly).
+For ordinary bucket and object commands, include `provider://` in the URI. The CLI does not currently substitute its `default_provider` setting when parsing these arguments. Bucket-query forms, such as listing across providers without specifying a provider, are separate and can omit it.
 
 Supported backend providers currently include:
 * `ais://` - AIStore provider

@@ -434,26 +434,35 @@ The latter is the primary implementation, and the preferred way to investigate c
 ```console
 $ ais show cluster stats <TAB-TAB>
 
-counters     throughput   latency      capacity     disk
+counters     throughput   latency      capacity     intra-data   disk
 ```
 
 ```console
 $ ais show cluster stats --help
-
 NAME:
-   ais show cluster stats - (alias for "ais show performance") Show performance counters, throughput, latency, disks, used/available capacities (press <TAB-TAB> to select specific view)
+   ais show cluster stats - (alias for "show performance") Show performance counters, throughput, latency, disks, used/available capacities (press <TAB-TAB> to select specific view)
 
 USAGE:
-   ais show cluster stats command [TARGET_ID]  [command options]
+   ais show cluster stats [TARGET_ID]  [command options]
 
 COMMANDS:
    counters    Show (GET, PUT, DELETE, RENAME, EVICT, APPEND) object counts, as well as:
                - numbers of list-objects requests;
                - (GET, PUT, etc.) cumulative and average sizes;
                - associated error counters, if any, and more.
-   throughput  Show GET and PUT throughput, associated (cumulative, average) sizes and counters
-   latency     Show GET, PUT, and APPEND latencies and average sizes
+   throughput  Show GET and PUT throughput, associated (cumulative, average) sizes and counters.
+               Examples:
+               - 'ais performance throughput --refresh 10'            - update every 10s;
+               - 'ais performance throughput --refresh 10 --count 5'  - 5 iterations, 10s apart.
+   latency     Show GET, PUT, and APPEND latencies and average sizes.
+               Examples:
+               - 'ais performance latency --refresh 10'            - update every 10s;
+               - 'ais performance latency --refresh 10 --count 5'  - 5 iterations, 10s apart.
    capacity    Show target mountpaths, disks, and used/available capacity
+   intra-data  Show intra-cluster streaming traffic: RX/TX object counts, sizes, throughput, and average size.
+               Examples:
+               - 'ais performance intra-data --refresh 10'            - update every 10s;
+               - 'ais performance intra-data --refresh 10 --count 5'  - 5 iterations, 10s apart.
    disk        Show disk utilization and read/write statistics
 
 OPTIONS:
@@ -468,8 +477,8 @@ OPTIONS:
                          --regex "put|err" - show PUT (count), PUT (total size), and all supported error counters;
                          --regex "Put|ERR" - same as above;
                          --regex "[a-z]" - show all supported metrics, including those that have zero values across all nodes;
-                         --regex "(AWS-GET$|VERSION-CHANGE$)" - show the number object version changes (updates) and cold GETs from AWS
-                         --regex "(gcp-get$|version-change$)" - same as above for Google Cloud ('gs://')
+                         --regex "aws-get|version-change" - show AWS backend reads and out-of-band object version changes;
+                         --regex "gcp-get|version-change" - same as above for Google Cloud ('gs://')
    --units value        Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
                         iec - IEC format, e.g.: KiB, MiB, GiB (default)
                         si  - SI (metric) format, e.g.: KB, MB, GB
@@ -489,57 +498,32 @@ See also:
 ```console
 $ ais show storage disk --help
 NAME:
-   ais show storage disk - show disk utilization and read/write statistics
-
-USAGE:
-   ais show storage disk [TARGET_ID] [command options]
-
-OPTIONS:
-   --refresh value   interval for continuous monitoring;
-                     valid time units: ns, us (or µs), ms, s (default), m, h
-   --count value     used together with '--refresh' to limit the number of generated reports (default: 0)
-   --no-headers, -H  display tables without headers
-   --units value     show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
-                     iec - IEC format, e.g.: KiB, MiB, GiB (default)
-                     si  - SI (metric) format, e.g.: KB, MB, GB
-                     raw - do not convert to (or from) human-readable format
-   --regex value     regular expression to select table columns (case-insensitive), e.g.: --regex "put|err"
-   --summary         tally up target disks to show per-target read/write summary stats and average utilizations
-   --help, -h        show help
-```
-
-When `TARGET_ID` is not given, disk stats for all targets will be shown and aggregated.
-
-### Options
-
-```console
-$ ais show storage disk --help
-
-NAME:
    ais show storage disk - Show disk utilization and read/write statistics
 
 USAGE:
    ais show storage disk [TARGET_ID] [command options]
 
 OPTIONS:
-   --count value     Used together with '--refresh' to limit the number of generated reports, e.g.:
-                      '--refresh 10 --count 5' - run 5 times with 10s interval (default: 0)
-   --no-headers, -H  Display tables without headers
-   --refresh value   Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
-                     valid time units: ns, us (or µs), ms, s (default), m, h
-   --regex value     Regular expression to select table columns (case-insensitive), e.g.:
-                      --regex "put|err" - show PUT (count), PUT (total size), and all supported error counters;
-                      --regex "Put|ERR" - same as above;
-                      --regex "[a-z]" - show all supported metrics, including those that have zero values across all nodes;
-                      --regex "(AWS-GET$|VERSION-CHANGE$)" - show the number object version changes (updates) and cold GETs from AWS
-                      --regex "(gcp-get$|version-change$)" - same as above for Google Cloud ('gs://')
-   --summary         Tally up target disks to show per-target read/write summary stats and average utilizations
-   --units value     Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
-                     iec - IEC format, e.g.: KiB, MiB, GiB (default)
-                     si  - SI (metric) format, e.g.: KB, MB, GB
-                     raw - do not convert to (or from) human-readable format
-   --help, -h        Show help
+   count         Used together with '--refresh' to limit the number of generated reports, e.g.:
+                  '--refresh 10 --count 5' - run 5 times with 10s interval
+   no-headers,H  Display tables without headers
+   refresh       Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                 valid time units: ns, us (or µs), ms, s (default), m, h
+   regex         Regular expression to select table columns (case-insensitive), e.g.:
+                  --regex "put|err" - show PUT (count), PUT (total size), and all supported error counters;
+                  --regex "Put|ERR" - same as above;
+                  --regex "[a-z]" - show all supported metrics, including those that have zero values across all nodes;
+                  --regex "aws-get|version-change" - show AWS backend reads and out-of-band object version changes;
+                  --regex "gcp-get|version-change" - same as above for Google Cloud ('gs://')
+   summary       Tally up target disks to show per-target read/write summary stats and average utilizations
+   units         Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
+                 iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                 si  - SI (metric) format, e.g.: KB, MB, GB
+                 raw - do not convert to (or from) human-readable format
+   help, h       Show help
 ```
+
+When `TARGET_ID` is not given, disk stats for all targets will be shown and aggregated.
 
 ### Examples
 
@@ -820,8 +804,10 @@ UUID        URL                       Alias     Primary         Smap  Targets  O
 By default, objects are distributed uniformly across targets. Target placement weights (v5.2) represent
 relative capacities (1, 3, 6) or sizes in GB (100, 300, 600).
 
-Weighted HRW is pending: these commands update placement metadata and trigger rebalance when weights
-change non-proportionally. Object placement still uses uniform HRW.
+With weights set, each target owns a `weight/sum(weights)` share of objects - except in buckets with
+`placement.weighting=uniform`. Changing weights non-proportionally triggers global rebalance. To see
+measured per-target object counts, run `ais storage summary BUCKET --per-target`. See
+[Placement weights](/docs/placement.md).
 
 ```console
 $ ais cluster placement --help

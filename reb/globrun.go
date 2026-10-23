@@ -768,7 +768,7 @@ func (rj *rebJogger) _lwalk(lom *core.LOM, fqn string) (bool /*handedOff*/, erro
 		}
 	}
 
-	tsi, err := rargs.smap.HrwHash2T(lom.Digest())
+	tsi, err := rargs.smap.HrwObjHash2T(lom.Bck(), lom.Digest())
 	if err != nil {
 		rargs.xreb.Abort(err) // smap unusable (abort the whole xaction)
 		return false, err
@@ -866,7 +866,7 @@ func (rargs *rargs) doSend(lom *core.LOM, tsi *meta.Snode, roc cos.ReadOpenClose
 		o = transport.AllocSend()
 	)
 	o.Hdr.Bck.Copy(lom.Bucket())
-	o.Hdr.ObjName = lom.ObjName
+	o.Hdr.ObjName = lom.OrigObjName()
 	o.Hdr.Opaque = rargs.opaque[:]
 	o.Hdr.ObjAttrs.CopyFrom(lom.ObjAttrs(), false /*skip cksum*/)
 	o.SentCB, o.CmplArg = rargs.objSentCallback, lom

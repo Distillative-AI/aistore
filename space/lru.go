@@ -102,6 +102,7 @@ type (
 		now         int64
 		totalSize   int64 // difference between lowWM size and used size
 		allowDelObj bool
+		force       bool // selected buckets: evict regardless of bucket LRU and delete permission
 	}
 	lruFactory struct {
 		xctn *XactLRU
@@ -290,6 +291,7 @@ func (j *lruJ) jogBcks(bcks []cmn.Bck, force bool) error {
 			nlog.Errorf("%s: %v - skipping %s (Hint: run 'ais storage cleanup' to cleanup)", j, err, bck.String())
 			continue
 		}
+		j.force = force
 		j.allowDelObj = a || force
 
 		if err := j.jogBck(); err != nil {
@@ -355,7 +357,7 @@ func (j *lruJ) _visit(lom *core.LOM, parsedFQN *fs.ParsedFQN) (pushed bool) {
 	if err := lom.Load(false /*cache it*/, false /*locked*/); err != nil {
 		return false
 	}
-	if lom.AtimeUnix()+int64(j.config.LRU.DontEvictTime) > j.now {
+	if lom.AtimeUnix()+int64(lom.Bprops().LRU.DontEvictTime) > j.now {
 		return false
 	}
 	if lom.HasCopies() && lom.IsCopy() {
@@ -446,7 +448,8 @@ func (j *lruJ) capCheckAndThrottle(size int64) {
 	}
 
 	// init, recompute, and throttle - once per capCheckThresh
-	j.allowDelObj, _ = j.allow()
+	a, _ := j.allow()
+	j.allowDelObj = a || j.force
 	j.config = cmn.GCO.Get() // refresh
 	j.now = time.Now().UnixNano()
 	j.capCheck = 0

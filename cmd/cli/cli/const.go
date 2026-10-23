@@ -589,8 +589,8 @@ var (
 			indent4 + "\t --regex \"put|err\" - show PUT (count), PUT (total size), and all supported error counters;\n" +
 			indent4 + "\t --regex \"Put|ERR\" - same as above;\n" +
 			indent4 + "\t --regex \"[a-z]\" - show all supported metrics, including those that have zero values across all nodes;\n" +
-			indent4 + "\t --regex \"(AWS-GET$|VERSION-CHANGE$)\" - show the number object version changes (updates) and cold GETs from AWS\n" +
-			indent4 + "\t --regex \"(gcp-get$|version-change$)\" - same as above for Google Cloud ('gs://')",
+			indent4 + "\t --regex \"aws-get|version-change\" - show AWS backend reads and out-of-band object version changes;\n" +
+			indent4 + "\t --regex \"gcp-get|version-change\" - same as above for Google Cloud ('gs://')",
 	}
 	allColumnsFlag = cli.BoolFlag{
 		Name:  "all-columns",

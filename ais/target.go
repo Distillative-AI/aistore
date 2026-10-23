@@ -73,6 +73,7 @@ type (
 		reb      *reb.Reb
 		res      *res.Res
 		fsprg    fsprungroup
+		hdbGate  hdbGate // head-batch receiver
 		txns     txns
 		ups      ups
 		htrun    // common w/ proxy
@@ -145,7 +146,13 @@ func (t *target) Backend(bck *meta.Bck) core.Backend { // as core.Target
 	}
 	provider := bck.Provider
 	if bck.Props != nil {
-		provider = bck.RemoteBck().Provider
+		rbck := bck.RemoteBck()
+		if rbck == nil {
+			// ais:// bucket without backend
+			dummy, _ := backend.NewDummyBackend(t, nil)
+			return dummy
+		}
+		provider = rbck.Provider
 	}
 	config := cmn.GCO.Get()
 	if _, ok := config.Backend.Providers[provider]; ok {
@@ -341,6 +348,7 @@ func (t *target) init(config *cmn.Config) {
 	startedUp := ts.Init()    // reg common metrics (see also: "begin target metrics" below)
 	daemon.rg.add(ts)
 	t.statsT = ts
+	ts.RmDeleted = t.rmDeleted
 
 	k := newTalive(t, ts, startedUp)
 	daemon.rg.add(k)
@@ -352,6 +360,7 @@ func (t *target) init(config *cmn.Config) {
 	daemon.rg.add(sc)                                                              // new stream collector
 
 	t.fshc = health.NewFSHC(t)
+	t.hdbGate.init()
 
 	if err := ts.InitCDF(config); err != nil {
 		cos.ExitLog(err)
@@ -1158,14 +1167,10 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 		return
 	}
 
-	cs := fs.Cap()
-	if errCap := cs.Err(); errCap != nil || cs.PctMax > int32(config.Space.CleanupWM) {
-		cs = t.oos(config)
-		if cs.IsOOS() {
-			// fail this write
-			t.writeErr(w, r, errCap, http.StatusInsufficientStorage)
-			return
-		}
+	if cs := fs.Cap(); cs.IsOOS() {
+		// fail this write
+		t.writeErr(w, r, cs.Err(), http.StatusInsufficientStorage)
+		return
 	}
 
 	// init
@@ -1714,9 +1719,13 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 		t.writeErr(w, r, err)
 		return
 	}
-	if err := cmn.ValidateCustomMD(custom); err != nil {
-		t.writeErrf(w, r, "%s: %v", lom.Cname(), err)
-		return
+	// (merge mode validates the merged result below)
+	delOldSetNew := cos.IsParseBool(apireq.dpq.get(apc.QparamNewCustom))
+	if delOldSetNew {
+		if err := cmn.ValidateCustomMD(custom); err != nil {
+			t.writeErrf(w, r, "%s: %v", lom.Cname(), err)
+			return
+		}
 	}
 
 	lom.Lock(true)
@@ -1729,14 +1738,15 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 		}
 		return
 	}
-	delOldSetNew := cos.IsParseBool(apireq.dpq.get(apc.QparamNewCustom))
 	if delOldSetNew {
 		lom.SetCustomMD(custom)
 	} else {
 		cloneMD := maps.Clone(lom.GetCustomMD()) // (CoW)
 		lom.SetCustomMD(cloneMD)
-		for key, val := range custom {
-			lom.SetCustomKey(key, val)
+		if err := lom.ObjAttrs().AddCustomMD(custom); err != nil {
+			lom.Unlock(true)
+			t.writeErrf(w, r, "%s: %v", lom.Cname(), err)
+			return
 		}
 	}
 

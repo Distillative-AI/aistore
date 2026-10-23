@@ -1,5 +1,5 @@
-AIStore supports distributed tracing via OpenTelemetry (OTEL), enhancing its observability capabilities alongside existing extensive [metrics and logging features](/docs/monitoring-overview.md).
-Distributed tracing enables tracking client requests across AIStore's proxy and target daemons, providing better visibility into the request flow and offering valuable performance insights
+AIStore supports distributed tracing with OpenTelemetry (OTEL), alongside its [metrics and logging features](/docs/monitoring-overview.md).
+Tracing follows client requests across AIStore proxy and target daemons to show request flow and help identify performance bottlenecks.
 
 For more details:
 - [Understanding Distributed Tracing](https://opentelemetry.io/docs/concepts/observability-primer/#understanding-distributed-tracing)
@@ -17,82 +17,67 @@ For more details:
 
 ## Getting Started
 
-In this section, we use AIStore [Local Playground](/docs/getting_started.md#local-playground) and local [Jaeger](https://www.jaegertracing.io/). This is done for purely (easy-to-use-and-repropduce) demonsration purposes.
+Start with a new [Local playground](/docs/getting_started.md#local-playground) and a **TLS-enabled OTLP/gRPC collector** reachable from every AIS node. Configure the collector and trace UI using the [Jaeger documentation](https://www.jaegertracing.io/docs/latest/) or your collector's guide. A plaintext collector does not work with the local deployment helper's TLS settings.
 
+From the repository root, build the CLI and deploy 1 target and 1 proxy with the exporter endpoint set to your TLS-enabled collector. Replace `localhost:4317` if the collector is not reachable at that address from **each** node:
 
-> #### Pre-Requisite
-> - Docker
+```sh
+export AIS_ENDPOINT=http://localhost:8080
+TAGS=oteltracing AIS_TRACING_ENDPOINT="localhost:4317" \
+  make cli deploy <<< $'1\n1'
+```
 
-1. Local Jaeger setup
-    ```sh
-    docker run -d --name jaeger \
-    -e COLLECTOR_OTLP_ENABLED=true \
-    -p 16686:16686 \
-    -p 4317:4317 \
-    -p 4318:4318 \
-    jaegertracing/all-in-one:latest
-    ```
-
-2. Optionally, shutdown and cleanup [Local Playground](/docs/getting_started.md#local-playground):
-
-    ```sh
-    make kill clean
-    ```
-
-3. Deploy the cluster with AuthN enabled:
-   ```sh
-   AIS_TRACING_ENDPOINT="localhost:4317" make deploy
-   ```
-
-   This will start up an AIStore cluster with distributed-tracing enabled.
+Setting `AIS_TRACING_ENDPOINT` makes the local deployment helper enable tracing and generate `tracing.skip_verify: true`. The exporter uses TLS with certificate verification disabled. Use this setting only for isolated tests; see [Configuration](#configuration) for verified TLS.
 
 ### Example operations
 
+With `AIS_ENDPOINT` pointed at the proxy and the CLI available, run these example operations from the repository root using a new test bucket name in place of `nnn`:
+
 ```sh
-ais bucket create ais://nnn
+ais create ais://nnn
 ais put README.md ais://nnn
 ais get ais://nnn/README.md /dev/null
 ```
 
-View traces at: [http://localhost:16686](http://localhost:16686/)
+Check the collector's trace UI for AIS proxy and target spans. If none appear, check collector reachability, TLS settings, exporter logs, and sampling.
 
 ## Configuration
 
-Cluster-wide `tracing` configuration. For list of AIStore config options refer to [configuration.md](/docs/configuration.md).
+The `tracing` configuration is cluster-wide. For other AIStore options, refer to [configuration.md](/docs/configuration.md). Tracing configuration changes require a daemon restart to take effect.
+
+For verified collector TLS, set `tracing.skip_verify=false` and leave `OTEL_EXPORTER_OTLP_INSECURE` and `OTEL_EXPORTER_OTLP_TRACES_INSECURE` unset or false. The exporter uses system-trusted CAs by default. For a private CA, set `OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE=/absolute/path/collector-ca.crt` in every AIS daemon's environment before starting or restarting it. This is an [OpenTelemetry exporter setting](https://pkg.go.dev/go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc), separate from AIS HTTP client TLS settings. `tracing.skip_verify=true` overrides the exporter's CA configuration.
 
 | Option name | Default value | Description |
 |---|---|---|
 | `tracing.enabled` | `false` | If true, enables distributed tracing |
 | `tracing.exporter_endpoint` | `''` | OTEL exporter gRPC endpoint |
 | `tracing.service_name_prefix` | `aistore` | Prefix added to OTEL service name reported by exporter |
-| `tracing.attributes` | `{}` | Extra attributes to be added the traces |
-| `tracing.sampler_probablity` | `1` (export all traces) | Percentage of traces to sample [0,1] |
-| `tracing.skip_verify` | `false` | Allow insecure (TLS) exporter gRPC connection |
+| `tracing.attributes` | `{}` | Extra attributes to add to traces |
+| `tracing.sampler_probability` | `1.0` (sample all traces) | Sampling ratio in [0,1], stored as a JSON string |
+| `tracing.skip_verify` | `false` | When true, provide TLS credentials with server-certificate verification disabled; isolated tests only, not plaintext transport |
 | `tracing.exporter_auth.token_header` | `''` | Request header used for exporter auth token |
 | `tracing.exporter_auth.token_file` | `''` | Filepath to obtain exporter auth token |
 
 
-Sample aistore cluster configuration:
+Example `tracing` section for a TLS-enabled collector, with certificate verification enabled:
 
 ```json
 {
-    ...
     "tracing": {
         "enabled": true,
         "exporter_endpoint": "localhost:4317",
-        "skip_verify": true,
+        "skip_verify": false,
         "service_name_prefix": "aistore",
         "sampler_probability": "1.0"
-    },
-    ...
+    }
 }
 ```
 
 ### Build AIStore with tracing
 
-Distributed tracing is a build-time option controlled using *oteltracing* build tag.
+Distributed tracing is a build-time option controlled by the `oteltracing` build tag.
 
-When `aisnode` binary is built without this build tag, tracing configuration is ignored and the entire tracing functionality becomes a no-op.
+When the `aisnode` binary is built without this tag, tracing configuration is ignored and tracing operations are no-ops.
 
 ```console
 # build with tracing support

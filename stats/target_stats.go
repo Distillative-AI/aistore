@@ -185,6 +185,9 @@ type (
 		}
 		ioErrs  int64 // sum values of (ioErrNames) counters
 		standby bool
+
+		// above cleanup watermark: remove deleted buckets and objects (set by target)
+		RmDeleted func() `json:"-"`
 	}
 )
 
@@ -642,7 +645,7 @@ func (r *Trunner) RegMetrics(snode *meta.Snode) {
 	// get-batch error counts
 	r.reg(snode, GetBatchSoftErrCount, KindCounter,
 		&Extra{
-			Help: "get-batch: number of transient errors (retryable failures under configured limit)",
+			Help: "get-batch: number of soft errors (missing entries, stream breaks, GFN recoveries)",
 		},
 	)
 	r.reg(snode, GetBatchErrCountGFN, KindCounter,
@@ -873,11 +876,10 @@ func (r *Trunner) _cap(config *cmn.Config, now int64, verbose bool) (set, clr co
 	if errCap != nil {
 		r.t.OOS(pcs, config, &r.Tcdf)
 		flags = r.nodeStateFlags()
-	} else if cs.PctMax > int32(config.Space.CleanupWM) { // remove deleted, other cleanup
+	} else if cs.PctMax > int32(config.Space.CleanupWM) && r.RmDeleted != nil {
+		// fast remove deleted buckets and objects
 		debug.Func(func() { debug.Assert(!cs.IsOOS(), cs.String()) })
-		errCap = cmn.NewErrCapExceeded(cs.TotalUsed, cs.TotalAvail+cs.TotalUsed, 0, config.Space.CleanupWM, cs.PctMax, false)
-		r.t.OOS(pcs, config, &r.Tcdf)
-		flags = r.nodeStateFlags()
+		r.RmDeleted()
 	}
 
 	// log (periodically | on error | verbose) mountpath cap and state

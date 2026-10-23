@@ -1,45 +1,49 @@
-`ais performance` or (same) `ais show performance` command supports the following 5 (five) subcommands:
+`ais performance` or (same) `ais show performance` command supports six subcommands. The following command entries are excerpted from captured CLI help:
 
-```console
-$ ais performance <TAB-TAB>
-
-counters     throughput   latency      capacity     disk
+```text
+   counters    Show (GET, PUT, DELETE, RENAME, EVICT, APPEND) object counts, as well as:
+   throughput  Show GET and PUT throughput, associated (cumulative, average) sizes and counters.
+   latency     Show GET, PUT, and APPEND latencies and average sizes.
+   capacity    Show target mountpaths, disks, and used/available capacity
+   intra-data  Show intra-cluster streaming traffic: RX/TX object counts, sizes, throughput, and average size.
+   disk        Show disk utilization and read/write statistics
 ```
 
-Further, use `--help` to display any of the five performance subcommands, e.g.:
+Further, use `--help` to display any of the six performance subcommands, e.g.:
 
 ```console
 $ ais performance throughput --help
-
 NAME:
-   ais performance throughput - Show GET and PUT throughput, associated (cumulative, average) sizes and counters
+   ais performance throughput - Show GET and PUT throughput, associated (cumulative, average) sizes and counters.
+     Examples:
+     - 'ais performance throughput --refresh 10'            - update every 10s;
+     - 'ais performance throughput --refresh 10 --count 5'  - 5 iterations, 10s apart.
 
 USAGE:
    ais performance throughput [TARGET_ID] [command options]
 
 OPTIONS:
-   --average-size       Show average GET, PUT, etc. request size
-   --count value        Used together with '--refresh' to limit the number of generated reports, e.g.:
-                         '--refresh 10 --count 5' - run 5 times with 10s interval (default: 0)
-   --no-headers, -H     Display tables without headers
-   --non-verbose, --nv  Non-verbose (quiet) output, minimized reporting, fewer warnings
-   --refresh value      Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
-                        valid time units: ns, us (or µs), ms, s (default), m, h
-   --regex value        Regular expression to select table columns (case-insensitive), e.g.:
-                         --regex "put|err" - show PUT (count), PUT (total size), and all supported error counters;
-                         --regex "Put|ERR" - same as above;
-                         --regex "[a-z]" - show all supported metrics, including those that have zero values across all nodes;
-                         --regex "(AWS-GET$|VERSION-CHANGE$)" - show the number object version changes (updates) and cold GETs from AWS
-                         --regex "(gcp-get$|version-change$)" - same as above for Google Cloud ('gs://')
-   --units value        Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
-                        iec - IEC format, e.g.: KiB, MiB, GiB (default)
-                        si  - SI (metric) format, e.g.: KB, MB, GB
-                        raw - do not convert to (or from) human-readable format
-   --verbose, -v        Verbose output
-   --help, -h           Show help
+   count           Used together with '--refresh' to limit the number of generated reports, e.g.:
+                    '--refresh 10 --count 5' - run 5 times with 10s interval
+   no-headers,H    Display tables without headers
+   non-verbose,nv  Non-verbose (quiet) output, minimized reporting, fewer warnings
+   refresh         Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                   valid time units: ns, us (or µs), ms, s (default), m, h
+   regex           Regular expression to select table columns (case-insensitive), e.g.:
+                    --regex "put|err" - show PUT (count), PUT (total size), and all supported error counters;
+                    --regex "Put|ERR" - same as above;
+                    --regex "[a-z]" - show all supported metrics, including those that have zero values across all nodes;
+                    --regex "aws-get|version-change" - show AWS backend reads and out-of-band object version changes;
+                    --regex "gcp-get|version-change" - same as above for Google Cloud ('gs://')
+   units           Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
+                   iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                   si  - SI (metric) format, e.g.: KB, MB, GB
+                   raw - do not convert to (or from) human-readable format
+   verbose,v       Verbose output
+   help, h         Show help
 ```
 
-> Note that `ais show performance` and its shorter versioni, `ais performance`, can be used interchangeably.
+> Note that `ais show performance` and its shorter version, `ais performance`, can be used interchangeably.
 
 ## `ais performance throughput`
 
@@ -54,58 +58,56 @@ $ ais performance throughput --refresh 30
 Example usage:
 
 ```console
-$ ais show performance latency --refresh 10
-
-latency ------------------ 13:03:58.329680
-TARGET           GET-COLD(n)     GET-COLD-RW(t)  GET-COLD(total/avg size)       GET(n)  GET(t)  GET-REDIR(t)    GET(total/avg size)
-t[EkMt8081]      151             2.01s           145.00MiB  983.31KiB           154     2.13s   1.156551ms      154.00MiB  1.00MiB
-
-latency ------------------ 13:04:08.335764
-TARGET           GET-COLD(n)     GET-COLD-RW(t)  GET-COLD(total/avg size)       GET(n)  GET(t)  GET-REDIR(t)    GET(total/avg size)
-t[EkMt8081]      189             2.04s           181.00MiB  980.66KiB           190     1.86s   892.015µs       190.00MiB  1.00MiB
+$ ais show performance latency --refresh 10 --regex get
 ```
 
-Notice naming conventions:
+Column naming:
 
-* (n) - counter (total number of operations of a given kind)
-* (t) - time (latency of the operation)
+* `(n)` - number of operations
+* `(t)` - average latency over the refresh interval: change in cumulative time divided by change in count; shown as 0 when fewer than 4 requests complete during the interval
 
-Other notable semantics includes:
+| Columns | Meaning |
+| ------- | ------- |
+| `GET(n)`, `GET(t)` | user GET requests, warm and cold; for cold GETs, latency includes reading from the remote backend; reads by copy/transform jobs are not included |
+| `AWS-GET(n)`, `AWS-GET(t)` | reads from the AWS (S3) backend - by cold GETs and also by prefetch, blob download, and copy/transform jobs; latency includes storing (or copying/transforming) the object locally |
 
-| metric | comment |
-| ------ | ------- |
-| `GET-COLD-RW(t)` | denotes (remote read, local write) latency, which is a _part_ of the total latency  _not_ including the time it takes to transmit requested payload to user |
-| `GET(t)` | GET latency (for cold GETs includes the above) |
-| `GET-REDIR(t)` | time that passes between ais gateway _redirecting_ GET operation to specific target, and this target _starting_ to handle the request |
+Other backends follow the same convention: `GCP-GET`, `AZURE-GET`, `OCI-GET`, and `REMAIS-GET` (remote AIS cluster).
+
+Since backend reads include job traffic, the difference between `AWS-GET(n)` and `GET(n)` is not the number of cold GETs.
 
 ## `ais show performance counters`
 
 ```console
 $ ais performance counters --help
 NAME:
-   ais performance counters - show (GET, PUT, DELETE, RENAME, EVICT, APPEND) object counts, as well as:
+   ais performance counters - Show (GET, PUT, DELETE, RENAME, EVICT, APPEND) object counts, as well as:
         - numbers of list-objects requests;
         - (GET, PUT, etc.) cumulative and average sizes;
-        - associated error counters, if any.
+        - associated error counters, if any, and more.
 
 USAGE:
-   ais show performance counters [TARGET_ID] [command options]
+   ais performance counters [TARGET_ID] [command options]
 
 OPTIONS:
-   --refresh value   interval for continuous monitoring;
-                     valid time units: ns, us (or µs), ms, s (default), m, h
-   --count value     used together with '--refresh' to limit the number of generated reports, e.g.:
-                      '--refresh 10 --count 5' - run 5 times with 10s interval (default: 0)
-   --no-headers, -H  display tables without headers
-   --regex value     regular expression select table columns (case-insensitive), e.g.:
-                      --regex "put|err" - show PUT (count), PUT (total size), and all supported error counters;
-                      --regex "[a-z]" - show all supported metrics, including those that have zero values across all nodes;
-                      --regex "(GET-COLD$|VERSION-CHANGE$)" - show the number of cold GETs and object version changes (updates)
-   --units value     show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
-                     iec - IEC format, e.g.: KiB, MiB, GiB (default)
-                     si  - SI (metric) format, e.g.: KB, MB, GB
-                     raw - do not convert to (or from) human-readable format
-   --average-size    show average GET, PUT, etc. request size
+   average-size    Show average GET, PUT, etc. request size
+   count           Used together with '--refresh' to limit the number of generated reports, e.g.:
+                    '--refresh 10 --count 5' - run 5 times with 10s interval
+   no-headers,H    Display tables without headers
+   non-verbose,nv  Non-verbose (quiet) output, minimized reporting, fewer warnings
+   refresh         Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                   valid time units: ns, us (or µs), ms, s (default), m, h
+   regex           Regular expression to select table columns (case-insensitive), e.g.:
+                    --regex "put|err" - show PUT (count), PUT (total size), and all supported error counters;
+                    --regex "Put|ERR" - same as above;
+                    --regex "[a-z]" - show all supported metrics, including those that have zero values across all nodes;
+                    --regex "aws-get|version-change" - show AWS backend reads and out-of-band object version changes;
+                    --regex "gcp-get|version-change" - same as above for Google Cloud ('gs://')
+   units           Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
+                   iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                   si  - SI (metric) format, e.g.: KB, MB, GB
+                   raw - do not convert to (or from) human-readable format
+   verbose,v       Verbose output
+   help, h         Show help
 ```
 
 ## `ais performance disk`
@@ -113,24 +115,27 @@ OPTIONS:
 ```console
 $ ais performance disk --help
 NAME:
-   ais show performance disk - show disk utilization and read/write statistics
+   ais performance disk - Show disk utilization and read/write statistics
 
 USAGE:
-   ais show performance disk [TARGET_ID] [command options]
+   ais performance disk [TARGET_ID] [command options]
 
 OPTIONS:
-   --refresh value   interval for continuous monitoring;
-                     valid time units: ns, us (or µs), ms, s (default), m, h
-   --count value     used together with '--refresh' to limit the number of generated reports, e.g.:
-                      '--refresh 10 --count 5' - run 5 times with 10s interval (default: 0)
-   --no-headers, -H  display tables without headers
-   --units value     show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
-                     iec - IEC format, e.g.: KiB, MiB, GiB (default)
-                     si  - SI (metric) format, e.g.: KB, MB, GB
-                     raw - do not convert to (or from) human-readable format
-   --regex value     regular expression select table columns (case-insensitive), e.g.:
-                      --regex "put|err" - show PUT (count), PUT (total size), and all supported error counters;
-                      --regex "[a-z]" - show all supported metrics, including those that have zero values across all nodes;
-                      --regex "(GET-COLD$|VERSION-CHANGE$)" - show the number of cold GETs and object version changes (updates)
-   --summary         tally up target disks to show per-target read/write summary stats and average utilizations
+   count         Used together with '--refresh' to limit the number of generated reports, e.g.:
+                  '--refresh 10 --count 5' - run 5 times with 10s interval
+   no-headers,H  Display tables without headers
+   refresh       Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                 valid time units: ns, us (or µs), ms, s (default), m, h
+   regex         Regular expression to select table columns (case-insensitive), e.g.:
+                  --regex "put|err" - show PUT (count), PUT (total size), and all supported error counters;
+                  --regex "Put|ERR" - same as above;
+                  --regex "[a-z]" - show all supported metrics, including those that have zero values across all nodes;
+                  --regex "aws-get|version-change" - show AWS backend reads and out-of-band object version changes;
+                  --regex "gcp-get|version-change" - same as above for Google Cloud ('gs://')
+   summary       Tally up target disks to show per-target read/write summary stats and average utilizations
+   units         Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
+                 iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                 si  - SI (metric) format, e.g.: KB, MB, GB
+                 raw - do not convert to (or from) human-readable format
+   help, h       Show help
 ```
