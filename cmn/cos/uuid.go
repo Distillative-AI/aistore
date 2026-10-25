@@ -15,18 +15,19 @@ import (
 	"github.com/NVIDIA/aistore/cmn/mono"
 
 	onexxh "github.com/OneOfOne/xxhash"
-	"github.com/teris-io/shortid"
 )
 
 const (
-	// Alphabet for generating UUIDs similar to the shortid.DEFAULT_ABC
+	// tie-breaker alphabet (GenTie, GenYAID)
 	// NOTE: len(uuidABC) > 0x3f - see GenTie()
 	uuidABC = "-5nZJDft6LuzsjGNpPwY7rQa39vehq4i1cV2FROo8yHSlC0BUEdWbIxMmTgKXAk_"
 )
 
 const (
-	LenShortID = 9  // UUID length, as per https://github.com/teris-io/shortid#id-length
+	LenShortID = 9  // min valid UUID length; retain compatibility with older nodes
 	LenBEID    = 10 // BEID
+
+	lenUUID = 11 // GenUUID: letter + 9 alphanumerics + letter, ~65 bits
 
 	lenDaemonID   = 8 // min length, via cryptographic rand
 	lenK8sProxyID = 13
@@ -52,15 +53,10 @@ const (
 	OnlyPlus       = mayOnlyContain + ", and dots (.)"
 )
 
-var (
-	sid  *shortid.Shortid
-	rtie atomic.Uint64
-)
+var rtie atomic.Uint64
 
+// seed tie-breakers (GenTie, GenYAID)
 func InitShortID(seed uint64) {
-	worker := uint8(seed & 0x1f) // must be < 32
-	sid = shortid.MustNew(worker, uuidABC, seed)
-
 	rtie.Store(uint64(mono.NanoTime()) ^ seed)
 }
 
@@ -68,34 +64,21 @@ func InitShortID(seed uint64) {
 // UUID
 //
 
-// compare with xreg.GenBEID
-// (see also: bench/micro/uuid/genid_test.go)
-
+// generate a cryptographically random ID with letters at both ends
+// vs pre-5.2:
+// - no clock or ordering dependency; safe to call concurrently
+// - never parses as a rebalance ID
+// - removes the shortid dependency
+// compare with xreg.GenBEID (see also: bench/micro/uuid/genid_test.go)
 func GenUUID() string {
 	var (
-		h, t string
-		uuid = sid.MustGenerate()
+		b    [lenUUID]byte
+		ends [2]byte
 	)
-	c := uuid[0]
-	if (c == 'g' && looksLikeReb(uuid)) || !isAlpha(c) { // cosmetic prefix
-		tie := rtie.Add(1)
-		h = string(rune('A' + tie%26))
-	}
-	c = uuid[len(uuid)-1]
-	if c == '-' || c == '_' { // ditto
-		tie := rtie.Add(1)
-		t = string(rune('a' + tie%26))
-	}
-	return h + uuid + t
-}
-
-func looksLikeReb(id string) bool {
-	for i := 1; i < len(id); i++ {
-		if !isNum(id[i]) {
-			return false
-		}
-	}
-	return true
+	randBytes(crnd, LetterRunes, ends[:])
+	randBytes(crnd, AlnumRunes, b[1:lenUUID-1])
+	b[0], b[lenUUID-1] = ends[0], ends[1]
+	return string(b[:])
 }
 
 // "best-effort ID" encoder: turn 64-bit value into a short printable ID
