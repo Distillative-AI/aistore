@@ -6,8 +6,10 @@
 package cmn
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -74,6 +76,7 @@ type (
 		Certificate string
 		Key         string
 		SkipVerify  bool
+		AltDNSName  string // intra-cluster only; see HTTPConf.ToTLSAlt
 	}
 )
 
@@ -110,6 +113,90 @@ func NewTransport(cargs TransportArgs) *http.Transport {
 		transport.Proxy = defaultTransport.Proxy
 	}
 	return transport
+}
+
+// accept a peer certificate valid for host or for name;
+// nil roots means system roots
+func verifyHostOrName(roots *x509.CertPool, host, name string) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("client tls: no peer certificate")
+		}
+		leaf := cs.PeerCertificates[0]
+		opts := x509.VerifyOptions{Roots: roots, Intermediates: x509.NewCertPool()}
+		for _, c := range cs.PeerCertificates[1:] {
+			opts.Intermediates.AddCert(c)
+		}
+		if _, err := leaf.Verify(opts); err != nil {
+			return err
+		}
+		hostErr := leaf.VerifyHostname(host)
+		if hostErr == nil {
+			return nil
+		}
+		if err := leaf.VerifyHostname(name); err != nil {
+			return errors.Join(hostErr, err)
+		}
+		return nil
+	}
+}
+
+func (sargs *TLSArgs) useAlt(intra bool) bool {
+	return intra && sargs.AltDNSName != "" && !sargs.SkipVerify
+}
+
+// complete client TLS handshake on conn;
+// accept a peer certificate valid for the host in addr or for alt name
+func handshakeAlt(ctx context.Context, conn net.Conn, addr string, conf *tls.Config, alt string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	conf = conf.Clone()
+	// keep SNI, as http.Transport does without DialTLSContext
+	if conf.ServerName == "" {
+		conf.ServerName = host
+	}
+	conf.InsecureSkipVerify = true // replaced by VerifyConnection
+	// VerifyConnection sees an empty server name for IP addresses (no SNI); bind the dialed host
+	conf.VerifyConnection = verifyHostOrName(conf.RootCAs, host, alt)
+	tc := tls.Client(conn, conf)
+	if err := tc.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return tc, nil
+}
+
+// configure the transport as an HTTPS client
+// - with alt name verification, later changes to tr.DialContext or tr.TLSClientConfig
+// do not apply to HTTPS connections
+func SetTLS(tr *http.Transport, sargs TLSArgs, intra bool) error {
+	conf, err := NewTLS(sargs, intra)
+	if err != nil {
+		return err
+	}
+	tr.TLSClientConfig = conf
+	if !sargs.useAlt(intra) {
+		return nil
+	}
+	dial, timeout := tr.DialContext, tr.TLSHandshakeTimeout
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		return handshakeAlt(ctx, conn, addr, conf, sargs.AltDNSName)
+	}
+	return nil
 }
 
 func NewTLS(sargs TLSArgs, intra bool) (tlsConf *tls.Config, err error) {
@@ -198,13 +285,9 @@ func NewIntraClientTLS(cargs TransportArgs, config *Config) *http.Client {
 // TransportArgs.ClientTimeout becomes http.Client.Timeout.
 func NewClientTLS(cargs TransportArgs, sargs TLSArgs, intra bool) *http.Client {
 	transport := NewTransport(cargs)
-
-	// initialize TLS config
-	tlsConfig, err := NewTLS(sargs, intra)
-	if err != nil {
+	if err := SetTLS(transport, sargs, intra); err != nil {
 		cos.ExitLog(err) // FATAL
 	}
-	transport.TLSClientConfig = tlsConfig
 	return &http.Client{Transport: transport, Timeout: cargs.ClientTimeout}
 }
 

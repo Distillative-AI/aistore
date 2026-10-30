@@ -6,9 +6,12 @@
 package cli
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -111,8 +114,15 @@ func isErrDoesNotExist(err error) bool {
 // misc. utils, helpers
 //
 
+// recognize TLS certificate verification errors
 func isCertificateVerificationError(err error) bool {
-	return strings.HasPrefix(err.Error(), "CertificateVerificationError")
+	// check go type error first
+	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
+		return true
+	}
+	// if serialized, check http type code
+	herr := cmn.AsErrHTTP(err)
+	return herr != nil && herr.TypeCode == "CertificateVerificationError"
 }
 
 func isUnreachableError(err error) (msg string, unreachable bool) {
@@ -122,13 +132,13 @@ func isUnreachableError(err error) (msg string, unreachable bool) {
 			err.Message = err.StringEx()
 		}
 		msg = err.Message
-		unreachable = cos.IsUnreachable(err, err.Status)
+		unreachable = isUnreachableHerr(err)
 	case *errUsage, *errAdditionalInfo:
 		return "", false
 	default:
 		msg = err.Error()
 		if herr := cmn.AsErrHTTP(err); herr != nil {
-			unreachable = cos.IsUnreachable(herr, herr.Status)
+			unreachable = isUnreachableHerr(herr)
 		} else {
 			regx := regexp.MustCompile("dial.*(timeout|refused)")
 			if unreachable = regx.MatchString(msg); unreachable {
@@ -139,6 +149,31 @@ func isUnreachableError(err error) (msg string, unreachable bool) {
 		}
 	}
 	return
+}
+
+// - status-based, as reported by the server (see cos.IsUnreachable)
+// - or, failed to dial (connection refused, DNS lookup, dial timeout)
+// (not unwrapping into cos.IsUnreachable: client timeouts and EOFs are not "unreachable")
+func isUnreachableHerr(herr *cmn.ErrHTTP) bool {
+	if oerr, ok := errors.AsType[*net.OpError](herr); ok && oerr.Op == "dial" {
+		return true
+	}
+	return cos.IsUnreachable(nil, herr.Status)
+}
+
+// return the node URL that failed, if different from the configured CLI endpoint
+// (e.g., primary from the cluster map)
+func unreachableOther(err error) string {
+	uerr, ok := errors.AsType[*url.Error](err)
+	if !ok {
+		return ""
+	}
+	u, e1 := url.Parse(uerr.URL)
+	c, e2 := url.Parse(clusterURL)
+	if e1 != nil || e2 != nil || u.Host == c.Host {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 func redErr(err error) error {
@@ -393,11 +428,20 @@ func formatErr(err error) error {
 		return nil
 	}
 	if _, unreachable := isUnreachableError(err); unreachable {
+		if other := unreachableOther(err); other != "" {
+			return redErr(fmt.Errorf("AIStore cannot be reached at %s (CLI endpoint: %s)", other, clusterURL))
+		}
 		errmsg := fmt.Sprintf("AIStore cannot be reached at %s\n", clusterURL)
 		errmsg += fmt.Sprintf("Make sure that environment '%s' has the address of any AIS gateway (proxy).\n"+
 			"For defaults, see CLI config at %s or run `ais show config cli`.",
 			env.AisEndpoint, config.Path())
 		return redErr(errors.New(errmsg))
+	}
+	if isCertificateVerificationError(err) {
+		const tip = "\n(Tip: the requested DNS name or IP must match a certificate Subject Alternative Name; " +
+			"configure a trusted CA with " + env.AisClientCA + " or CLI 'cluster.client_ca_tls')" +
+			"\n  For testing only (insecure): 'ais config cli set cluster.skip_verify_crt true'"
+		return redErr(errors.New(err.Error() + tip))
 	}
 	switch err := err.(type) {
 	case *cmn.ErrHTTP:
@@ -412,14 +456,6 @@ func formatErr(err error) error {
 		err.baseErr = formatErr(err.baseErr)
 		return err
 	default:
-		// unwrap and check assorted system error types
-		// (currently, only tls cert validation)
-		const tip = "\n(Tip: review CLI configuration ('ais config cli'), in particular tls and 'skip_verify' settings)"
-		if uerr := errors.Unwrap(err); uerr != nil {
-			if isCertificateVerificationError(uerr) {
-				err = errors.New(uerr.Error() + tip)
-			}
-		}
 		return redErr(err)
 	}
 }

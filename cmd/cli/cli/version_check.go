@@ -90,6 +90,7 @@ func proxiesOlderThan(c *cli.Context, version string) bool {
 }
 
 func checkVersionWarn(c *cli.Context, role string, stmap teb.NodeStatusMap) bool {
+	// TODO: remove "(in maintenance mode?)" hint - see related `bab474d19ccc`
 	const fmtEmptyVer = "empty version from %s (in maintenance mode?)"
 
 	longParams := getLongRunParams(c)
@@ -105,7 +106,7 @@ func checkVersionWarn(c *cli.Context, role string, stmap teb.NodeStatusMap) bool
 
 	for _, ds := range stmap {
 		if ds.Version == "" {
-			if ds.Node.Snode.InMaintOrDecomm() {
+			if ds.Status != teb.NodeOnline || ds.Node.Snode.InMaintOrDecomm() {
 				continue
 			}
 			actionWarnf(c, fmtEmptyVer, ds.Node.Snode.StringEx())

@@ -45,6 +45,8 @@ AIStore exposes blob download functionality through three distinct interfaces, e
 - **Prefetch + blob-threshold** – route large objects in the prefetch job through blob downloader.
 - **Streaming GET** – stream a large object from blob downloader while it is being cached in AIS.
 
+For a comparison with other ways to read large remote objects, including S3 clients, see [Reading large objects from remote buckets](/docs/howto_large_cold_objects.md).
+
 ### 1. Single object blob-download job
 
 Use this when you want direct control over which/how objects are fetched with blob downloader.
@@ -131,7 +133,7 @@ Key prefetch options:
 - **`--blob-chunk-size SIZE`**: chunk size when bucket auto-chunking is disabled; otherwise `chunks.chunk_size` applies.
 - **`--prefix` / `--list` / `--template`**: scope which objects are prefetched.
 
-### 3. Streaming GET (Python SDK Only)
+### 3. Streaming GET
 
 In addition to CLI jobs, blob downloader can be used to stream large objects while they are concurrently downloaded in the cluster. This is useful when you want to feed data directly into an application (for example, model loading or preprocessing) and still keep a copy in AIS.
 
@@ -143,13 +145,22 @@ from aistore.sdk.blob_download_config import BlobDownloadConfig
 client = Client("AIS_ENDPOINT")
 bucket = client.bucket(name="my_bucket", provider="aws")
 
-# Configure blob downloader (4 MiB chunks, 16 workers)
-blob_cfg = BlobDownloadConfig(chunk_size="4MiB", num_workers="16")
+# Select and tune server-side blob download
+blob_cfg = BlobDownloadConfig(
+    threshold=64 * 1024 * 1024,
+    chunk_size="4MiB",
+    num_workers="16",
+    read_timeout="30s",
+)
 
-# Stream large object using blob downloader settings
-reader = bucket.object("my_large_object").get_reader(blob_download_config=blob_cfg)
+# Use the blob downloader for remote objects at least 64 MiB in size
+reader = bucket.object("my_large_object").get_reader(
+    blob_download_config=blob_cfg,
+)
 data = reader.read_all()
 ```
+
+`BlobDownloadConfig.num_workers` controls server-side blob-download readers. `Object.get_reader(num_workers=...)` is a separate client-side mode and cannot be combined with this configuration.
 
 ### Size limits
 

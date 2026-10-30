@@ -1654,7 +1654,7 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 		bckArgs.w = w
 		bckArgs.r = r
 		bckArgs.bck = bck
-		bckArgs.perms = apc.AccessNone // access checked below
+		bckArgs.perms = dtor.Access
 		bckArgs.msg = msg
 		bckArgs.query = query
 		bckArgs.createAIS = false
@@ -2047,6 +2047,13 @@ func (p *proxy) _bcr(w http.ResponseWriter, r *http.Request, query url.Values, m
 				return
 			}
 		}
+		if backendBck.Props == nil {
+			bargs := bckPropsArgs{bck: backendBck}
+			backendBck.Props = bargs.inheritMerge()
+		}
+		if err := p.checkAccess(w, r, backendBck, apc.AccessRW); err != nil {
+			return
+		}
 	}
 
 	// 3. plain ais://bucket-name with no nothing
@@ -2428,7 +2435,8 @@ func (p *proxy) httpbckpatch(w http.ResponseWriter, r *http.Request, apireq *api
 		return
 	}
 	perms := apc.AcePATCH
-	if propsToUpdate.Access != nil {
+	// reset-bprops overwrites Access with the default (apc.AccessAll)
+	if propsToUpdate.Access != nil || msg.Action == apc.ActResetBprops {
 		perms |= apc.AceBckSetACL
 	}
 
@@ -2473,6 +2481,9 @@ func (p *proxy) httpbckpatch(w http.ResponseWriter, r *http.Request, apireq *api
 			bckArgs.r = r
 			bckArgs.bck = backendBck
 			bckArgs.msg = msg
+			if !nprops.BackendBck.Equal(&bck.Props.BackendBck) {
+				bckArgs.perms = apc.AccessRW
+			}
 			bckArgs.dpq = apireq.dpq
 			bckArgs.query = apireq.query
 			bckArgs.createAIS = false
@@ -3137,7 +3148,17 @@ func (p *proxy) receiveRMD(newRMD *rebMD, msg *actMsgExt, sender string) error {
 	// Register `nl` for rebalance/resilver
 	smap := p.owner.smap.get()
 	if smap.IsIC(p.si) && smap.CountActiveTs() > 0 && (smap.IsPrimary(p.si) || p.ClusterStarted()) {
-		nl := xact.NewXactNL(xact.RebID2S(newRMD.Version), apc.ActRebalance, &smap.Smap, nil)
+		xid := xact.RebID2S(newRMD.Version)
+
+		// when rebalance is limited to user-specified bucket(s)
+		var bcks []*cmn.Bck
+		if msg.Action == apc.ActRebalance {
+			if args, _ := msg.rebalanceArgs(xid); !args.Bck.IsEmpty() {
+				bcks = []*cmn.Bck{&args.Bck}
+			}
+		}
+
+		nl := xact.NewXactNL(xid, apc.ActRebalance, &smap.Smap, nil, bcks...)
 		nl.SetOwner(equalIC)
 		err := p.notifs.add(nl)
 		debug.AssertNoErr(err)

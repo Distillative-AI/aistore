@@ -39,6 +39,9 @@ func _x509Client() *http.Client {
 		return g.client.control
 	}
 	transport.TLSClientConfig.InsecureSkipVerify = true
+	// drop the custom dialer (alt_tls_dns_name): it holds the original
+	// TLS config and would still verify
+	transport.DialTLSContext = nil
 	return &http.Client{
 		Transport: transport,
 		Timeout:   g.client.control.Timeout,

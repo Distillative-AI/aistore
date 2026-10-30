@@ -26,6 +26,7 @@ These measured shares are separate from the configured shares shown by
   - [Startup readiness](#startup-readiness)
   - [Troubleshooting](#troubleshooting)
 - [Upgrade](#upgrade)
+- [Python SDK direct reads](#python-sdk-direct-reads)
 - [Buckets](#buckets)
 - [Erasure coding](#erasure-coding)
 - [Verifying placement](#verifying-placement)
@@ -293,14 +294,22 @@ Nodes already ready before weights appear keep their readiness.
 
 ## Upgrade
 
-Older nodes cannot decode a cluster map with weights, or bucket metadata with placement overrides.
+Older nodes cannot decode a cluster map with weights, bucket metadata with placement
+overrides, or the rebalance metadata used for bucket redistribution.
 
 - setting weights returns HTTP 409 while node versions differ
 - a pre-5.2 node cannot join a weighted cluster, or a cluster with any bucket placement override
 - the primary learns node versions on join and from keepalives; right after a primary change,
   setting weights may return HTTP 409 until all members outside maintenance/decommission
   have reported the primary's version; those in maintenance/decommission are checked on rejoin
-- setting a bucket placement override is not yet rejected while node versions differ
+- introducing a bucket placement override or changing effective bucket placement
+  also requires every active member to run the primary's version
+
+## Python SDK direct reads
+
+Python SDK 2.1 computes uniform HRW placement for `get_reader(direct=True)` and `Smap.get_target_for_object()`. It does not apply target weights or bucket placement overrides and can therefore select the wrong target for a weighted bucket.
+
+For weighted buckets, keep the default `direct=False`. The request goes through a proxy, which selects the target using the bucket's effective placement policy. The subsequent data transfer still follows the normal proxy-to-target redirect path.
 
 ## Buckets
 
@@ -311,8 +320,16 @@ ais bucket props set ais://abc placement.weighting=uniform   # uniform placement
 ais bucket props set ais://abc placement.weighting=""        # reset (follow target weights)
 ```
 
-- set the override before writing data: redistribution on override change is pending,
-  and objects written under the previous policy remain where they are
+- changing effective placement starts a bucket-scoped rebalance and returns its job ID;
+  this applies to existing objects, including when resetting the override or bucket properties
+- unchanged policies, or changes between default and uniform placement with equal or
+  unset target weights, update properties without redistribution
+- a single properties update cannot both redistribute objects and re-mirror, re-EC,
+  or rechunk the bucket; submit these layout changes separately
+- ownership-changing updates require rebalance enabled and obey the same membership
+  serialization and EC spare-target checks as target-weight updates
+- any change of `placement.weighting`, even in an unweighted cluster, returns `ErrBusy`
+  (HTTP 409) while a rebalance or membership change is in progress; retry when it completes
 - clearing target weights returns HTTP 409 while any bucket has an override
 - a pre-5.2 node cannot join a cluster with any bucket override
 
@@ -324,9 +341,10 @@ Weights apply to EC as well: the object's full replica goes to its owner, and sl
 - a target holds at most one part of any given object; as `data_slices + parity_slices + 1`
   approaches the number of active targets, almost every target holds a part of every
   object, and weights have little effect on EC buckets
-- moving an object's owner (e.g., after a weight change) needs a spare active target
+- moving a sliced object's owner (e.g., after a weight change) needs a spare active target
   beyond the full replica and slices: `data_slices + parity_slices + 2` active targets;
-  admission checks for weight changes without such spare capacity are pending
+  target-weight and bucket-policy updates that require migration are rejected without
+  that spare capacity; uniform buckets are unaffected by target-weight updates
 
 ## Verifying placement
 

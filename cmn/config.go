@@ -732,6 +732,10 @@ type (
 		SkipVerifyCrt   bool `json:"skip_verify"`       // skip X.509 cert verification (used with self-signed certs)
 		Chunked         bool `json:"chunked_transfer"`  // (https://tools.ietf.org/html/rfc7230#page-36; not used since 02/23)
 
+		// node-to-node TLS: also accept peer certificates valid for this DNS name
+		// (control plane and intra-cluster relays only; see ToTLSAlt)
+		AltDNSName string `json:"alt_tls_dns_name,omitempty"`
+
 		// Optional TLS overrides for public listeners;
 		// when nil or empty, public listeners use the common net.http TLS configuration.
 		Pub *TLSConf `json:"pub,omitempty"`
@@ -739,6 +743,7 @@ type (
 	HTTPConfToSet struct {
 		*TLSConfToSet          `json:",inline"`
 		ServerNameTLS          *string       `json:"domain_tls,omitempty"`
+		AltDNSName             *string       `json:"alt_tls_dns_name,omitempty"`
 		IdleConnTimeout        *cos.Duration `json:"idle_conn_time,omitempty"`
 		BackendIdleConnTimeout *cos.Duration `json:"backend_idle_conn_time,omitempty"`
 		MaxIdleConnsPerHost    *int          `json:"idle_conns_per_host,omitempty"`
@@ -2361,6 +2366,11 @@ func (c *HTTPConf) Validate() error {
 	if c.ServerNameTLS != "" {
 		return fmt.Errorf("invalid domain_tls %q: expecting empty (domain names/SANs should be set in X.509 cert)", c.ServerNameTLS)
 	}
+	if c.AltDNSName != "" {
+		if err := validateDNSName(c.AltDNSName); err != nil {
+			return fmt.Errorf("invalid alt_tls_dns_name %q: %v", c.AltDNSName, err)
+		}
+	}
 
 	// note: NewClient(TransportArgs{}) defaults to: DefaultIdleConnTimeout (6s)
 	if d := c.IdleConnTimeout.D(); d == 0 {
@@ -2417,6 +2427,37 @@ func (c *HTTPConf) ToTLS() TLSArgs {
 		ClientCA:    c.ClientCA,
 		SkipVerify:  c.SkipVerifyCrt,
 	}
+}
+
+// same as ToTLS, plus alt_tls_dns_name
+// - use only for node-to-node dials that may target a node's public URL
+func (c *HTTPConf) ToTLSAlt() TLSArgs {
+	sargs := c.ToTLS()
+	sargs.AltDNSName = c.AltDNSName
+	return sargs
+}
+
+// lowercase RFC 1123 subdomain: dot-separated labels of [a-z0-9-],
+// each 1..63 long, not starting or ending with '-'; 253 max total
+func validateDNSName(name string) error {
+	if len(name) > 253 {
+		return errors.New("must be no more than 253 characters")
+	}
+	for label := range strings.SplitSeq(name, ".") {
+		if l := len(label); l == 0 || l > 63 {
+			return errors.New("each label must be 1 to 63 characters long")
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return errors.New("labels must start and end with an alphanumeric character")
+		}
+		for i := range len(label) {
+			c := label[i]
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return fmt.Errorf("invalid character %q (expecting lowercase alphanumeric, '-', or '.')", c)
+			}
+		}
+	}
+	return nil
 }
 
 /////////////

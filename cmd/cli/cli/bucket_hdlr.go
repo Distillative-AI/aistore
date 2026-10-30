@@ -344,6 +344,7 @@ var (
 		commandRechunk: {
 			verbObjPrefixFlag,
 			syncRemoteFlag,
+			continueOnErrorFlag,
 			yesFlag,
 			waitFlag,
 			waitJobXactFinishedFlag,
@@ -698,8 +699,9 @@ func rechunkBucketHandler(c *cli.Context) error {
 		}
 	}
 	msg := &apc.RechunkMsg{
-		Prefix:     prefix,
-		SyncRemote: syncRemote,
+		Prefix:          prefix,
+		SyncRemote:      syncRemote,
+		ContinueOnError: flagIsSet(c, continueOnErrorFlag),
 	}
 	xid, err := api.RechunkBucket(apiBP, bck, msg)
 	if err != nil {
@@ -776,10 +778,14 @@ func resetPropsHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := api.ResetBucketProps(apiBP, bck); err != nil {
+	xid, err := api.ResetBucketProps(apiBP, bck)
+	if err != nil {
 		return V(err)
 	}
 	actionDone(c, "Bucket props successfully reset to cluster defaults")
+	if xid != "" {
+		actionDonef(c, "Started job %s. %s", xid, toMonitorMsg(c, xid, ""))
+	}
 	return nil
 }
 
