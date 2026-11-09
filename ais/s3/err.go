@@ -33,6 +33,8 @@ const (
 	ErrCodeInvalidArgument = "InvalidArgument" // 400 (malformed query)
 	ErrCodeInvalidRequest  = "InvalidRequest"  // catch-all
 	ErrCodeNotImplemented  = "NotImplemented"  // 501
+
+	ErrCodePreconditionFailed = "PreconditionFailed" // 412
 )
 
 // See https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html
@@ -107,6 +109,7 @@ func WriteErr(w http.ResponseWriter, r *http.Request, errInfo ErrInfo) {
 		out       Error         // out error
 		in        *cmn.ErrHTTP
 		errName   *cmn.ErrBckNameConflict
+		errUnsupp *cmn.ErrUnsupp
 		ok        bool
 		allocated bool
 	)
@@ -115,6 +118,13 @@ func WriteErr(w http.ResponseWriter, r *http.Request, errInfo ErrInfo) {
 	if in, ok = err.(*cmn.ErrHTTP); !ok {
 		in = cmn.InitErrHTTP(r, err, errInfo.Status)
 		allocated = true
+		if wrapped := cmn.AsErrHTTP(err); wrapped != nil {
+			// Keep the wrapper's message (including multipart hints) and the wire error's identity.
+			in.TypeCode = wrapped.TypeCode
+			if wrapped.Status != 0 {
+				in.Status = wrapped.Status
+			}
+		}
 	}
 	out.Message = in.Message
 	switch {
@@ -134,6 +144,10 @@ func WriteErr(w http.ResponseWriter, r *http.Request, errInfo ErrInfo) {
 		}
 	case isErrNoSuchUpload(err):
 		out.Code = NoSuchUpload
+	case in.Status == http.StatusNotImplemented && errors.As(err, &errUnsupp):
+		out.Code = ErrCodeNotImplemented
+	case in.Status == http.StatusPreconditionFailed:
+		out.Code = ErrCodePreconditionFailed
 	case in.TypeCode != "":
 		out.Code = in.TypeCode
 	default:

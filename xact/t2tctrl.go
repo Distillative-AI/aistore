@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
@@ -39,10 +40,36 @@ var (
 )
 
 func (xctn *Base) NewErrRecvAbortXact(tid, errCause string) error {
-	return fmt.Errorf("%w: %s [%s: %q]", errRecvAbortXact, xctn.Cname(), meta.Tname(tid), errCause)
+	return newErrRecvAbortXact(xctn.Cname(), tid, errCause)
+}
+
+func newErrRecvAbortXact(cname, tid, errCause string) error {
+	return fmt.Errorf("%w: %s [%s: %q]", errRecvAbortXact, cname, meta.Tname(tid), errCause)
+}
+
+func RecvAbortXact(xctn core.Xact, tid, errCause string) {
+	err := newErrRecvAbortXact(xctn.Cname(), tid, errCause)
+	if xctn.Abort(err) {
+		nlog.Warningln(err)
+	}
 }
 
 func IsErrRecvAbortXact(err error) bool { return errors.Is(err, errRecvAbortXact) }
+
+// return true if other targets get the same abort without T2T (peer, proxy xact-stop, or cluster-wide event)
+// TODO: a shared cause found locally (e.g., missing source bucket) is not marked
+func (xctn *Base) SkipAbortBcast(err error) bool {
+	return IsErrRecvAbortXact(err) || xctn.IsClusterAbort() ||
+		errors.Is(err, cmn.ErrXactUserAbort) || errors.Is(err, cmn.ErrXactICNotifAbort)
+}
+
+func (xctn *Base) BcastAbort(smap *meta.Smap) {
+	err := xctn.AbortErr()
+	if err == nil || xctn.SkipAbortBcast(err) {
+		return
+	}
+	xctn.BcastCtrl(smap, "", OpcodeAbortXact, err)
+}
 
 func (xctn *Base) NewErrRecvAbortWI(tid, wid, errCause string) error {
 	return fmt.Errorf("%w: %s wid=%q [%s: %q]", errRecvAbortWI, xctn.Cname(), wid, meta.Tname(tid), errCause)
@@ -87,5 +114,7 @@ func (xctn *Base) BcastCtrl(smap *meta.Smap, wid, opcode string, err error) {
 			}
 		}(tsi)
 	}
-	nlog.WarningDepth(1, xctn.Name(), core.T.String(), "bcast abort [", err, "]")
+	if cmn.Rom.V(4, cos.ModXs) {
+		nlog.InfoDepth(1, xctn.Name(), core.T.String(), "bcast abort [", err, "]")
+	}
 }

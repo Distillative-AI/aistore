@@ -13,7 +13,7 @@ dependencies noted where applicable.
 - [On-demand adaptive rate limiter for jobs](#on-demand-adaptive-rate-limiter-for-jobs)
 - [Data mover: finish without the receive-side quiesce](#data-mover-finish-without-the-receive-side-quiesce)
 - [Out-of-band control for all xactions](#out-of-band-control-for-all-xactions)
-- [prune: transient HEAD errors delete destination objects](#prune-transient-head-errors-delete-destination-objects)
+- [prune: report the source-check errors](#prune-report-the-source-check-errors)
 - [Miscellaneous](#miscellaneous)
 
 ## Remote prefix iteration: single designated target (highest priority)
@@ -161,9 +161,14 @@ T2T control (xact/t2tctrl.go: `POST /v1/xactions/t2tctrl/{xkind}/{xid}/{wid}/{op
 
 Goal: reliable control, independent of data streams and DM. HTTP alone does not supply delivery or completion guarantees.
 
-- today, only x-moss uses T2T control (moss.go; ais/ml.go); `target.xactCtrl` (ais/tgtxact.go) explicitly
-  rejects other kinds, so generalize dispatch as well as adding opcodes
-- still in-stream: sentinel.go (tcb, tcobjs, archive), streaming.go, lso.go (abort)
+- today, `target.xactCtrl` (ais/tgtxact.go) dispatches to x-moss (moss.go; ais/ml.go), and aborts
+  other kinds on `xact.OpcodeAbortXact` (see `xact.RecvAbortXact`)
+- sentinel abort goes both via T2T (`xact.Base.BcastAbort`, upon abort) and in-stream (`sentinel.bcast`, upon fini);
+  x-list abort: `xact.Base.BcastAbort` (designated target, upon abort) and in-stream (`LsoXact.sendAbort`)
+- still in-stream only: sentinel.go (done, progress), archive.go (done)
+- x-list page timeout: the proxy sends one asynchronous `Abort2PC` to the designated target if its
+  page call times out. peers waiting for the page can time out locally
+  - best-effort, single attempt: a lost abort leaves the designated target running until `lso.idle_time`
 - add opcodes as needed: done (with per-destination counts, see above), progress request/response
 - delivery: `SendCtrl` waits for an HTTP response; `BcastCtrl` launches asynchronous sends and only logs
   failures. Add bounded retries/acknowledgments or a receiver-side status fallback for completion
@@ -175,16 +180,11 @@ Goal: reliable control, independent of data streams and DM. HTTP alone does not 
 - define capability/version gating for mixed-version clusters; remove group-1 opcodes from
   transport/header.go only after legacy use is no longer supported, updating `IsControl` and tests too
 
-## prune: transient HEAD errors delete destination objects
+## prune: report the source-check errors
 
-`prune.do` (prune.go): `if _, err := core.T.HeadObjT2T(src, tsi); err != nil` shadows the outer `err`
-and sets `ecode = http.StatusNotFound` on any error when the AIS source is owned by another target.
-A timeout, 503, or connection reset therefore reads as "source does not exist", and `--sync` can remove
-the destination object. This is a data-safety fix, not just error-message cleanup.
-
-Preserve the actual error/status and remove only on a confirmed not-found; retain the destination and
-report other HEAD failures. Add an integration regression that injects transient peer HEAD failures
-and verifies that the destination survives, while a genuine source 404 still permits pruning.
+`prune.do` keeps the destination when the local `Load` or the remote `HeadCold` fails with an error
+other than not-found, but does not report the error. Add it to the job, as `peerReply` does.
+Add an integration test that verifies that prune removes no destination object when a peer does not answer.
 
 ## Miscellaneous
 

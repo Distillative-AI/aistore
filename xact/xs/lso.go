@@ -6,6 +6,7 @@
 package xs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -178,6 +179,10 @@ func (p *lsoFactory) Start() error {
 		}
 		if r.walk.this {
 			r.page = make(cmn.LsoEntries, 0, iniPageCap) // reuse across all remote pages (may grow in cap)
+			if p.dm != nil {
+				// TODO: r.smap misses a target that joins after Start (it waits for list_timeout)
+				context.AfterFunc(r.Context(), func() { r.BcastAbort(r.smap) }) // including abort between pages
+			}
 		}
 
 		// engage local page iterator (lpi)
@@ -350,36 +355,28 @@ loop:
 		}
 	}
 
-	// TODO confirm: once started (lsoFactory.Start), always runs and executes stop (to properly cleanup)
 	r.stop()
 }
 
 func (r *LsoXact) stop() {
 	r.stopCh.Close()
 	if r.walk.remote {
-		if r.DemandBase.IsDone() {
-			// must be aborted
-			r.DemandBase.Stop()
-			if !r.walk.wor {
-				r.p.dm.Close(r.Err())
-				r.p.dm.UnregRecv()
-			}
-		} else {
-			r.DemandBase.Stop()
+		aborted := r.DemandBase.IsDone()
+		r.DemandBase.Stop()
+		if !aborted {
 			r.Finish()
 			r.lastmsg()
+		}
+		if !r.walk.wor {
+			r.p.dm.Close(r.Err())
 
-			if !r.walk.wor {
-				r.p.dm.Close(r.Err())
-
-				if r.walk.this {
-					debug.Assert(r.remtCh == nil)
-					cos.DrainAnyChan(r.msgCh)
-					r.p.dm.UnregRecv()
-				} else if r.p.dm != nil {
-					// postpone unreg
-					hk.Reg(r.ID()+hk.NameSuffix, r.fcleanup, r.config.Lso.QuiesceTime.D())
-				}
+			if r.walk.this {
+				debug.Assert(r.remtCh == nil)
+				cos.DrainAnyChan(r.msgCh)
+				r.p.dm.UnregRecv()
+			} else if r.p.dm != nil {
+				// designated target may still send a page (postpone unreg)
+				hk.Reg(r.ID()+hk.NameSuffix, r.fcleanup, r.config.Lso.QuiesceTime.D())
 			}
 		}
 	} else {
@@ -599,11 +596,7 @@ func (r *LsoXact) nextPageR() (err error) {
 		if err := r.smap.CheckSameTargets(smapCurr, r.Name()); err != nil {
 			r.Abort(err)
 			if r.walk.this {
-				// TODO:
-				// - transition to use T2T control
-				// - for details, see xact/xs/TODO.md, "Out-of-band control for all xactions"
-				r.sendTerm(r.msg.UUID, nil, err)
-				time.Sleep(2 * time.Second) // TODO: remove
+				r.sendAbort()
 			}
 			return err
 		}
@@ -615,20 +608,19 @@ func (r *LsoXact) nextPageR() (err error) {
 		page, err = r.thisPageR(npg)
 	} else {
 		debug.AssertFunc(func() bool { return !r.msg.WantOnlyRemoteProps() && /*same*/ !r.walk.wor })
+		timeout := cmn.GCO.Get().Client.ListObjTimeout // current (as the proxy)
 		select {
 		case rsp := <-r.remtCh:
-			switch {
-			case rsp == nil:
-				err = ErrGone
-			case rsp.Err != nil:
-				err = rsp.Err
-			default:
-				page = rsp.Lst
-				err = npg.filterAddLmeta(page)
-				r.walk.last = page.ContinuationToken == ""
-			}
+			debug.Assert(rsp != nil && rsp.Err == nil)
+			page = rsp.Lst
+			err = npg.filterAddLmeta(page)
+			r.walk.last = page.ContinuationToken == ""
 		case <-r.ChanAbort():
 			err = r.AbortErr()
+		case <-time.After(timeout.D()): // proxy gives up
+			err = fmt.Errorf("%s: timed out waiting for %s (%v)", r, meta.Tname(r.msg.SID), timeout)
+			r.Abort(err)
+			nlog.Warningln(err)
 		}
 	}
 
@@ -688,8 +680,19 @@ rerr:
 	if aborted && err == nil {
 		err = r.AbortErr()
 	}
-	r.sendTerm(r.msg.UUID, nil, err)
+	r.Abort(err)
+	if r.p.dm != nil {
+		r.sendAbort()
+	}
 	return page, err
+}
+
+func (r *LsoXact) sendAbort() {
+	err := r.AbortErr()
+	if r.SkipAbortBcast(err) {
+		return // peers abort via another source (see SkipAbortBcast)
+	}
+	r.sendTerm(r.msg.UUID, nil, err)
 }
 
 func (r *LsoXact) bcast(page *cmn.LsoRes) (err error) {
@@ -899,7 +902,9 @@ func (r *LsoXact) cb(fqn string, de fs.DirEntry) error {
 	}
 
 	// Handle file entries
-	entry, err := r.walk.wi.callback(fqn, de)
+	lom := core.AllocLOM("")
+	defer core.FreeLOM(lom)
+	entry, err := r.walk.wi._cb(lom, fqn)
 	if err != nil || entry == nil {
 		return err
 	}
@@ -921,7 +926,7 @@ func (r *LsoXact) cb(fqn string, de fs.DirEntry) error {
 
 	// ls arch
 	// looking only at the file extension - not reading ("detecting") file magic (TODO: add lsmsg flag)
-	archList, err := archive.List(fqn)
+	archList, err := r.lsArch(lom)
 	if err != nil {
 		if archive.IsErrUnknownFileExt(err) {
 			// skip and keep going
@@ -948,6 +953,23 @@ func (r *LsoXact) cb(fqn string, de fs.DirEntry) error {
 	return nil
 }
 
+func (*LsoXact) lsArch(lom *core.LOM) ([]*archive.Entry, error) {
+	if _, err := archive.Mime("", lom.FQN); err != nil {
+		return nil, err
+	}
+	lom.Lock(false)
+	defer lom.Unlock(false)
+	if err := lom.Load(false /*cache it*/, true /*locked*/); err != nil {
+		return nil, err
+	}
+	fh, err := lom.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer cos.Close(fh)
+	return archive.List(fh, lom.Lsize(), lom.FQN)
+}
+
 func (r *LsoXact) Snap() *core.Snap { return r.Base.NewSnap(r) }
 
 //
@@ -961,11 +983,15 @@ func (r *LsoXact) recv(hdr *transport.ObjHdr, objReader io.Reader, err error) er
 	if hdr.Opcode == transport.OpcAbort {
 		errCause := hdr.ObjName // (see streamingX.sendTerm)
 		err = r.NewErrRecvAbortXact(hdr.SID, errCause)
-		r.Abort(err)
+		transport.FreeRecv(objReader) // header only (hdr invalid hereafter)
+		if !r.Abort(err) {
+			return nil // duplicate
+		}
+		return err
 	}
 	if err != nil && !cos.IsOkEOF(err) {
 		nlog.Errorln(core.T.String(), r.String(), len(r.remtCh), err)
-		r.remtCh <- &LsoRsp{Status: http.StatusInternalServerError, Err: err}
+		r.Abort(err)
 		return err
 	}
 
@@ -988,14 +1014,17 @@ func (r *LsoXact) _recv(hdr *transport.ObjHdr, objReader io.Reader, buf []byte) 
 	)
 	err = page.DecodeMsg(mr)
 	if err == nil {
-		r.remtCh <- &LsoRsp{Lst: page, Status: http.StatusOK}
-		// using generic in-counter to count received pages
-		r.InObjsAdd(1, hdr.ObjAttrs.Size)
+		select {
+		case r.remtCh <- &LsoRsp{Lst: page, Status: http.StatusOK}:
+			// using generic in-counter to count received pages
+			r.InObjsAdd(1, hdr.ObjAttrs.Size)
+		case <-r.ChanAbort(): // aborted or finished
+		}
 	} else {
 		nlog.Errorf("%s: failed to recv [%s: %s] num=%d from %s (%s, %s): %v",
 			core.T, page.UUID, page.ContinuationToken, len(page.Entries),
 			hdr.SID, hdr.Bck.Cname(""), string(hdr.Opaque), err)
-		r.remtCh <- &LsoRsp{Status: http.StatusInternalServerError, Err: err}
+		r.Abort(err)
 	}
 	return
 }

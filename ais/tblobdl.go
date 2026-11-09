@@ -6,6 +6,8 @@ package ais
 
 import (
 	"fmt"
+	"net/http"
+	"strconv"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -19,6 +21,96 @@ import (
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xs"
 )
+
+// return done=false when the caller should continue with regular GET
+func (t *target) getBlob(w http.ResponseWriter, r *http.Request, dpq *dpq, lom *core.LOM,
+	blobDownload bool, thresholdStr string) (done bool, ecode int, err error) {
+	var threshold int64
+	if thresholdStr != "" {
+		var err error
+		if threshold, err = strconv.ParseInt(thresholdStr, 10, 64); err != nil {
+			return true, http.StatusBadRequest, fmt.Errorf("blob-downloader: failed to parse %s=%s: %w",
+				apc.HdrBlobThreshold, thresholdStr, err)
+		}
+		if threshold < 0 {
+			return true, http.StatusBadRequest, fmt.Errorf("blob-downloader: invalid %s=%s: expecting a non-negative value",
+				apc.HdrBlobThreshold, thresholdStr)
+		}
+	}
+	if !blobDownload && threshold == 0 {
+		return false, 0, nil
+	}
+
+	// keep regular GET semantics for range read and archive extraction:
+	// - threshold only: fall through to regular GET
+	// - explicit blob download: reject the conflicting request
+	if r.Header.Get(cos.HdrRange) != "" || dpq.isArch() {
+		if blobDownload {
+			return true, http.StatusBadRequest, fmt.Errorf("blob-downloader: %s cannot be combined with range read or archive extraction",
+				apc.HdrBlobDownload)
+		}
+		return false, 0, nil
+	}
+	if !lom.Bck().IsRemote() {
+		return true, http.StatusBadRequest, fmt.Errorf("blob-downloader is not supported for local buckets: %s", lom.Bck().Cname(""))
+	}
+
+	// control msg
+	var (
+		msg apc.BlobMsg
+	)
+	if err := msg.FromHeader(r.Header); err != nil {
+		return true, http.StatusBadRequest, err
+	}
+	// apc.QparamLatestVer via api.GetArgs or bck.VersionConf().ValidateWarmGet
+	msg.LatestVer = _validateWarmGet(lom, dpq.latestVer)
+
+	// lock, check latest, HEAD(obj), blob-download
+	var (
+		args = &core.BlobParams{
+			Context:       r.Context(),
+			RespWriter:    w, // NOTE: make a blocking call
+			Lom:           lom,
+			Msg:           &msg,
+			BlobThreshold: max(threshold, core.MinBlobDlGetSize),
+			Parent:        xs.BlobParentGET,
+		}
+		rsphdr = &rsphdr{hdr: w.Header(), lom: lom, s3: dpq.isS3, ctype: true}
+	)
+	xid, _, err := t.blobdlLocked(args, rsphdr)
+
+	if err != nil {
+		if xs.IsErrBlobDlOneChunk(err) {
+			// a) nothing to parallelize - proceed anyway w/ regular GET (explicit or not)
+			if cmn.Rom.V(4, cos.ModAIS) {
+				nlog.Infoln("GET", lom.Cname(), "falling back to regular GET:", err)
+			}
+			return false, 0, nil
+		}
+		if xs.IsErrBlobDlAdmission(err) {
+			if !blobDownload {
+				// b) threshold only: it's a GET - regular GET
+				if cmn.Rom.V(4, cos.ModAIS) {
+					nlog.Infoln("GET", lom.Cname(), "falling back to regular GET:", err)
+				}
+				return false, 0, nil
+			}
+			ecode = http.StatusTooManyRequests
+			err = cmn.NewErrTooManyRequests(err, ecode)
+		}
+		if xid != "" {
+			// streaming w/ bytes on the wire - avoid "superfluous response"
+			nlog.Warningln("GET", lom.Cname(), "via blob-download["+xid+"]:", err)
+			err = nil
+		}
+	}
+
+	if xid == "" && err == nil {
+		// c) ditto - regular GET
+		return false, 0, nil
+	}
+	return true, ecode, err
+}
 
 // compare running the same via (generic) t.xstart
 // the caller owns retry/fallback policy for this terminal outcome.

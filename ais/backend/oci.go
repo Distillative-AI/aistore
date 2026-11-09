@@ -6,17 +6,16 @@
  */
 package backend
 
-// Outstanding [TODO] items:
-//   1) Resolve if ais/test/mp_tuning.env is *not* the way to do this
-//   2) Avoid per MPU Child make([]byte) invocation (see e.g. memsys/)
-//   3) Resolve proper place/way to stress/bench test in pipeline(s)
-//   4) Add MPU stress (and benchmarking?)
-//   5) Add MPD stress (and benchmarking?)
-//   6) Add support for object versioning
-//   7) Resolve test:long:oci CI Pipeline failure in TestMultiProxy
-//   8) Support remaining OCI bucket props (for example, compartment overrides)
-//   9) Define our own "rcFile" equivalent if desired (preferably in something like JSON)
-//  10) Add in support for OCI SDK's rcFile if desired (perhaps in lieu of 9)
+// ETag quoting:
+// - native OCI returns bare ETags and requires bare If-Match values.
+// - ociWriteConditions strips client-supplied quotes before forwarding.
+
+// TODO:
+// - add an OCI backend config file for transfer tuning and compartment defaults
+//   - reduce/remove most of the existing "OCI_*" environment variables
+// - reuse automatic MPU part buffers after each part finishes
+// - include the largest object size in concurrent MPU/MPD tests
+// - support OCI object versioning
 
 import (
 	"container/list"
@@ -353,6 +352,8 @@ func ociErrorToAISError(op, bucketName, objectPath, byteRange string, errIn erro
 		statusCode, ok = respOrStatus.(int)
 		if !ok {
 			switch resp := respOrStatus.(type) {
+			case *http.Response:
+				rawResponse = resp
 			case ocios.AbortMultipartUploadResponse:
 				rawResponse = resp.RawResponse
 			case ocios.CommitMultipartUploadResponse:
@@ -392,6 +393,8 @@ func ociErrorToAISError(op, bucketName, objectPath, byteRange string, errIn erro
 	switch statusCode {
 	case http.StatusRequestedRangeNotSatisfiable:
 		errOut = cos.NewErrRangeNotSatisfiable(errIn, []string{byteRange}, 0)
+	case http.StatusPreconditionFailed:
+		errOut = cos.NewErrPreconditionFailed(errIn)
 	case http.StatusTooManyRequests:
 		errOut = cmn.NewErrTooManyRequests(errIn, statusCode)
 	default:
@@ -666,6 +669,11 @@ func (bp *ocibp) PutObj(ctx context.Context, r io.ReadCloser, lom *core.LOM, ore
 		objectAttrs = lom.ObjAttrs()
 		objectSize  int64
 	)
+	ifMatch, ifNoneMatch, err := ociWriteConditions(oreq)
+	if err != nil {
+		_ = r.Close()
+		return http.StatusBadRequest, err
+	}
 	client, _, err := bp.ociClient(cloudBck)
 	if err != nil {
 		return ociClientToAISError("PutObject", cloudBck.Name, lom.ObjName, err)
@@ -680,7 +688,7 @@ func (bp *ocibp) PutObj(ctx context.Context, r io.ReadCloser, lom *core.LOM, ore
 
 	ociSetMetadata(lom.ObjAttrs(), ociPutMetadata(lom, oreq), ociPutContentType(lom, oreq))
 	if !avoidingMPU {
-		return bp.putObjViaMPU(r, lom, objectSize, oreq)
+		return bp.putObjViaMPU(r, lom, objectSize, oreq, ifMatch, ifNoneMatch)
 	}
 
 	req := ocios.PutObjectRequest{
@@ -688,6 +696,8 @@ func (bp *ocibp) PutObj(ctx context.Context, r io.ReadCloser, lom *core.LOM, ore
 		BucketName:    &cloudBck.Name,
 		ObjectName:    &lom.ObjName,
 		PutObjectBody: r,
+		IfMatch:       ifMatch,
+		IfNoneMatch:   ifNoneMatch,
 		OpcMeta:       ociPutMetadata(lom, oreq),
 		ContentType:   ociPutContentType(lom, oreq),
 	}
@@ -696,7 +706,7 @@ func (bp *ocibp) PutObj(ctx context.Context, r io.ReadCloser, lom *core.LOM, ore
 	// Note: in case PutObject() failed to close r...
 	_ = r.Close()
 	if err != nil {
-		return ociErrorToAISError("PutObject", cloudBck.Name, lom.ObjName, "", err, resp)
+		return ociWriteError("PutObject", cloudBck.Name, lom.ObjName, err, resp, ifMatch, ifNoneMatch)
 	}
 
 	h := cmn.BackendHelpers.OCI
@@ -913,15 +923,14 @@ func (bp *ocibp) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT, _ *http
 		return res.ErrCode, res.Err
 	}
 
-	putParams := allocPutParams(res, owt)
+	putParams := allocPutParams(&res, owt)
 	err := bp.t.PutObject(lom, putParams)
 	core.FreePutParams(putParams)
 
 	return 0, err
 }
 
-// [TODO] Consider setting req.IfMatch to lom.GetCustomKey(cmn.ETag) if present
-func (bp *ocibp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64) (res core.GetReaderResult) {
+func (bp *ocibp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64, pin ...*core.ObjPin) (res core.GetReaderResult) {
 	dl, ctx := newRdl(ctx, &bp.base, lom.Bck()) // read deadline (see rdl.go)
 	defer dl.fini(&res)
 
@@ -948,6 +957,9 @@ func (bp *ocibp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length
 	} else {
 		rangeHeader = cmn.MakeRangeHdr(offset, length)
 		req.Range = &rangeHeader
+		if p := core.RangePin(pin); p != nil && p.ETag != "" {
+			req.IfMatch = &p.ETag
+		}
 	}
 
 	var cancel context.CancelFunc
@@ -980,7 +992,7 @@ func (bp *ocibp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length
 		res.ExpCksum = expCksum
 		if res.Err != nil {
 			cancel()
-			resp.Content.Close()
+			cmn.CloseRemote(resp.Content, lom, 4, cos.ModBackend)
 		}
 		return res
 	}

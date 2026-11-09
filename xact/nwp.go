@@ -6,12 +6,12 @@ package xact
 
 import (
 	"errors"
-	"runtime"
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/load"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/cmn/oom"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/sys"
@@ -51,25 +51,18 @@ const (
 	NwpDflt = 0  // resolve at runtime via defaultNW()
 )
 
-// media-type multipliers (workers per mountpath)
-const (
-	nwpMultNVMe = 8
-	nwpMultSSD  = 4
-	nwpMultHDD  = 1
-)
-
 // return the default number of workers based on:
 // - number of available mountpaths
 // - detected storage media type (NVMe, SSD, HDD)
-// - hardcoded multiplier (above)
-func _defaultNW(numMpaths int) int {
+// - media-type multiplier (see core/get_tunables)
+func DefaultNW(numMpaths int) int {
 	switch {
 	case fs.IsRotational() || fs.IsSlow():
-		return numMpaths * nwpMultHDD
+		return numMpaths * core.NwpMultHDD
 	case fs.IsNVMe():
-		return numMpaths * nwpMultNVMe
+		return numMpaths * core.NwpMultNVMe
 	default: // SSD
-		return numMpaths * nwpMultSSD
+		return numMpaths * core.NwpMultSSD
 	}
 }
 
@@ -84,26 +77,24 @@ func _defaultNW(numMpaths int) int {
 // - numMpaths: number of available mountpaths
 func TuneNumWorkers(xname string, numWorkers, numMpaths int) (int, error) {
 	const memExtremeMsg = "extreme memory pressure"
-	var (
-		ngr     = runtime.NumGoroutine()
-		ngrLoad = load.Gor(ngr)
-	)
+	schLoad := load.Sched()
+
 	// 1. apply system default
 	if numWorkers == NwpDflt {
-		numWorkers = _defaultNW(numMpaths)
+		numWorkers = DefaultNW(numMpaths)
 	}
 
-	// 2. goroutine load
-	if ngrLoad == load.Critical {
-		nlog.Warningln(xname, "critical", stats.NgrPrompt, ngr)
+	// 2. scheduler latency
+	if schLoad == load.Critical {
+		nlog.Warningln(xname, "critical", stats.SchedPrompt, load.SchedP99())
 		return NwpNone, nil
 	}
 
 	numWorkers = min(sys.MaxParallelism()+4, numWorkers)
 
 	// yellow alert (high)
-	if ngrLoad == load.High {
-		nlog.Warningln(xname, "high", stats.NgrPrompt, ngr)
+	if schLoad == load.High {
+		nlog.Warningln(xname, "high", stats.SchedPrompt, load.SchedP99())
 		numWorkers = min(numWorkers, numMpaths)
 	}
 
@@ -117,7 +108,7 @@ func TuneNumWorkers(xname string, numWorkers, numMpaths int) (int, error) {
 		}
 		return NwpNone, nil
 	case load.High:
-		if ngrLoad == load.High {
+		if schLoad == load.High {
 			return NwpNone, nil
 		}
 		numWorkers = min(NwpMin+1, numWorkers)
@@ -131,8 +122,8 @@ func TuneNumWorkers(xname string, numWorkers, numMpaths int) (int, error) {
 		nlog.Warningln(xname, tag, "critical")
 		return NwpNone, nil
 	case load.High:
-		if ngrLoad == load.High {
-			nlog.Warningln(xname, tag, "high and high", stats.NgrPrompt, ngr)
+		if schLoad == load.High {
+			nlog.Warningln(xname, tag, "high and high", stats.SchedPrompt, load.SchedP99())
 			return NwpNone, nil
 		}
 		numWorkers = min(NwpMin+1, numWorkers)

@@ -35,7 +35,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/cmn/k8s"
-	"github.com/NVIDIA/aistore/cmn/load"
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
@@ -64,7 +63,6 @@ type htext interface {
 
 type ratelim struct {
 	sync.Map
-	now int64
 }
 
 type htrun struct {
@@ -492,8 +490,6 @@ func (h *htrun) initPhase2(config *cmn.Config) {
 
 	initCtrlClient(config, g.netServ.control.useIPv6)
 	initDataClient(config, g.netServ.data.useIPv6)
-
-	load.Init()
 
 	h.owner.smap = newSmapOwner(config, h.si.IsTarget())
 	h.owner.rmd = newRMDOwner(config)
@@ -3095,15 +3091,11 @@ func (h *htrun) _status(smap *smapX) (daeStatus string) {
 //
 
 func (rl *ratelim) housekeep(now int64) time.Duration {
-	rl.now = now
-	rl.Range(rl.cleanup)
+	rl.Range(func(k, v any) bool {
+		if r := v.(cos.Rater); time.Duration(now-r.LastUsed()) >= hk.PruneRateLimiters>>1 {
+			rl.Delete(k)
+		}
+		return true // keep going
+	})
 	return hk.PruneRateLimiters
-}
-
-func (rl *ratelim) cleanup(k, v any) bool {
-	r := v.(cos.Rater)
-	if time.Duration(rl.now-r.LastUsed()) >= hk.PruneRateLimiters>>1 {
-		rl.Delete(k)
-	}
-	return true // keep going
 }

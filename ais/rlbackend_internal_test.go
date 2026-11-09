@@ -54,7 +54,7 @@ func (bp *throttleBackend) GetObj(context.Context, *core.LOM, cmn.OWT, *http.Req
 	return 0, nil
 }
 
-func (bp *throttleReaderBackend) GetObjReader(context.Context, *core.LOM, int64, int64) core.GetReaderResult {
+func (bp *throttleReaderBackend) GetObjReader(context.Context, *core.LOM, int64, int64, ...*core.ObjPin) core.GetReaderResult {
 	bp.calls++
 	return core.GetReaderResult{Err: bp.err, ErrCode: http.StatusTooManyRequests}
 }
@@ -323,4 +323,19 @@ func TestRLBackendListObjectsCanceled(t *testing.T) {
 	tassert.Fatalf(t, errors.Is(err, context.Canceled), "expected %v, got %v", context.Canceled, err)
 	tassert.Fatalf(t, ecode == 0, "expected code 0, got %d", ecode)
 	tassert.Fatalf(t, backend.calls == 1, "expected no retry call, got %d calls", backend.calls)
+}
+
+type conditionalWriteBackend struct {
+	core.Backend
+	enabled bool
+}
+
+func (bp *conditionalWriteBackend) CondWrite(*meta.Bck) bool { return bp.enabled }
+
+func TestRLBackendCondWrite(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		wrapped := &conditionalWriteBackend{enabled: enabled}
+		bp := &rlbackend{Backend: wrapped}
+		tassert.Fatalf(t, bp.CondWrite(nil) == enabled, "lost backend conditional-write capability")
+	}
 }

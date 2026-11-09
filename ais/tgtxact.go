@@ -314,6 +314,9 @@ func (t *target) xstart(args *xact.ArgsMsg, bck *meta.Bck, msg *apc.ActMsg) (xid
 				Parent: xs.BlobParentXStart, // generic start-xaction path (compare with dedicated api.BlobDownload)
 			}
 			xid, _, err = t.blobdlBackground(params, nil /*oa*/)
+			if xs.IsErrBlobDlAdmission(err) {
+				err = cmn.NewErrTooManyRequests(err, http.StatusTooManyRequests)
+			}
 		}
 		return xid, err
 	// 3. cannot start
@@ -401,22 +404,28 @@ func (t *target) xactCtrl(w http.ResponseWriter, r *http.Request, kind, xid, wid
 		return
 	}
 
+	if xctn.Kind() != kind {
+		t.writeErrf(w, r, "%s: unexpected T2T control [%q, %q, %q]", xctn.Name(), kind, wid, opcode)
+		return
+	}
+
 	body, err := cmn.ReadBytes(r)
 	if err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
-
-	if kind != apc.ActGetBatch {
-		err := fmt.Errorf("expecting x-moss, got %q [%q, %q, %q, %q]", xctn.Name(), kind, xid, wid, opcode)
-		debug.AssertNoErr(err)
-		t.writeErr(w, r, err)
-		return
+	sid := r.Header.Get(apc.HdrSenderID)
+	switch {
+	case kind == apc.ActGetBatch:
+		xmoss, ok := xctn.(*xs.XactMoss)
+		debug.Assert(ok)
+		err = xmoss.RecvCtrl(wid, sid, opcode, body)
+	case opcode == xact.OpcodeAbortXact:
+		xact.RecvAbortXact(xctn, sid, string(body))
+	default:
+		err = fmt.Errorf("%s: unsupported T2T control [%q, %q]", xctn.Name(), wid, opcode)
 	}
-
-	xmoss, ok := xctn.(*xs.XactMoss)
-	debug.Assert(ok)
-	if err := xmoss.RecvCtrl(wid, r.Header.Get(apc.HdrSenderID), opcode, body); err != nil {
+	if err != nil {
 		t.writeErr(w, r, err)
 	}
 }

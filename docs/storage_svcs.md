@@ -18,6 +18,7 @@
   - [Example recovering lost or damaged slices and/or objects](#example-recovering-lost-or-damaged-slices-and-objects)
 - [Chunking](#chunking)
   - [Storage layout](#storage-layout)
+  - [Parallel cold GET](#parallel-cold-get)
   - [Rechunk](#rechunk)
   - [Prefetch mechanism](#prefetch-mechanism)
   - [Chunked writes and cleanup on failure](#chunked-writes-and-cleanup-on-failure)
@@ -354,15 +355,33 @@ For a given object size:
 2. Otherwise, when auto-chunking is enabled and the size is at or above `chunks.objsize_limit`: chunked, with `chunks.chunk_size`.
 3. Otherwise: monolithic - except for the explicit per-object overrides above and the prefetch exception [below](#prefetch-mechanism).
 
-A layout rule is independent of how the object arrives. It applies equally to PUT, cold GET, copy, and rechunk.
+A layout rule is independent of how the object arrives. It applies equally to PUT, cold GET, copy, append flush, promote, and rechunk.
 
 > **Status (v5.1):** rule 1 is enforced by PUT, cold GET, and copy; rechunk enforces it only for the objects it rewrites - an existing monolithic object above `chunks.max_monolithic_size` (e.g., after lowering it) is left as is. Rule 2 is enforced by rechunk only; PUT, cold GET, and copy do not auto-chunk at `chunks.objsize_limit`.
 >
 > **Status (v5.2):** PUT, cold GET, copy, and rechunk enforce both rules.
+>
+> **Status (v5.3):** Append flush and promote also enforce both rules.
+
+### Parallel cold GET
+
+A user GET (native or S3) of a cold object in an auto-chunked bucket can fetch remote ranges in parallel when the object is at or above `chunks.objsize_limit` and the minimum size for parallel cold GET, and spans at least two chunks. Parallel reads also require an available remote version pin and sufficient target resources.
+
+Readers fetch chunks concurrently, up to [`chunks.cold_readers`](/docs/howto_large_cold_objects.md#number-of-readers) per GET (4 by default), all pinned to the same remote version. When the remote supplies a whole-object checksum, parallel cold GET stores it as is, the same as a sequential cold GET. Otherwise, it combines per-chunk CRC32C checksums in object order, even when chunks arrive out of order, without rereading the data. Buckets with checksumming disabled remain without a payload checksum.
+
+Jobs keep their own logic: prefetch chooses between the blob downloader and a sequential cold GET (see [Prefetch mechanism](#prefetch-mechanism)), and copy, transform, and other jobs read sequentially.
+
+Parallel cold GET is disabled for `checksum.validate_cold_get`, EC-enabled buckets, and the OCI backend.
+
+If a range read fails with HTTP 412 (the remote object changed), AIS discards the partial result and refetches the object once with a fresh sequential GET, before sending data to the client.
+
+The same sequential refetch applies when a range read returns HTTP 429 or 503 in a bucket without backend rate limiting. Throttling on the initial full GET, or on a blob download range read, also starts target-wide backoff. During backoff, cold GETs for buckets without backend rate limiting stay sequential for twice `timeout.cold_get_conflict` (10s by default), with a 5s minimum and `timeout.max_host_busy` as the maximum. See [Reading large objects from remote buckets](/docs/howto_large_cold_objects.md#cold-get-into-a-chunked-bucket) for how this interacts with the rate limiter.
+
+For large objects, use a `chunks.chunk_size` of 128–256 MiB. The object must span multiple chunks for parallelism; the number of readers is at most the number of chunks.
 
 ### Rechunk
 
-Changing a bucket's `chunks` properties automatically starts rechunk to converge existing objects to the rules above:
+Changing a bucket's chunk layout automatically starts rechunk to converge existing objects to the rules above.
 
 ```console
 $ ais bucket props set ais://abc chunks.chunk_size=16MiB chunks.objsize_limit=50MiB
@@ -391,7 +410,7 @@ The third case is a deliberate exception to rule 3. A `chunks.objsize_limit` of 
 
 ### Chunked writes and cleanup on failure
 
-AIS can write chunks during a regular PUT, a cold GET that caches a remote object, or an object copy. The bucket's hard limit determines when these operations must store an object as chunks; see [storage layout](#storage-layout) for the current rules. Local copies of already-chunked objects preserve their existing layout. Rechunk (xaction) changes the layout according to the bucket's configuration.
+AIS can write chunks during a regular PUT, a cold GET that caches a remote object, an object copy, append flush, or promote. The bucket's chunking configuration determines when these operations must store an object as chunks; see [storage layout](#storage-layout) for the current rules. Local copies of already-chunked objects preserve their existing layout. Rechunk (xaction) changes the layout according to the bucket's configuration.
 
 For these internally managed writes, AIS owns the multipart upload. If initiation, a part write, or completion fails, AIS aborts the upload and attempts local cleanup even if backend abort fails. The operation returns its original error; cleanup failures are logged. Writes that only populate the local cache do not attempt to abort a backend upload. Filesystem cleanup remains best effort.
 

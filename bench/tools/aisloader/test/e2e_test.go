@@ -18,7 +18,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -38,9 +37,6 @@ const (
 	durationEnv = "DURATION"
 	e2eWorkers  = 8
 )
-
-// tools.InitLocalCluster writes package-level state and must not run concurrently.
-var initClusterOnce sync.Once
 
 type (
 	opStats struct {
@@ -115,6 +111,22 @@ func TestAISLoaderWorkloads(t *testing.T) {
 		)
 		assertOperation(t, "mixed PUT", report.Put)
 		assertOperation(t, "mixed GET", report.Get)
+	}) {
+		t.FailNow()
+	}
+
+	if !t.Run("Random Range GET", func(t *testing.T) {
+		const readLen = 64 * cos.KiB
+		report := runner.run(t, "random-range", shorter, time.Minute, false,
+			"-subdir="+regularPrefix,
+			"-readoff=random",
+			"-readlen="+strconv.Itoa(readLen),
+		)
+		assertOperation(t, "random range GET", report.Get)
+		// all objects are larger than readLen, so each range must fit entirely within its object
+		tassert.Fatalf(t, report.Get.Bytes == report.Get.Count*readLen,
+			"random range GET bytes = %d, expected %d (count %d * readlen %d)",
+			report.Get.Bytes, report.Get.Count*readLen, report.Get.Count, readLen)
 	}) {
 		t.FailNow()
 	}
@@ -330,7 +342,6 @@ func newE2ERunner(t *testing.T, name string) *e2eRunner {
 		t.Fatalf("aisloader binary not found in PATH: %v", err)
 	}
 
-	initClusterOnce.Do(tools.InitLocalCluster)
 	proxyURL := tools.RandomProxyURL(t)
 	rootPrefix := "aisloader-e2e-" + name + "-" + strings.ToLower(trand.String(8))
 	bck, created := configuredBucket(t, proxyURL)

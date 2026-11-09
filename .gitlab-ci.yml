@@ -226,7 +226,8 @@ build:fern-docs:
     - apt-get install -y --no-install-recommends python3-yaml docker.io
     # Fern bind-mounts temporary files; keep the daemon in the job container.
     - export DOCKER_HOST=unix:///var/run/docker.sock
-    - dockerd --host="$DOCKER_HOST" > /tmp/fern-docker.log 2>&1 &
+    # Avoid nested union-filesystem mounts when starting the Python docs parser.
+    - dockerd --host="$DOCKER_HOST" --storage-driver=vfs > /tmp/fern-docker.log 2>&1 &
     - timeout 30 sh -c 'until docker info > /dev/null 2>&1; do sleep 1; done' || { cat /tmp/fern-docker.log; exit 1; }
     - npm install -g fern-api@5.168.0
   script:
@@ -377,6 +378,7 @@ test:short:
   variables:
     BUCKET: "ais://test"
   script:
+    - go test -tags="debug aws gcp azure oci" ./ais/backend/...
     - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all
     - make test-short
     - make test-tracing-unit
@@ -435,7 +437,7 @@ test:short:python-unit:
     - cd python
     - |
       set -e
-      for ver in 3.10 3.11 3.12 3.13 3.14; do
+      for ver in 3.10 3.11 3.12 3.13 3.14 3.15; do
         uv venv --python "$ver" .venv
         source .venv/bin/activate
         make python_sdk_unit_tests
@@ -461,12 +463,12 @@ test:short:python-integration:
     - cd python
     - |
       set -e
-      for ver in 3.10 3.12 3.14; do
+      for ver in 3.10 3.12 3.14 3.15; do
         uv venv --python "$ver" .venv
         source .venv/bin/activate
         make python_botocore_integration_tests
-        # TODO: For now, only run full SDK integration on 3.14
-        if [ "$ver" = "3.14" ]; then make python_sdk_integration_tests; fi
+        # TODO: For now, only run full SDK integration on 3.15
+        if [ "$ver" = "3.15" ]; then make python_sdk_integration_tests; fi
         deactivate || true
         rm -rf .venv
       done
@@ -736,7 +738,7 @@ test:long:python-extended:
     - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all --aws
   script:
     - cd python
-    - uv venv --python 3.14 .venv
+    - uv venv --python 3.15 .venv
     - source .venv/bin/activate
     - make python_sdk_extended_tests
     - deactivate || true
@@ -797,23 +799,6 @@ test:long:oci:
   script:
     - . ais/test/oci/mp_tuning.env && ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --oci --deployment all
     - . ais/test/oci/mp_tuning.env && make test-long
-
-test:long:aisloader:
-  stage: test-long
-  tags:
-    - $RUNNER_TAG
-  timeout: 15m
-  variables:
-    AIS_ENDPOINT: "http://localhost:8080"
-  script:
-    - make aisloader
-    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
-    - sleep 10 # make sure that cluster properly starts
-    - DURATION=1m make test-aisloader
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
-      when: manual
-      allow_failure: true
 
 test:long:pyaisloader:
   stage: test-long
@@ -950,7 +935,7 @@ test:short:python-etl:
     PIP: "uv pip"
   script:
     - cd python
-    - uv venv --python 3.14 .venv
+    - uv venv --python 3.15 .venv
     - source .venv/bin/activate
     - make python_etl_tests
     - deactivate || true

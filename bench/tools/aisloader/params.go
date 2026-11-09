@@ -114,6 +114,7 @@ type (
 		readOffStr     string // read range offset (unparsed)
 		readLen        int64  // read range length (bytes, 0 = full object)
 		readOff        int64  // read range offset (bytes)
+		readOffRandom  bool   // random read range offset per GET (-readoff=random)
 		evictBatchSize int    // batch size for list and evict operations
 		getBatchSize   int    // use GetBatch API instead of GetObject (ML workloads)
 		latest         bool   // check metadata and GET latest version from remote bucket
@@ -228,7 +229,7 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 
 	// ============ Workload ============
 	DurationExtVar(f, &p.duration, "duration", time.Minute,
-		"Benchmark duration (0 - run forever or until Ctrl-C). \n"+
+		"Benchmark duration (0 - no time limit; requires totalputsize, epochs, or stoppable). \n"+
 			"If not specified and totalputsize > 0, aisloader runs until totalputsize reached. Otherwise aisloader runs until first of duration and "+
 			"totalputsize reached")
 	f.IntVar(&p.numWorkers, "numworkers", 10, "number of goroutine workers operating on AIS in parallel")
@@ -276,7 +277,8 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 	f.BoolVar(&p.skipList, "skiplist", false, "when true, skip listing objects in a bucket before running 100% PUT workload")
 
 	// ============ Read operations ============
-	f.StringVar(&p.readOffStr, "readoff", "", "read range offset (can contain multiplicative suffix K, MB, GiB, etc.)")
+	f.StringVar(&p.readOffStr, "readoff", "",
+		"read range offset (can contain multiplicative suffix K, MB, GiB, etc.), or 'random' to select a random offset for each GET (requires -readlen)")
 	f.StringVar(&p.readLenStr, "readlen", "", "read range length (can contain multiplicative suffix; 0 - GET full object)")
 	f.IntVar(&p.getBatchSize, "get-batchsize", 0, "GetBatch (ML endpoint)")
 	f.BoolVar(&p.latest, "latest", false, "when true, check in-cluster metadata and possibly GET the latest object version from the associated remote bucket")
@@ -374,6 +376,9 @@ func initParams(p *params) (err error) {
 		p.seed = mono.NanoTime()
 	}
 	rnd = rand.New(cos.NewRandSource(uint64(p.seed)))
+	// separate stream with a different seed: '-readoff=random' must not alter the (seeded) sequence
+	// of selected objects, nor repeat its draws (that would tie each object to a narrow range of offsets)
+	readOffRnd = rand.New(cos.NewRandSource(uint64(p.seed) + 1))
 
 	//
 	// parse sizes
@@ -395,7 +400,9 @@ func initParams(p *params) (err error) {
 		p.maxSize = max(p.minSize, p.maxSize)
 	}
 
-	if p.readOff, err = _parseSize(p.readOffStr, "readoff", 0); err != nil {
+	if p.readOffStr == randomReadOff {
+		p.readOffRandom = true
+	} else if p.readOff, err = _parseSize(p.readOffStr, "readoff", 0); err != nil {
 		return err
 	}
 	if p.readLen, err = _parseSize(p.readLenStr, "readlen", 0); err != nil {
@@ -538,6 +545,11 @@ func (p *params) inflight() int {
 	return p.numWorkers
 }
 
+// no duration, PUT size limit, or epochs (and not stoppable): nothing to run
+func (p *params) noWorkload() bool {
+	return p.duration.Val == 0 && p.putSizeUpperBound == 0 && p.numEpochs == 0 && !p.stoppable
+}
+
 func _parseSize(valueStr, name string, defaultVal int64) (int64, error) {
 	if valueStr == "" {
 		return defaultVal, nil
@@ -621,6 +633,11 @@ func (p *params) validate() error {
 		return errors.New("invalid option: '-skiplist' is only valid for 100% PUT workloads")
 	}
 
+	// '-getloaderid' prints the loader ID and exits without running a workload
+	if p.noWorkload() && !p.getLoaderID {
+		return errors.New("invalid option: no workload specified (set a nonzero '-duration', '-totalputsize', '-epochs', or '-stoppable')")
+	}
+
 	// direct s3 access vs other command line
 	if isDirectS3() {
 		if p.randomProxy {
@@ -665,6 +682,29 @@ func (p *params) validate() error {
 		}
 		if isDirectS3() {
 			return fmt.Errorf("option %s requires AIStore (S3 does not provide GetBatch)", s)
+		}
+	}
+
+	if p.readOffRandom {
+		const s = "'-readoff=random'"
+		if p.readLen <= 0 {
+			return fmt.Errorf("option %s requires '-readlen' > 0", s)
+		}
+		if p.fileList != "" || p.fileListObj != "" {
+			return fmt.Errorf("option %s with '-filelist' or '-filelist-obj' is not supported yet", s)
+		}
+		if p.archParams.pct > 0 || p.archParams.list {
+			return fmt.Errorf("option %s cannot be used with archive options", s)
+		}
+		if p.mpdStreamPct > 0 {
+			return fmt.Errorf("command line options %s and '-pctmpdstream' are mutually exclusive", s)
+		}
+		if p.updateExistingPct > 0 {
+			return fmt.Errorf("command line options %s and '-pctupdate' are mutually exclusive", s)
+		}
+		if p.putPct == 100 {
+			fmt.Fprintf(os.Stderr, "Warning: option %s is ignored with 100%% PUT workloads\n", s)
+			p.readOffRandom = false
 		}
 	}
 

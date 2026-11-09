@@ -125,7 +125,7 @@ For the most recently updated command-line options and examples, please run `ais
 | -config | `string` | Load runtime settings from a [YAML file](#yaml-configuration); explicit CLI flags take precedence | `""` |
 | -cont-on-err | `bool` | GetBatch: ignore missing files and/or objects - include them under `__404__/` prefix and keep going | `false` |
 | -dry-run | `bool` | Show the entire set of parameters that aisloader will use when actually running | `false` |
-| -duration | `duration` | Benchmark duration (0 - run forever or until Ctrl-C). If not specified and totalputsize > 0, runs until totalputsize reached | `1m` |
+| -duration | `duration` | Benchmark duration (0 - no time limit; requires `-totalputsize`, `-epochs`, or `-stoppable`). If not specified and totalputsize > 0, runs until totalputsize reached | `1m` |
 | -epochs | `int` | Number of "epochs" to run whereby each epoch entails full pass through the entire listed bucket | `0` |
 | -etl | `string` | Built-in ETL, one of: `transformer-echo`, `tar2tf`, `transformer-md5`, or `parquet-parser`. Each object that aisloader GETs undergoes the selected transformation | `""` |
 | -etl-spec | `string` | Custom ETL runtime specification (pathname) | `""` |
@@ -164,7 +164,7 @@ For the most recently updated command-line options and examples, please run `ais
 | -randomproxy | `bool` | When true, select random gateway ("proxy") to execute each I/O request | `false` |
 | -readertype | `string` | Type of reader: `sg` (default), `file`, `rand`, `tar` | `sg` |
 | -readlen | `string` | Read range length, can contain [multiplicative suffix](#bytes-multiplicative-suffix) | `""` |
-| -readoff | `string` | Read range offset, can contain [multiplicative suffix](#bytes-multiplicative-suffix) | `""` |
+| -readoff | `string` | Read range offset, can contain [multiplicative suffix](#bytes-multiplicative-suffix); `random` selects a random offset for each GET (see [Read range](#read-range)) | `""` |
 | -s3endpoint | `string` | S3 endpoint to read/write S3 bucket directly (with no AIStore) | `""` |
 | -s3profile | `string` | Other than default S3 config profile referencing alternative credentials | `""` |
 | -s3-use-path-style | `bool` | Use older path-style addressing (e.g., `https://s3.amazonaws.com/BUCKET/KEY`). Should only be used with `-s3endpoint` | `false` |
@@ -215,7 +215,7 @@ For the most recently updated command-line options and examples, please run `ais
 
 | Command-line option | Type | Description | Default |
 | --- | --- | --- | --- |
-| -duration | `duration` | Benchmark duration (0 - run forever or until Ctrl-C). If not specified and totalputsize > 0, runs until totalputsize reached | `1m` |
+| -duration | `duration` | Benchmark duration (0 - no time limit; requires `-totalputsize`, `-epochs`, or `-stoppable`). If not specified and totalputsize > 0, runs until totalputsize reached | `1m` |
 | -numworkers | `int` | Number of goroutine workers operating on AIS in parallel | `10` |
 | -pctput | `int` | Percentage of PUTs in the aisloader-generated workload (see also: `-arch.pct`) | `0` |
 | -pctupdate | `int` | Percentage of GET requests that are followed by a PUT "update" (i.e., creation of a new version of the object) | `0` |
@@ -266,7 +266,7 @@ For the most recently updated command-line options and examples, please run `ais
 
 | Command-line option | Type | Description | Default |
 | --- | --- | --- | --- |
-| -readoff | `string` | Read range offset, can contain [multiplicative suffix](#bytes-multiplicative-suffix) | `""` |
+| -readoff | `string` | Read range offset, can contain [multiplicative suffix](#bytes-multiplicative-suffix); `random` selects a random offset for each GET (see [Read range](#read-range)) | `""` |
 | -readlen | `string` | Read range length, can contain [multiplicative suffix](#bytes-multiplicative-suffix) | `""` |
 | -get-batchsize | `int` | Use GetBatch API (ML endpoint) instead of GetObject | `0` |
 | -latest | `bool` | When true, check in-cluster metadata and possibly GET the latest object version from the associated remote bucket | `false` |
@@ -401,6 +401,8 @@ To set the offset and length to read, use option `-readoff=<read offset (in byte
 
 For convenience, both options support size suffixes: `k` - for KiB, `m` - for MiB, and `g` - for GiB.
 
+Note that `-readoff` takes effect only when `-readlen` is greater than zero; otherwise, the loader reads entire objects.
+
 Example that reads a 32MiB segment at 1KB offset from each object stored in the bucket "abc":
 
 ```console
@@ -408,6 +410,10 @@ $ aisloader -bucket=ais://abc -duration 5m -cleanup=false -readoff=1024 -readlen
 ```
 
 The test (above) will run for 5 minutes and will not "cleanup" after itself (next section).
+
+To read a different segment on each GET, use `-readoff=random`. For each GET, the loader selects a random offset such that the entire `-readlen` range fits within the object; objects that are not larger than `-readlen` are read from the beginning.
+
+`-readoff=random` requires `-readlen` and uses object sizes from the bucket listing, refreshed from each GET response. It cannot be combined with `-filelist`, `-filelist-obj`, archive options (`-arch.list`, `-arch.pct`), `-pctmpdstream`, or `-pctupdate`, and is ignored in 100% PUT workloads.
 
 ### Cleanup
 
@@ -424,11 +430,7 @@ $ aisloader -bucket=ais://abc -duration 1h -pctput=0 -cleanup=true
 
 The first line in this example above fills the bucket "abc" with 16MiB of random data. The second - uses existing data to test read performance for 1 hour, and then removes all data.
 
-If you just need to clean up old data prior to running a test, run the loader with 0 (zero) total put size and zero duration:
-
-```console
-$ aisloader -bucket=<bucket to cleanup> -duration 0s -totalputsize=0
-```
+To destroy a bucket, use `ais bucket rm <BUCKET>`. Alternatively, to empty a bucket, use `ais object rm <BUCKET> --all`.
 
 ### Object size
 
@@ -776,60 +778,54 @@ For the most recently updated command-line options and examples, please run `ais
     $ aisloader -loaderid=loaderstring -loaderidhashlen=8 -getloaderid (0xdb)
     ```
 
-**12**. Destroy existing ais bucket. If the bucket is Cloud-based, delete all objects:
-
-    ```console
-    $ aisloader -bucket=nvais -duration 0s -totalputsize=0 -cleanup=true
-    ```
-
-**13**. Generate load on a cluster listening on custom IP address and port:
+**12**. Generate load on a cluster listening on custom IP address and port:
 
     ```console
     $ aisloader -ip="example.com" -port=8080
     ```
 
-**14**. Generate load on a cluster listening on custom IP address and port from environment variable:
+**13**. Generate load on a cluster listening on custom IP address and port from environment variable:
 
     ```console
     $ AIS_ENDPOINT="examples.com:8080" aisloader
     ```
 
-**15**. Use HTTPS when connecting to a cluster:
+**14**. Use HTTPS when connecting to a cluster:
 
     ```console
     $ aisloader -ip="https://localhost" -port=8080
     ```
 
-**16**. PUT TAR files with random files inside into a cluster:
+**15**. PUT TAR files with random files inside into a cluster:
 
     ```console
     $ aisloader -bucket=ais://my_bucket -duration=10s -pctput=100 -arch.pct=100 -arch.num-files=10 -arch.minsize=1K -arch.maxsize=10K -cleanup=false
     ```
 
-**17**. Generate load on `tar2tf` ETL. New ETL is started and then deleted at the end. TAR files are PUT to the cluster. Only available when cluster is deployed on Kubernetes.
+**16**. Generate load on `tar2tf` ETL. New ETL is started and then deleted at the end. TAR files are PUT to the cluster. Only available when cluster is deployed on Kubernetes.
 
     ```console
     $ aisloader -bucket=my_ais_bucket -duration=10s -pctput=100 -provider=ais -readertype=tar -etl=tar2tf -cleanup=false
     ```
 
-**18**. Timed 100% GET _directly_ from S3 bucket (notice '-s3endpoint' command line):
+**17**. Timed 100% GET _directly_ from S3 bucket (notice '-s3endpoint' command line):
     ```console
     $ aisloader -bucket=s3://xyz -cleanup=false -numworkers=8 -pctput=0 -duration=10m -s3endpoint=https://s3.amazonaws.com
     ```
 
-**19**. PUT approx. 8000 files into s3 bucket directly, skip printing usage and defaults. Similar to the previous example, aisloader goes directly to a given S3 endpoint ('-s3endpoint'), and AIStore is not being used:
+**18**. PUT approx. 8000 files into s3 bucket directly, skip printing usage and defaults. Similar to the previous example, aisloader goes directly to a given S3 endpoint ('-s3endpoint'), and AIStore is not being used:
     ```console
      $ aisloader -bucket=s3://xyz -cleanup=false -minsize=16B -maxsize=16B -numworkers=8 -pctput=100 -totalputsize=128k -s3endpoint=https://s3.amazonaws.com -quiet
     ```
 
-**20**. Generate a list of object names (once), and then run aisloader without executing list-objects (see [Object-name lists](#object-name-lists) for storing the list in AIS):
+**19**. Generate a list of object names (once), and then run aisloader without executing list-objects (see [Object-name lists](#object-name-lists) for storing the list in AIS):
 
     ```console
     $ ais ls ais://nnn --props name -H > /tmp/a.txt
     $ aisloader -bucket=ais://nnn -duration 1h -numworkers=30 -pctput=0 -filelist /tmp/a.txt -cleanup=false
     ```
 
-**21**. GetBatch example: read random batches each consisting of 64 archived files
+**20**. GetBatch example: read random batches each consisting of 64 archived files
 
 ```console
     $ ais ls ais://nnn --summary

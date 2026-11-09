@@ -317,9 +317,10 @@ func formatCnum(num int) string {
 }
 
 // check whether completed chunks are properly located
+// - caller checks the object's HRW mountpath using avail first
+// - lom.IsHRW() can be stale after a volume change (e.g., BeginDD)
 func (u *Ufest) IsHRW(avail fs.MPI) (bool, error) {
-	debug.AssertFunc(func() bool { return u.lom.IsHRW() }, "must be already checked by the caller")
-	debug.AssertFunc(func() bool { return u.Completed() }, "ditto (don't call with partial)")
+	debug.AssertFunc(func() bool { return u.Completed() }, "don't call with partial")
 	for i := range u.chunks {
 		c := &u.chunks[i]
 		switch c.num {
@@ -1008,19 +1009,21 @@ func (u *Ufest) WholeChecksum() (*cos.Cksum, error) {
 	}
 
 	// Fall back to CRC32C combination
-	if cksum, err := u.combineCRC32C(); err == nil {
+	if cksum, err := u.CombineCRC32C(); err == nil {
 		return cksum, nil
 	}
 
 	// Last resort: re-read all chunks
 	cksumH := cos.NewCksumHash(cos.ChecksumCRC32C)
-	if err := u.ComputeWholeChecksum(cksumH); err != nil {
+	if err := u.computeWholeChecksum(cksumH); err != nil {
 		return nil, err
 	}
 	return &cksumH.Cksum, nil
 }
 
-func (u *Ufest) combineCRC32C() (*cos.Cksum, error) {
+// combine chunk checksums in object order, without rereading data
+// - caller must have stopped all chunk writers
+func (u *Ufest) CombineCRC32C() (*cos.Cksum, error) {
 	debug.Func(func() { debug.AssertNoErr(u.Check(true /*completed*/)) })
 	if u.count == 0 {
 		return nil, errNoChunks
@@ -1040,7 +1043,7 @@ func (u *Ufest) combineCRC32C() (*cos.Cksum, error) {
 // reread all chunk payloads to compute a checksum of the given type
 // see also: s3/mpt for ListParts
 // TODO: optimize-out; callers to revise locking
-func (u *Ufest) ComputeWholeChecksum(cksumH *cos.CksumHash) error {
+func (u *Ufest) computeWholeChecksum(cksumH *cos.CksumHash) error {
 	debug.Func(func() { debug.AssertNoErr(u.Check(true /*completed*/)) })
 	const tag = "[whole-checksum]"
 

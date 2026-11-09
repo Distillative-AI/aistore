@@ -6,6 +6,11 @@
  */
 package backend
 
+// ETag quoting:
+// - Azure returns quoted ETags ("0x8D..."), on the wire and in azcore.ETag
+// - store unquoted (see cmn.BackendHelpers.Azure.EncodeETag)
+// - quote when sending If-Match (cmn.QuoteETag)
+
 // TODO:
 // - check a variety of az clients instantiated below, and alternatives
 //
@@ -413,7 +418,7 @@ func (azbp *azbp) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT, _ *htt
 	if res.Err != nil {
 		return res.ErrCode, res.Err
 	}
-	params := allocPutParams(res, owt)
+	params := allocPutParams(&res, owt)
 	err := azbp.t.PutObject(lom, params)
 	core.FreePutParams(params)
 	if cmn.Rom.V(5, cos.ModBackend) {
@@ -422,7 +427,7 @@ func (azbp *azbp) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT, _ *htt
 	return 0, err
 }
 
-func (azbp *azbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64) (res core.GetReaderResult) {
+func (azbp *azbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64, pin ...*core.ObjPin) (res core.GetReaderResult) {
 	dl, ctx := newRdl(ctx, &azbp.base, lom.Bck()) // read deadline (see rdl.go)
 	defer dl.fini(&res)
 
@@ -448,11 +453,23 @@ func (azbp *azbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, lengt
 	var opts blob.DownloadStreamOptions
 	opts.Range.Count = length
 	opts.Range.Offset = offset
+	if length > 0 {
+		// (ETag only: version not recorded by cold GET)
+		if p := core.RangePin(pin); p != nil && p.ETag != "" {
+			etag := azcore.ETag(cmn.QuoteETag(p.ETag))
+			opts.AccessConditions = &blob.AccessConditions{
+				ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfMatch: &etag},
+			}
+		}
+	}
 	resp, err := client.DownloadStream(ctx, &opts)
 	if err != nil {
 		res.ErrCode, res.Err = azureErrorToAISError(err, cloudBck, lom.ObjName)
-		if res.ErrCode == http.StatusRequestedRangeNotSatisfiable {
+		switch res.ErrCode {
+		case http.StatusRequestedRangeNotSatisfiable:
 			res.Err = cos.NewErrRangeNotSatisfiable(res.Err, nil, 0)
+		case http.StatusPreconditionFailed:
+			res.Err = cos.NewErrPreconditionFailed(res.Err)
 		}
 		return res
 	}
@@ -472,6 +489,10 @@ func (azbp *azbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, lengt
 		if md5, _ := h.EncodeCksum(respProps.ContentMD5); md5 != "" {
 			lom.SetCustomKey(cmn.MD5ObjMD, md5)
 			res.ExpCksum = cos.NewCksum(cos.ChecksumMD5, md5)
+		}
+		// a changed response cannot seed parallel reads from the earlier properties
+		if resp.ETag != nil && *resp.ETag == *respProps.ETag {
+			res.Pin.Init(apc.Azure, lom.ObjAttrs())
 		}
 	}
 

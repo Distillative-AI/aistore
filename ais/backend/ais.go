@@ -13,7 +13,6 @@ import (
 	"os"
 	"regexp"
 	"sync"
-	"time"
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
@@ -24,7 +23,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
-	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/stats"
 )
 
@@ -497,7 +495,7 @@ func (m *AISbp) ListObjects(ctx context.Context, remoteBck *meta.Bck, msg *apc.L
 	origEntries := lst.Entries[:0]
 	*lst = *lstRes
 	lst.Entries = origEntries
-	lst.Entries = append(lst.Entries, lstRes.Entries...) // not clearing remote `apc.EntryIsCached` - done later by x-lso
+	lst.Entries = append(lst.Entries, lstRes.Entries...) // not clearing remote `apc.EntryIsCached` - done later by x-list
 
 	// Restore the original request UUID (UUID of the remote cluster is already inside `ContinuationToken`).
 	lst.UUID = msg.UUID
@@ -587,41 +585,24 @@ func (m *AISbp) HeadObj(_ context.Context, lom *core.LOM, _ *http.Request) (oa *
 	return
 }
 
-// TODO: retry
-func (m *AISbp) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT, _ *http.Request) (ecode int, err error) {
-	var (
-		remAis    *remAis
-		r         io.ReadCloser
-		size      int64
-		remoteBck = lom.Bck().Clone()
-	)
-	if remAis, err = m.getRemAis(remoteBck.Ns.UUID); err != nil {
-		return
+// TODO: retry upon 'unreachable' or timeout
+func (m *AISbp) GetObj(ctx context.Context, lom *core.LOM, owt cmn.OWT, _ *http.Request) (int, error) {
+	res := m.GetObjReader(ctx, lom, 0, 0)
+	if res.Err != nil {
+		return res.ErrCode, res.Err
 	}
-	unsetUUID(&remoteBck)
-	if r, size, err = api.GetObjectReader(remAis.bpL, remoteBck, lom.ObjName, &api.GetArgs{Context: ctx}); err != nil {
-		return m.extractErrCode(err, remAis.uuid)
-	}
-	params := core.AllocPutParams()
-	{
-		params.WorkTag = fs.WorkfileColdget
-		params.Reader = r
-		params.OWT = owt
-		params.Size = size
-		params.Atime = time.Now()
-	}
-	err = m.t.PutObject(lom, params)
+	params := allocPutParams(&res, owt)
+	err := m.t.PutObject(lom, params)
 	core.FreePutParams(params)
-
-	// TODO: retry upon 'unreachable' or timeout
-
-	return m.extractErrCode(err, remAis.uuid)
+	return 0, err // local write: no remote error mapping (cf. other backends)
 }
 
-func (m *AISbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64) (res core.GetReaderResult) {
+func (m *AISbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64, pin ...*core.ObjPin) (res core.GetReaderResult) {
 	var (
 		remAis    *remAis
 		args      *api.GetArgs
+		p         *core.ObjPin
+		oah       api.ObjAttrs
 		remoteBck = lom.Bck().Clone()
 	)
 	if remAis, res.Err = m.getRemAis(remoteBck.Ns.UUID); res.Err != nil {
@@ -632,26 +613,52 @@ func (m *AISbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length 
 	// reader
 	args = &api.GetArgs{Context: ctx}
 	if length > 0 {
+		p = core.RangePin(pin)
 		args.Header = http.Header{cos.HdrRange: []string{cmn.MakeRangeHdr(offset, length)}}
 		args.Query = url.Values{apc.QparamSilent: []string{"true"}}
-	} else {
-		hargs := api.HeadArgs{FltPresence: apc.FltPresent, Silent: true}
-		var op *cmn.ObjectPropsV2
-		if op, res.Err = api.HeadObjectV2(remAis.bp, remoteBck, lom.ObjName, remAisHeadProps, hargs); res.Err != nil {
-			res.ErrCode, res.Err = m.extractErrCode(res.Err, remAis.uuid)
-			return res
-		}
-		oa := lom.ObjAttrs()
-		*oa = op.ObjAttrs
-		res.Size = oa.Size
-		oa.SetCustomKey(cmn.SourceObjMD, apc.AIS)
-		res.ExpCksum = oa.Cksum
-		lom.SetCksum(nil)
 	}
 
-	res.R, res.Size, res.Err = api.GetObjectReader(remAis.bpL, remoteBck, lom.ObjName, args)
+	res.R, oah, res.Err = api.GetObjectReaderWithAttrs(remAis.bpL, remoteBck, lom.ObjName, args)
+	res.Size = oah.Size()
 	res.ErrCode, res.Err = m.extractErrCode(res.Err, remAis.uuid)
+	if res.Err == nil && length == 0 {
+		// take metadata from this GET, without a separate HEAD
+		oa := lom.ObjAttrs()
+		*oa = cmn.ObjAttrs{}
+		res.ExpCksum, res.Err = oa.FromHeader(oah.RespHeader())
+		if res.Err != nil {
+			cmn.CloseRemote(res.R, lom, 4, cos.ModBackend)
+			res.R, res.Size, res.ErrCode = nil, 0, http.StatusBadGateway
+			return res
+		}
+		oa.SetCustomKey(cmn.SourceObjMD, apc.AIS)
+		if oa.Version() != "" { // unversioned AIS has no authoritative revision to seed a fill
+			res.Pin.Init(apc.AIS, oa)
+		}
+	}
+	if res.Err == nil && p != nil {
+		if res.ErrCode, res.Err = m.checkPin(p, oah.RespHeader()); res.Err != nil {
+			cmn.CloseRemote(res.R, lom, 4, cos.ModBackend) // do not consume a different revision's body
+			res.R, res.Size = nil, 0
+		}
+	}
 	return res
+}
+
+// check the GET itself before exposing its reader
+func (*AISbp) checkPin(p *core.ObjPin, hdr http.Header) (int, error) {
+	var oa cmn.ObjAttrs
+	if _, err := oa.FromHeader(hdr); err != nil {
+		return http.StatusBadGateway, err
+	}
+	cur := core.NewObjPin(apc.AIS, &oa)
+	switch {
+	case cur == nil:
+		return http.StatusPreconditionFailed, cos.NewErrPreconditionFailed(fmt.Errorf("pinned %s, have none", p))
+	case *cur != *p:
+		return http.StatusPreconditionFailed, cos.NewErrPreconditionFailed(fmt.Errorf("pinned %s, have %s", p, cur))
+	}
+	return 0, nil
 }
 
 // TODO: retry upon 'unreachable' or timeout

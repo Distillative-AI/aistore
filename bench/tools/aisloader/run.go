@@ -71,6 +71,8 @@ const (
 
 	defaultClusterIP   = "localhost"
 	defaultClusterIPv4 = "127.0.0.1"
+
+	randomReadOff = "random" // -readoff=random
 )
 
 type (
@@ -100,9 +102,11 @@ type (
 var (
 	runParams        *params
 	rnd              *rand.Rand
+	readOffRnd       *rand.Rand // -readoff=random
 	intervalStats    sts
 	accumulatedStats sts
 	objnameGetter    namegetter.Basic
+	objSizes         map[string]int64
 	statsPrintHeader = "%-10s%-6s%-22s\t%-22s\t%-36s\t%-22s\t%-10s\n"
 	statsdC          *statsd.Client
 
@@ -193,17 +197,7 @@ func Start(version, buildtime string) (err error) {
 		return nil
 	}
 
-	// If none of duration, epochs, or put upper bound is specified, it is a no op.
-	// Note that stoppable prevents being a no op
-	// This can be used as a cleanup only run (no put no get).
 	if runParams.duration.Val == 0 {
-		if runParams.putSizeUpperBound == 0 && runParams.numEpochs == 0 && !runParams.stoppable {
-			if runParams.cleanUp.Val {
-				cleanup()
-			}
-			return nil
-		}
-
 		runParams.duration.Val = time.Duration(math.MaxInt64)
 	}
 
@@ -268,7 +262,7 @@ func Start(version, buildtime string) (err error) {
 
 		// note that "'-skiplist' option is ignored when '-filelist' or '-filelist-obj' is specified"
 	case !runParams.skipList:
-		names, fcnt, err := listObjects()
+		names, sizes, fcnt, err := listObjects()
 		if err != nil {
 			return err
 		}
@@ -295,6 +289,7 @@ func Start(version, buildtime string) (err error) {
 		// initialize global name-getter and announce
 		objnameGetter = ng
 		objnameGetter.Init(names, rnd)
+		objSizes = sizes
 		switch fcnt {
 		case 0:
 			fmt.Printf("Found %s existing object%s\n\n", cos.FormatBigInt(l), cos.Plural(l))
@@ -796,7 +791,7 @@ func objNamesFromList(r io.Reader) (names []string, err error) {
 	return names, scanner.Err()
 }
 
-func listObjects() (names []string, fcnt int, err error) {
+func listObjects() (names []string, sizes map[string]int64, fcnt int, err error) {
 	switch {
 	case runParams.fileList != "":
 		names, err = objNamesFromFile(runParams.fileList)
@@ -805,9 +800,9 @@ func listObjects() (names []string, fcnt int, err error) {
 	case isDirectS3():
 		names, err = s3ListObjects()
 	default:
-		names, fcnt, err = listObjectNames(runParams)
+		names, sizes, fcnt, err = listObjectData(runParams)
 	}
-	return names, fcnt, err
+	return names, sizes, fcnt, err
 }
 
 func objNamesFromFile(path string) ([]string, error) {

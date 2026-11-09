@@ -6,6 +6,11 @@
  */
 package backend
 
+// ETag quoting:
+// - S3 returns quoted, opaque ETags: "<md5>" or "<md5>-<number-of-parts>" (multipart)
+// - store unquoted (see cmn.BackendHelpers.Amazon.EncodeETag)
+// - quote when sending If-Match (cmn.QuoteETag)
+
 import (
 	"context"
 	"errors"
@@ -498,7 +503,7 @@ finalize:
 	if res.Err != nil {
 		return res.ErrCode, res.Err
 	}
-	params := allocPutParams(res, owt)
+	params := allocPutParams(&res, owt)
 	err := s3bp.t.PutObject(lom, params)
 	core.FreePutParams(params)
 	if cmn.Rom.V(5, cos.ModBackend) {
@@ -507,7 +512,7 @@ finalize:
 	return 0, err
 }
 
-func (s3bp *s3bp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64) (res core.GetReaderResult) {
+func (s3bp *s3bp) GetObjReader(ctx context.Context, lom *core.LOM, offset, length int64, pin ...*core.ObjPin) (res core.GetReaderResult) {
 	dl, ctx := newRdl(ctx, &s3bp.base, lom.Bck()) // read deadline (see rdl.go)
 	defer dl.fini(&res)
 
@@ -528,11 +533,22 @@ func (s3bp *s3bp) GetObjReader(ctx context.Context, lom *core.LOM, offset, lengt
 	if length > 0 {
 		rng := cmn.MakeRangeHdr(offset, length)
 		input.Range = aws.String(rng)
+		// prefer If-Match: VersionId requires s3:GetObjectVersion (and S3-compatible stores may not support it)
+		if p := core.RangePin(pin); p != nil {
+			if p.ETag != "" {
+				input.IfMatch = aws.String(cmn.QuoteETag(p.ETag))
+			} else if p.Version != "" {
+				input.VersionId = aws.String(p.Version)
+			}
+		}
 		obj, err = svc.GetObject(ctx, &input)
 		if err != nil {
 			res.ErrCode, res.Err = awsErrorToAISError(err, cloudBck, lom.ObjName, sessConf.detail())
-			if res.ErrCode == http.StatusRequestedRangeNotSatisfiable {
+			switch res.ErrCode {
+			case http.StatusRequestedRangeNotSatisfiable:
 				res.Err = cos.NewErrRangeNotSatisfiable(res.Err, nil, 0)
+			case http.StatusPreconditionFailed:
+				res.Err = cos.NewErrPreconditionFailed(res.Err)
 			}
 			return res
 		}
@@ -546,6 +562,7 @@ func (s3bp *s3bp) GetObjReader(ctx context.Context, lom *core.LOM, offset, lengt
 		lom.SetCustomKey(cmn.SourceObjMD, apc.AWS)
 
 		res.ExpCksum = _getCustom(lom, obj)
+		res.Pin.Init(apc.AWS, lom.ObjAttrs())
 
 		md := obj.Metadata
 		if cksumType, ok := md[cos.S3MetadataChecksumType]; ok {
@@ -642,6 +659,11 @@ func putUpload(ctx context.Context, r io.ReadCloser, lom *core.LOM, oreq *http.R
 	if err != nil {
 		return nil, 0, err
 	}
+	match, none, ecode, err := awsWriteConditions(svc, oreq)
+	if err != nil {
+		cos.Close(r)
+		return nil, ecode, err
+	}
 
 	md[cos.S3MetadataChecksumType] = cksumType
 	md[cos.S3MetadataChecksumVal] = cksumValue
@@ -666,13 +688,15 @@ func putUpload(ctx context.Context, r io.ReadCloser, lom *core.LOM, oreq *http.R
 		Body:     r,
 		Metadata: md,
 	}
+	// the uploader copies conditions to CompleteMultipartUpload
+	input.IfMatch, input.IfNoneMatch = match, none
 	if v, ok := lom.GetCustomKey(cos.HdrContentType); ok {
 		input.ContentType = aws.String(v)
 	}
 	out, err := uploader.Upload(ctx, input)
 	cos.Close(r)
 	if err != nil {
-		ecode, e := awsErrorToAISError(err, cloudBck, lom.ObjName, sessConf.detail())
+		ecode, e := awsWriteError(err, cloudBck, lom.ObjName, input.IfMatch != nil || input.IfNoneMatch != nil, sessConf.detail())
 		return nil, ecode, e
 	}
 	return out, 0, nil
@@ -759,15 +783,12 @@ func newPresignedReq(oreq *http.Request, lom *core.LOM, body io.ReadCloser) (*ai
 // "S3 methods are safe to use concurrently. It is not safe to modify mutate
 // any of the struct's properties though."
 func (sc *sessConf) s3client(tag string) (*s3.Client, error) {
-	sc.endpoint = s3Endpoint
+	sc.endpoint = awsEndpoint(sc.bck)
 	sc.profile = awsProfile
 
 	if sc.bck != nil && sc.bck.Props != nil {
 		if sc.region == "" {
 			sc.region = sc.bck.Props.Extra.AWS.CloudRegion
-		}
-		if sc.bck.Props.Extra.AWS.Endpoint != "" {
-			sc.endpoint = sc.bck.Props.Extra.AWS.Endpoint
 		}
 		if sc.bck.Props.Extra.AWS.Profile != "" {
 			sc.profile = sc.bck.Props.Extra.AWS.Profile

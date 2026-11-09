@@ -7,6 +7,7 @@ package aisloader
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -21,7 +22,8 @@ func TestParamsValidate(t *testing.T) {
 				bck: cmn.Bck{Provider: apc.AIS},
 			},
 			workloadParams: workloadParams{
-				putPct: 50,
+				duration: DurationExt{Val: time.Minute},
+				putPct:   50,
 			},
 			sizeCksumParams: sizeCksumParams{
 				minSize:   cos.KiB,
@@ -117,6 +119,68 @@ func TestParamsValidate(t *testing.T) {
 			wantErr: "value 1001 (must be 1-1000)",
 		},
 		{
+			name: "random read offset",
+			mutate: func(p *params) {
+				p.readOffRandom = true
+				p.readLen = cos.KiB
+			},
+		},
+		{
+			name:    "random read offset without read length",
+			mutate:  func(p *params) { p.readOffRandom = true },
+			wantErr: "'-readoff=random' requires '-readlen' > 0",
+		},
+		{
+			name: "random read offset with file list",
+			mutate: func(p *params) {
+				p.readOffRandom = true
+				p.readLen = cos.KiB
+				p.fileList = "/some/filelist.txt"
+			},
+			wantErr: "'-readoff=random' with '-filelist' or '-filelist-obj' is not supported yet",
+		},
+		{
+			name: "random read offset with archive listing",
+			mutate: func(p *params) {
+				p.readOffRandom = true
+				p.readLen = cos.KiB
+				p.archParams.list = true
+			},
+			wantErr: "'-readoff=random' cannot be used with archive options",
+		},
+		{
+			name: "random read offset with multipart download stream",
+			mutate: func(p *params) {
+				p.readOffRandom = true
+				p.readLen = cos.KiB
+				p.putPct = 0
+				p.mpdStreamPct = 10
+			},
+			wantErr: "'-readoff=random' and '-pctmpdstream' are mutually exclusive",
+		},
+		{
+			name: "random read offset with update existing",
+			mutate: func(p *params) {
+				p.readOffRandom = true
+				p.readLen = cos.KiB
+				p.updateExistingPct = 10
+			},
+			wantErr: "'-readoff=random' and '-pctupdate' are mutually exclusive",
+		},
+		{
+			name: "random read offset ignored with 100% PUT",
+			mutate: func(p *params) {
+				p.readOffRandom = true
+				p.readLen = cos.KiB
+				p.putPct = 100
+			},
+			check: func(t *testing.T, p *params) {
+				if p.readOffRandom {
+					t.Fatal("validate() must clear readOffRandom for 100% PUT workloads")
+				}
+			},
+		},
+		{
 			name:    "negative stats interval",
 			mutate:  func(p *params) { p.statsShowInterval = -1 },
 			wantErr: "stats show interval -1",
@@ -198,6 +262,39 @@ func TestParamsValidate(t *testing.T) {
 				p.statsOutputObj = "ais://workload/stats.json"
 				p.bck.Name = "ais://#tenant/workload"
 				p.cleanUp.Val = true
+			},
+		},
+		{
+			name:    "reject no workload",
+			mutate:  func(p *params) { p.duration.Val = 0 },
+			wantErr: "no workload specified",
+		},
+		{
+			name: "allow zero duration with total PUT size",
+			mutate: func(p *params) {
+				p.duration.Val = 0
+				p.putSizeUpperBound = cos.MiB
+			},
+		},
+		{
+			name: "allow zero duration with epochs",
+			mutate: func(p *params) {
+				p.duration.Val = 0
+				p.numEpochs = 1
+			},
+		},
+		{
+			name: "allow zero duration with stoppable",
+			mutate: func(p *params) {
+				p.duration.Val = 0
+				p.stoppable = true
+			},
+		},
+		{
+			name: "allow get loader ID with no workload",
+			mutate: func(p *params) {
+				p.duration.Val = 0
+				p.getLoaderID = true
 			},
 		},
 		{

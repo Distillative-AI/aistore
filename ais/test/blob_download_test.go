@@ -7,10 +7,14 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -20,7 +24,10 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/feat"
+	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
@@ -348,7 +355,7 @@ func TestBlobDownloadRenewFailureUnlocks(t *testing.T) {
 	tassert.Fatalf(t, lock == apc.LockNone, "expected released lock, got %d", lock)
 
 	// The failed candidate did not retain ownership: a valid retry can run to completion.
-	xid, err := api.BlobDownload(bp, m.bck, objName, &apc.BlobMsg{FullSize: objSize})
+	xid, err := api.BlobDownload(bp, m.bck, objName, &apc.BlobMsg{FullSize: objSize, ChunkSize: cos.MiB})
 	tassert.CheckFatal(t, err)
 	tassert.CheckFatal(t, api.WaitForXaction(bp, &xact.ArgsMsg{
 		ID: xid, Kind: apc.ActBlobDl, Timeout: tools.EvictPrefetchTimeout,
@@ -387,6 +394,8 @@ func TestBlobDownloadParentCancellation(t *testing.T) {
 		body, size, err := api.GetObjectReader(bp, bck, objName, getArgs)
 		tassert.CheckFatal(t, err)
 		tassert.Fatalf(t, size == objSize, "expected size %d, got %d", objSize, size)
+		_, err = io.CopyN(io.Discard, body, 1) // cancel after the backend has started delivering data
+		tassert.CheckFatal(t, err)
 		xargs := &xact.ArgsMsg{Kind: apc.ActBlobDl, Timeout: tools.RebalanceTimeout}
 		snaps, err := api.WaitForSnaps(bp, xargs, xargs.Started())
 		tassert.CheckFatal(t, err)
@@ -602,7 +611,7 @@ func TestBlobDownloadRWStress(t *testing.T) {
 				err = m.get(bp, idx, 0, args, true /*validate*/)
 			case apc.ActBlobDl:
 				var xid string
-				xid, err = api.BlobDownload(bp, m.bck, m.objNames[idx], &apc.BlobMsg{})
+				xid, err = api.BlobDownload(bp, m.bck, m.objNames[idx], &apc.BlobMsg{ChunkSize: cos.MiB})
 				if err == nil && xid != "" {
 					args := xact.ArgsMsg{ID: xid, Kind: apc.ActBlobDl, Timeout: tools.RebalanceTimeout}
 					err = api.WaitForXaction(bp, &args)
@@ -729,10 +738,22 @@ func TestBlobDownloadColdGetContention(t *testing.T) {
 }
 
 func TestBlobDownloadLockContentionLatestVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		latest bool
+	}{
+		{"regular-get", false},
+		{"latest-get", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testBlobDownloadLatestVersion(t, tc.latest) })
+	}
+}
+
+func testBlobDownloadLatestVersion(t *testing.T, latest bool) {
 	var (
 		regularGets = 4
 		blobGets    = 8
-		objSize     = int64(8 * cos.MiB)
+		objSize     = int64(32 * cos.MiB) // exceed socket buffering while the leader is unread
 		chunkSize   = int64(2 * cos.MiB)
 	)
 	if !testing.Short() {
@@ -771,7 +792,7 @@ func TestBlobDownloadLockContentionLatestVersion(t *testing.T) {
 	cos.Close(cached)
 
 	// Replace version 1 directly on the remote cluster, leaving the local copy stale.
-	newReader, err := readers.New(&readers.Arg{Type: readers.Rand, Size: objSize, CksumType: cos.ChecksumNone})
+	newReader, err := readers.New(&readers.Arg{Type: readers.Rand, Size: objSize, CksumType: cos.ChecksumCesXxh})
 	tassert.CheckFatal(t, err)
 	putArgs.Reader = newReader // out-of-band update on the remote cluster
 	_, err = api.PutObject(putArgs)
@@ -803,8 +824,22 @@ func TestBlobDownloadLockContentionLatestVersion(t *testing.T) {
 		go func() { blobErrCh <- m.get(bp, 0, 0, args, true /*validate*/) }()
 	}
 	for range regularGets {
-		args := &api.GetArgs{Query: url.Values{apc.QparamLatestVer: []string{"true"}}}
-		go func() { regularErrCh <- m.get(bp, 0, 0, args, true /*validate*/) }()
+		go func() {
+			var got cos.CksumHashSize
+			got.Init(cos.ChecksumCesXxh)
+			args := &api.GetArgs{Writer: &got}
+			if latest {
+				args.Query = url.Values{apc.QparamLatestVer: []string{"true"}}
+			}
+			err := m.get(bp, 0, 0, args, true /*validate*/)
+			if err == nil {
+				got.Finalize()
+				if got.Size != objSize || !got.Equal(newReader.Cksum()) {
+					err = errors.New("waiting GET returned stale object version")
+				}
+			}
+			regularErrCh <- err
+		}()
 	}
 	for range blobGets {
 		err := <-blobErrCh
@@ -813,21 +848,23 @@ func TestBlobDownloadLockContentionLatestVersion(t *testing.T) {
 	}
 
 	// The leader returns version 2 and releases its lock for all waiting GETs.
+	tassert.Fatalf(t, len(regularErrCh) == 0, "regular GETs completed before the leader released its lock")
 	expected, err = newReader.Open()
 	tassert.CheckFatal(t, err)
 	tassert.Fatalf(t, tools.ReaderEqual(expected, leader), "blob GET returned stale object version")
 	cos.Close(expected)
 	cos.Close(leader)
-	// Regular latest-version GETs wait for the leader, then read version 2.
+	// Regular GETs, with and without latest-ver, wait for the leader and return version 2.
 	for range regularGets {
 		tassert.CheckFatal(t, <-regularErrCh)
 	}
+	// blob download stores the remote checksum: latest-version GETs must not refetch
 	m.validateChunksOnDisk(bck, objName, int(objSize/chunkSize))
 }
 
 func TestBlobDownloadRemoteAISReadTimeout(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{RequiresRemoteCluster: true})
-	const objSize = cmn.ChunkSizeMin // (explicit api.BlobDownload: no minimum other than zero)
+	const objSize = 2 * cmn.ChunkSizeMin
 	var (
 		proxyURL  = tools.RandomProxyURL(t)
 		bp        = tools.BaseAPIParams(proxyURL)
@@ -836,9 +873,12 @@ func TestBlobDownloadRemoteAISReadTimeout(t *testing.T) {
 		bck       = cmn.Bck{Name: remoteBck.Name, Provider: apc.AIS, Ns: cmn.Ns{UUID: tools.RemoteCluster.Alias}}
 		objName   = t.Name() + "-object"
 	)
+	tlog.Logfln("remote cluster: alias %q, UUID %q, URL %s", tools.RemoteCluster.Alias, tools.RemoteCluster.UUID, tools.RemoteCluster.URL)
+	tlog.Logfln("create %s (via %s)", bck.Cname(""), proxyURL)
 	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
 	initMountpaths(t, proxyURL)
 
+	tlog.Logfln("put %s (size %s) directly to the remote cluster", remoteBck.Cname(objName), cos.ToSizeIEC(objSize, 0))
 	_, err := api.PutObject(&api.PutArgs{
 		BaseParams: remoteBP, Bck: remoteBck, ObjName: objName,
 		Reader: readers.NewBytes(bytes.Repeat([]byte{'x'}, objSize)), Size: objSize,
@@ -846,25 +886,30 @@ func TestBlobDownloadRemoteAISReadTimeout(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	xid, err := api.BlobDownload(bp, bck, objName, &apc.BlobMsg{
-		ChunkSize: cmn.ChunkSizeMin, NumWorkers: 1, ChunkReadTimeout: cos.Duration(time.Nanosecond),
+		ChunkSize: cmn.ChunkSizeMin, NumWorkers: 2, ChunkReadTimeout: cos.Duration(time.Nanosecond),
 	})
 	tassert.CheckFatal(t, err)
+	tlog.Logfln("%s[%s]: %s, chunk read timeout 1ns", apc.ActBlobDl, xid, bck.Cname(objName))
 
 	args := &xact.ArgsMsg{ID: xid, Kind: apc.ActBlobDl, Timeout: tools.RebalanceTimeout}
 	snaps, err := api.WaitForSnaps(bp, args, args.Finished())
 	tassert.CheckFatal(t, err)
 
 	var errText string
-	for _, targetSnaps := range snaps {
+	for tid, targetSnaps := range snaps {
 		for _, snap := range targetSnaps {
-			if snap.ID == xid {
-				errText = snap.Err
+			if snap.ID != xid {
+				continue
 			}
+			tlog.Logfln("%s[%s] on %s: finished %t, aborted %t, err %q, abort-err %q",
+				apc.ActBlobDl, xid, meta.Tname(tid), snap.IsFinished(), snap.IsAborted(), snap.Err, snap.AbortErr)
+			errText = snap.Err
 		}
 	}
 	tassert.Fatalf(t, strings.Contains(errText, context.DeadlineExceeded.Error()),
 		"expected context deadline, got %q", errText)
 
+	tlog.Logfln("validate: no chunks on disk for %s", bck.Cname(objName))
 	m := ioContext{t: t, bck: bck}
 	m.validateChunksOnDisk(bck, objName, 0)
 }
@@ -1508,12 +1553,79 @@ func TestBlobDownloadCacheOnlyMaxChunkSize(t *testing.T) {
 	}
 }
 
-// TestBlobDownloadSingleThreaded tests single-threaded blob download (numWorkers = -1).
-// It validates:
-// 1. Single-threaded blob download via API works correctly
-// 2. Single-threaded blob download via streaming GET works correctly
-// 3. Objects are downloaded and cached properly in single-threaded mode
-func TestBlobDownloadSingleThreaded(t *testing.T) {
+func TestBlobDownloadParallelAdmission(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: cliBck})
+	const (
+		objSize   = 2 * cos.MiB
+		chunkSize = 4 * cos.MiB
+	)
+	m := ioContext{t: t, bck: cliBck, num: 1, fileSize: objSize, fixedSize: true,
+		prefix: "blob-admission/" + trand.String(8)}
+	m.init(true /*cleanup*/)
+	m.remotePuts(false /*evict*/)
+	bp := tools.BaseAPIParams(m.proxyURL)
+	objName := m.objNames[0]
+
+	for _, tc := range []struct {
+		name    string
+		workers int
+		mode    string
+		status  int
+	}{
+		{"job/serial", -1, "job", http.StatusBadRequest},
+		{"job/one-worker", 1, "job", http.StatusBadRequest},
+		{"job/one-chunk", 0, "job", http.StatusBadRequest},
+		{"stream/serial", -1, "stream", http.StatusBadRequest},
+		{"stream/one-worker", 1, "stream", http.StatusBadRequest},
+		{"stream/one-chunk", 0, "stream", 0},
+		{"threshold/fallback", 0, "threshold", 0},
+		{"prefetch/serial", -1, "prefetch", http.StatusBadRequest},
+		{"prefetch/one-worker", 1, "prefetch", http.StatusBadRequest},
+		{"prefetch/fallback", 0, "prefetch", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := api.EvictObject(bp, m.bck, objName)
+			tassert.Fatalf(t, err == nil || api.HTTPStatus(err) == http.StatusNotFound, "evict: %v", err)
+			var xid, kind string
+			switch tc.mode {
+			case "job":
+				kind = apc.ActBlobDl
+				xid, err = api.BlobDownload(bp, m.bck, objName, &apc.BlobMsg{ChunkSize: chunkSize, NumWorkers: tc.workers})
+			case "prefetch":
+				kind = apc.ActPrefetchObjects
+				msg := &apc.PrefetchMsg{BlobThreshold: cos.MiB, BlobChunkSize: chunkSize, BlobNumWorkers: tc.workers}
+				msg.ObjNames = []string{objName}
+				xid, err = api.Prefetch(bp, m.bck, msg)
+			default:
+				header := http.Header{
+					apc.HdrBlobChunk:   []string{strconv.Itoa(chunkSize)},
+					apc.HdrBlobWorkers: []string{strconv.Itoa(tc.workers)},
+				}
+				if tc.mode == "stream" {
+					header.Set(apc.HdrBlobDownload, "true")
+				} else {
+					header.Set(apc.HdrBlobThreshold, strconv.Itoa(cos.MiB))
+				}
+				_, err = api.GetObject(bp, m.bck, objName, &api.GetArgs{Header: header})
+			}
+			if xid != "" {
+				tassert.CheckFatal(t, api.WaitForXaction(bp, &xact.ArgsMsg{ID: xid, Kind: kind, Timeout: tools.EvictPrefetchTimeout}))
+			}
+			if tc.status != 0 {
+				tassert.Fatalf(t, api.HTTPStatus(err) == tc.status, "expected HTTP %d, got %v", tc.status, err)
+				tassert.Fatalf(t, !tools.CheckObjIsPresent(bp.URL, m.bck, objName), "rejected download stored the object")
+				return
+			}
+			tassert.CheckFatal(t, err)
+			op, err := api.HeadObjectV2(bp, m.bck, objName, apc.JoinProps(apc.GetPropsChunked, apc.GetPropsSize), api.HeadArgs{FltPresence: apc.FltPresent})
+			tassert.CheckFatal(t, err)
+			tassert.Fatalf(t, op.Size == objSize && op.Chunks != nil && op.Chunks.ChunkCount == 0,
+				"expected regular cold GET to store an unchunked object, got %+v", op)
+		})
+	}
+}
+
+func TestBlobDownloadParallel(t *testing.T) {
 	const (
 		objSize   = 32 * cos.MiB
 		chunkSize = 8 * cos.MiB
@@ -1526,18 +1638,28 @@ func TestBlobDownloadSingleThreaded(t *testing.T) {
 
 	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: bck})
 	initMountpaths(t, proxyURL)
+	props, err := api.HeadBucket(baseParams, bck, false)
+	tassert.CheckFatal(t, err)
 
-	tests := []struct {
+	for _, test := range []struct {
 		name      string
 		streamGet bool
+		features  feat.Flags
 	}{
 		{name: "blob-download", streamGet: false},
 		{name: "streaming-get", streamGet: true},
-	}
-
-	for _, test := range tests {
+		{name: "blob-download-fsync", features: feat.FsyncPUT},
+		{name: "streaming-get-fsync", streamGet: true, features: feat.FsyncPUT},
+	} {
 		t.Run(test.name, func(t *testing.T) {
-			objName := "blob-single-threaded-" + test.name + "-" + trand.String(5)
+			t.Cleanup(func() {
+				_, err := api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{Features: apc.Ptr(props.Features)})
+				tassert.CheckError(t, err)
+			})
+			features := props.Features&^feat.FsyncPUT | test.features
+			_, err := api.SetBucketProps(baseParams, bck, &cmn.BpropsToSet{Features: &features})
+			tassert.CheckFatal(t, err)
+			objName := "blob-parallel-" + test.name + "-" + trand.String(5)
 
 			// Provision object to remote bucket
 			tlog.Logfln("Provisioning object %s (%s)", objName, cos.ToSizeIEC(objSize, 0))
@@ -1552,7 +1674,7 @@ func TestBlobDownloadSingleThreaded(t *testing.T) {
 				Size:       uint64(objSize),
 			})
 			tassert.CheckFatal(t, err)
-			defer api.DeleteObject(baseParams, bck, objName)
+			t.Cleanup(func() { tassert.CheckError(t, api.DeleteObject(baseParams, bck, objName)) })
 
 			// Evict the object to force cold GET
 			tlog.Logfln("Evicting object %s", objName)
@@ -1560,15 +1682,15 @@ func TestBlobDownloadSingleThreaded(t *testing.T) {
 			tassert.CheckFatal(t, err)
 
 			if test.streamGet {
-				// Test single-threaded blob download via streaming GET
-				tlog.Logfln("Starting single-threaded blob download via streaming GET")
+				// Test parallel blob download via streaming GET
+				tlog.Logfln("Starting parallel blob download via streaming GET")
 				coldGetBuf := &bytes.Buffer{}
 				getArgs := &api.GetArgs{
 					Writer: coldGetBuf,
 					Header: http.Header{
 						apc.HdrBlobDownload: []string{"true"},
 						apc.HdrBlobChunk:    []string{cos.ToSizeIEC(chunkSize, 0)},
-						apc.HdrBlobWorkers:  []string{"-1"}, // Single-threaded
+						apc.HdrBlobWorkers:  []string{"2"},
 					},
 				}
 				result, size, err := api.GetObjectReader(baseParams, bck, objName, getArgs)
@@ -1580,12 +1702,12 @@ func TestBlobDownloadSingleThreaded(t *testing.T) {
 				tassert.CheckFatal(t, err)
 				tassert.Fatalf(t, tools.ReaderEqual(readerDup, result), "cold GET: data mismatch")
 			} else {
-				// Test single-threaded blob download via API
-				tlog.Logfln("Starting single-threaded blob download via API")
+				// Test parallel blob download via API
+				tlog.Logfln("Starting parallel blob download via API")
 				blobMsg := &apc.BlobMsg{
 					ChunkSize:  chunkSize,
 					FullSize:   objSize,
-					NumWorkers: -1, // Single-threaded
+					NumWorkers: 2,
 					LatestVer:  false,
 				}
 				xid, err := api.BlobDownload(baseParams, bck, objName, blobMsg)
@@ -1593,7 +1715,7 @@ func TestBlobDownloadSingleThreaded(t *testing.T) {
 				tlog.Logfln("Blob download started with xid=%s", xid)
 
 				// Wait for blob download to complete
-				tlog.Logfln("Waiting for single-threaded blob download to complete")
+				tlog.Logfln("Waiting for parallel blob download to complete")
 				args := xact.ArgsMsg{ID: xid, Kind: apc.ActBlobDl, Timeout: tools.EvictPrefetchTimeout}
 				err = api.WaitForXaction(baseParams, &args)
 				tassert.CheckFatal(t, err)
@@ -1620,13 +1742,13 @@ func TestBlobDownloadSingleThreaded(t *testing.T) {
 			expectedChunks := (objSize + chunkSize - 1) / chunkSize
 			m.validateChunksOnDisk(bck, objName, expectedChunks)
 
-			tlog.Logfln("Single-threaded blob download test (%s) completed successfully", test.name)
+			tlog.Logfln("Parallel blob download test (%s) completed successfully", test.name)
 		})
 	}
 }
 
 // TestPrefetchBlobInvalidWorkers validates that prefetch rejects an out-of-range
-// BlobNumWorkers (anything below NwpNone == -1).
+// BlobNumWorkers (negative values or one worker).
 func TestPrefetchBlobInvalidWorkers(t *testing.T) {
 	var (
 		proxyURL   = tools.RandomProxyURL(t)
@@ -1655,7 +1777,7 @@ func TestPrefetchBlobInvalidWorkers(t *testing.T) {
 //
 // Covered values:
 //
-//	-1 (NwpNone, serial path), 0 (auto-tuned), small positive (4),
+//	2 (minimum parallelism), 0 (auto-tuned), small positive (4),
 //	above blobMaxWorkers cap (64).
 func TestPrefetchBlobNumWorkers(t *testing.T) {
 	const (
@@ -1663,17 +1785,15 @@ func TestPrefetchBlobNumWorkers(t *testing.T) {
 		blobThresh = cos.MiB
 	)
 
-	cases := []struct {
+	for _, tc := range []struct {
 		name      string
 		requested int
 	}{
-		{name: "single-thread", requested: -1},
+		{name: "two-workers", requested: 2},
 		{name: "auto-zero", requested: 0},
 		{name: "small-positive", requested: 4},
 		{name: "over-max-cap", requested: 64},
-	}
-
-	for _, tc := range cases {
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
 				proxyURL   = tools.RandomProxyURL(t)
@@ -1690,13 +1810,14 @@ func TestPrefetchBlobNumWorkers(t *testing.T) {
 			reader, err := readers.New(&readers.Arg{Type: readers.Rand, Size: objSize, CksumType: cos.ChecksumNone})
 			tassert.CheckFatal(t, err)
 			tools.PutObject(t, bck, objName, reader, uint64(objSize))
-			defer api.DeleteObject(baseParams, bck, objName)
+			t.Cleanup(func() { tassert.CheckError(t, api.DeleteObject(baseParams, bck, objName)) })
 
 			tlog.Logfln("Evicting %s", objName)
 			tassert.CheckFatal(t, api.EvictObject(baseParams, bck, objName))
 
 			msg := &apc.PrefetchMsg{
 				BlobThreshold:  blobThresh,
+				BlobChunkSize:  cos.MiB,
 				BlobNumWorkers: tc.requested,
 			}
 			msg.Template = uniq + "/*"
@@ -1717,6 +1838,308 @@ func TestPrefetchBlobNumWorkers(t *testing.T) {
 			tassert.CheckFatal(t, err)
 			tassert.Fatalf(t, tools.ReaderEqual(readerDup, result),
 				"data mismatch after blob prefetch with blob-num-workers=%d", tc.requested)
+		})
+	}
+}
+
+func TestRemaisBlobDownloadVersionPin(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiresRemoteCluster: true, RequiredDeployment: tools.ClusterTypeLocal})
+	const chunkSize = 4 * cos.MiB
+	var (
+		proxyURL  = tools.RandomProxyURL(t)
+		bp        = tools.BaseAPIParams(proxyURL)
+		remoteBP  = tools.BaseAPIParams(tools.RemoteCluster.URL)
+		remoteBck = cmn.Bck{Name: "pin-" + trand.String(8), Provider: apc.AIS}
+		bck       = cmn.Bck{Name: remoteBck.Name, Provider: apc.AIS, Ns: cmn.Ns{UUID: tools.RemoteCluster.UUID}}
+		objName   = "object"
+		v1        = bytes.Repeat([]byte{'1'}, 2*chunkSize)
+		v2        = bytes.Repeat([]byte{'2'}, len(v1))
+	)
+	// seed a versioned source
+	tlog.Logfln("creating versioned bucket %s on %s", remoteBck.Name, remoteBP.URL)
+	tools.CreateBucket(t, remoteBP.URL, remoteBck, &cmn.BpropsToSet{
+		Versioning: &cmn.VersionConfToSet{Enabled: apc.Ptr(true)},
+	}, true /*cleanup*/)
+	put := func(data []byte) error {
+		_, err := api.PutObject(&api.PutArgs{BaseParams: remoteBP, Bck: remoteBck, ObjName: objName,
+			Reader: readers.NewBytes(data), Size: uint64(len(data))})
+		return err
+	}
+	tlog.Logfln("writing v1: %s/%s (%d bytes)", remoteBck.Name, objName, len(v1))
+	tassert.CheckFatal(t, put(v1))
+	tlog.Logfln("registering remote bucket and initializing mountpaths")
+	_, err := api.HeadBucket(bp, bck, false)
+	tassert.CheckFatal(t, err)
+	t.Cleanup(func() { tassert.CheckError(t, api.EvictRemoteBucket(bp, bck, false)) })
+	initMountpaths(t, proxyURL)
+
+	remoteURL, err := url.Parse(remoteBP.URL)
+	tassert.CheckFatal(t, err)
+	forward := httputil.NewSingleHostReverseProxy(remoteURL)
+	forward.Transport = remoteBP.Client.Transport
+	var ranges atomic.Int64
+	updated := make(chan error, 1)
+	// match the remote scheme: the remote proxy redirects to its targets, and
+	// those redirects must reuse the same (TLS or plain) remote-AIS client
+	newBridge := httptest.NewServer
+	if cos.IsHTTPS(remoteBP.URL) {
+		newBridge = httptest.NewTLSServer
+	}
+	bridge := newBridge(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/"+remoteBck.Name+"/"+objName) && r.Header.Get(cos.HdrRange) != "" {
+			n := ranges.Add(1)
+			tlog.Logfln("range %d: %s", n, r.Header.Get(cos.HdrRange))
+			// overwrite before forwarding the second range
+			if n == 2 {
+				tlog.Logfln("overwriting source with v2 before range %d", n)
+				err := put(v2)
+				updated <- err
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadGateway)
+					return
+				}
+				tlog.Logfln("source overwritten with v2")
+			}
+		}
+		forward.ServeHTTP(w, r)
+	}))
+	t.Cleanup(bridge.Close)
+	config, err := api.GetClusterConfig(bp)
+	tassert.CheckFatal(t, err)
+	backend := config.Backend
+	backend.Conf = maps.Clone(backend.Conf)
+	// use a fresh alias to refresh remote clients
+	backend.Set(apc.AIS, cmn.BackendConfAIS{"pin-" + trand.String(8): []string{bridge.URL}})
+	t.Cleanup(func() {
+		tlog.Logfln("restoring backend config")
+		err := api.SetClusterConfigUsingMsg(bp, &cmn.ConfigToSet{Backend: &config.Backend}, false)
+		tassert.CheckError(t, err)
+		if err == nil {
+			// give proxies time to refresh the restored route before closing the bridge
+			time.Sleep(2 * config.Timeout.CplaneOperation.D())
+		}
+	})
+	tlog.Logfln("routing remote requests through %s", bridge.URL)
+	tassert.CheckFatal(t, api.SetClusterConfigUsingMsg(bp, &cmn.ConfigToSet{Backend: &backend}, false))
+
+	msg := &apc.BlobMsg{ChunkSize: chunkSize, NumWorkers: 2}
+	// pin v1, then change the source between ranges
+	tlog.Logfln("starting first fill: chunk size %d, two workers", chunkSize)
+	xid, err := api.BlobDownload(bp, bck, objName, msg)
+	tassert.CheckFatal(t, err)
+	args := &xact.ArgsMsg{ID: xid, Kind: apc.ActBlobDl, Timeout: tools.RebalanceTimeout}
+	tlog.Logfln("waiting for first fill %s", xid)
+	snaps, err := api.WaitForSnaps(bp, args, args.Finished())
+	tassert.CheckFatal(t, err)
+	select {
+	case err := <-updated:
+		tassert.CheckFatal(t, err)
+	default:
+		t.Fatal("did not overwrite the source between range reads")
+	}
+	tassert.Fatalf(t, ranges.Load() == 2, "expected two range reads, got %d", ranges.Load())
+	var errText string
+	for _, targetSnaps := range snaps {
+		for _, snap := range targetSnaps {
+			if snap.ID == xid {
+				errText = snap.Err
+			}
+		}
+	}
+	tlog.Logfln("first fill %s finished: %q", xid, errText)
+	tassert.Fatalf(t, strings.Contains(errText, "precondition failed"), "expected pin mismatch, got %q", errText)
+	// failed fills must leave no cached object or chunks
+	tlog.Logfln("checking failed fill left no cached object or chunks")
+	tassert.Fatalf(t, !tools.CheckObjIsPresent(proxyURL, bck, objName), "failed download published a cached object")
+	m := ioContext{t: t, bck: bck}
+	m.validateChunksOnDisk(bck, objName, 0)
+
+	// retry with a new pin
+	tlog.Logfln("starting fresh fill of v2")
+	xid, err = api.BlobDownload(bp, bck, objName, msg)
+	tassert.CheckFatal(t, err)
+	tlog.Logfln("waiting for fresh fill %s", xid)
+	tassert.CheckFatal(t, api.WaitForXaction(bp, &xact.ArgsMsg{ID: xid, Kind: apc.ActBlobDl, Timeout: tools.RebalanceTimeout}))
+	tlog.Logfln("reading cached object and checking v2")
+	var out bytes.Buffer
+	_, err = api.GetObject(bp, bck, objName, &api.GetArgs{Writer: &out})
+	tassert.CheckFatal(t, err)
+	tassert.Fatalf(t, bytes.Equal(out.Bytes(), v2), "fresh fill returned mixed revisions")
+	m.validateChunksOnDisk(bck, objName, 2)
+	tlog.Logfln("verified v2 bytes and two cached chunks")
+}
+
+func TestBlobDownloadRangeLength(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
+	const (
+		chunkSize = 64 * cos.MiB
+		fullSize  = 4*chunkSize + 17 // allow two workers
+		objName   = "object"
+	)
+	bp := tools.BaseAPIParams(tools.RandomProxyURL(t))
+	initMountpaths(t, bp.URL)
+	for _, tc := range []struct{ fault string }{
+		{"short-length"}, {"ignored-range"}, {"empty"}, {"short-body"},
+	} {
+		t.Run(tc.fault, func(t *testing.T) {
+			smap := meta.Smap{Pmap: make(meta.NodeMap), Tmap: make(meta.NodeMap), UUID: cos.GenUUID(), Version: 1}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == apc.URLPathDae.S:
+					w.Header().Set(cos.HdrContentType, cos.ContentJSON)
+					_ = json.NewEncoder(w).Encode(&smap)
+				case strings.HasPrefix(r.URL.Path, apc.URLPathBuckets.S):
+					w.Header().Set(apc.HdrBucketProps, "{}")
+				case r.Method == http.MethodHead:
+					w.Header().Set(cos.HdrContentLength, strconv.Itoa(fullSize))
+				default:
+					length, code := chunkSize, http.StatusPartialContent
+					switch tc.fault {
+					case "short-length":
+						length = 1
+					case "ignored-range":
+						length, code = fullSize, http.StatusOK
+					case "empty":
+						length = 0
+					}
+					w.Header().Set(cos.HdrContentLength, strconv.Itoa(length))
+					w.WriteHeader(code)
+					if length > 0 {
+						_, _ = w.Write([]byte{'x'})
+					}
+				}
+			}))
+			t.Cleanup(server.Close)
+			alias := "blob-length-" + trand.String(8)
+			tassert.CheckFatal(t, api.AttachRemoteAIS(bp, alias, server.URL))
+			t.Cleanup(func() { tassert.CheckError(t, api.DetachRemoteAIS(bp, alias)) })
+			bck := cmn.Bck{Name: alias, Provider: apc.AIS, Ns: cmn.Ns{UUID: smap.UUID}}
+			_, err := api.HeadBucket(bp, bck, false)
+			tassert.CheckFatal(t, err)
+			t.Cleanup(func() { tassert.CheckError(t, api.EvictRemoteBucket(bp, bck, false)) })
+			xid, err := api.BlobDownload(bp, bck, objName, &apc.BlobMsg{ChunkSize: chunkSize, NumWorkers: 2})
+			tassert.CheckFatal(t, err)
+			args := &xact.ArgsMsg{ID: xid, Kind: apc.ActBlobDl, Timeout: 15 * time.Second}
+			snaps, err := api.WaitForSnaps(bp, args, args.Finished())
+			if err != nil {
+				_ = api.AbortXaction(bp, args)
+				t.Fatal(err)
+			}
+			var errText string
+			for _, targetSnaps := range snaps {
+				for _, snap := range targetSnaps {
+					if snap.ID == xid {
+						errText = snap.Err
+					}
+				}
+			}
+			if tc.fault == "short-body" {
+				tassert.Fatalf(t, strings.Contains(errText, "unexpected EOF"), "expected truncated body error, got %q", errText)
+			} else {
+				tassert.Fatalf(t, strings.Contains(errText, "expected") && strings.Contains(errText, "bytes, got"), "expected range length error, got %q", errText)
+			}
+			tassert.Fatalf(t, !tools.CheckObjIsPresent(bp.URL, bck, objName), "failed download published a cached object")
+			m := ioContext{t: t, bck: bck}
+			m.validateChunksOnDisk(bck, objName, 0)
+		})
+	}
+}
+
+func TestBlobDownloadChecksum(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
+	proxyURL := tools.RandomProxyURL(t)
+	bp := tools.BaseAPIParams(proxyURL)
+
+	for _, test := range []struct {
+		checksum   string
+		outOfOrder bool
+	}{
+		{cos.ChecksumCesXxh, false},
+		{cos.ChecksumSHA256, false},
+		{cos.ChecksumNone, false},
+		{cos.ChecksumCesXxh, true},
+		{cos.ChecksumSHA256, true},
+		{cos.ChecksumNone, true},
+	} {
+		name := test.checksum + "/parallel"
+		if test.outOfOrder {
+			name = test.checksum + "/out-of-order"
+		}
+		t.Run(name, func(t *testing.T) {
+			chunkSize, fullChunks := int64(64*cos.KiB), 2
+			if test.outOfOrder {
+				tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
+				chunkSize, fullChunks = 64*cos.MiB, 4
+			}
+			var (
+				smap   = meta.Smap{Pmap: make(meta.NodeMap), Tmap: make(meta.NodeMap), UUID: cos.GenUUID(), Version: 1}
+				data   = append(bytes.Repeat([]byte("checksum"), int(chunkSize)*fullChunks/8), []byte("unequal last part")...)
+				second chan struct{}
+			)
+			if test.outOfOrder {
+				second = make(chan struct{})
+			}
+			data[chunkSize] ^= 0xff // distinguish equal-sized chunks
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == apc.URLPathDae.S {
+					w.Header().Set(cos.HdrContentType, cos.ContentJSON)
+					_ = json.NewEncoder(w).Encode(&smap)
+					return
+				}
+				if strings.HasPrefix(r.URL.Path, apc.URLPathBuckets.S) {
+					w.Header().Set(apc.HdrBucketProps, "{}")
+					return
+				}
+				rangeHdr := r.Header.Get(cos.HdrRange)
+				if r.Method == http.MethodGet && second != nil && rangeHdr == cmn.MakeRangeHdr(0, chunkSize) {
+					// Hold the first response until the second chunk has been streamed.
+					select {
+					case <-second:
+					case <-r.Context().Done():
+						return
+					}
+				}
+				http.ServeContent(w, r, "object", time.Time{}, bytes.NewReader(data))
+				if r.Method == http.MethodGet && second != nil && rangeHdr == cmn.MakeRangeHdr(chunkSize, chunkSize) {
+					close(second)
+				}
+			}))
+			t.Cleanup(server.Close)
+			alias := "blob-checksum-" + trand.String(8)
+			tassert.CheckFatal(t, api.AttachRemoteAIS(bp, alias, server.URL))
+			t.Cleanup(func() { tassert.CheckError(t, api.DetachRemoteAIS(bp, alias)) })
+			bck := cmn.Bck{Name: "checksum-" + trand.String(8), Provider: apc.AIS, Ns: cmn.Ns{UUID: smap.UUID}}
+			_, err := api.HeadBucket(bp, bck, false)
+			tassert.CheckFatal(t, err)
+			t.Cleanup(func() { tassert.CheckError(t, api.EvictRemoteBucket(bp, bck, false)) })
+			_, err = api.SetBucketProps(bp, bck, &cmn.BpropsToSet{
+				Cksum: &cmn.CksumConfToSet{Type: apc.Ptr(test.checksum)},
+			})
+			tassert.CheckFatal(t, err)
+
+			const objName = "object"
+			xid, err := api.BlobDownload(bp, bck, objName, &apc.BlobMsg{
+				ChunkSize: chunkSize, NumWorkers: 2,
+			})
+			tassert.CheckFatal(t, err)
+			tassert.CheckFatal(t, api.WaitForXaction(bp, &xact.ArgsMsg{ID: xid, Kind: apc.ActBlobDl, Timeout: tools.RebalanceTimeout}))
+
+			props, err := api.HeadObjectV2(bp, bck, objName, apc.GetPropsChecksum, api.HeadArgs{FltPresence: apc.FltPresent})
+			tassert.CheckFatal(t, err)
+			actual := props.ObjAttrs.Checksum()
+			if test.checksum == cos.ChecksumNone {
+				tassert.Errorf(t, cos.NoneC(actual), "expected no checksum, got %v", actual)
+			} else {
+				tassert.Fatalf(t, actual != nil, "missing checksum")
+				expectedType := actual.Type()
+				tassert.Errorf(t, expectedType == test.checksum || expectedType == cos.ChecksumCRC32C,
+					"unexpected checksum type %q", expectedType)
+				if test.outOfOrder {
+					expectedType = cos.ChecksumCRC32C
+				}
+				expected := cos.NewCksum(expectedType, cos.ChecksumB2S(data, expectedType))
+				tassert.Errorf(t, expected.Equal(actual), "expected %v, got %v", expected, actual)
+			}
 		})
 	}
 }

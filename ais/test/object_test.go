@@ -334,6 +334,66 @@ func TestAppendObject(t *testing.T) {
 	}
 }
 
+func TestAppendObjectChunks(t *testing.T) {
+	proxyURL := tools.RandomProxyURL(t)
+	bp := tools.BaseAPIParams(proxyURL)
+	for _, test := range []struct {
+		name    string
+		size    int
+		limit   cos.SizeIEC
+		chunked bool
+	}{
+		{name: "disabled", size: chunkPolicyLimit + 1},
+		{name: "below-limit", size: chunkPolicyLimit - 3, limit: chunkPolicyLimit},
+		{name: "at-limit", size: chunkPolicyLimit - 2, limit: chunkPolicyLimit, chunked: true},
+		{name: "above-limit", size: chunkPolicyLimit - 1, limit: chunkPolicyLimit, chunked: true},
+		{name: "already-chunked", size: 3*int(chunkPolicySize) + 1, limit: chunkPolicyLimit, chunked: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bck := cmn.Bck{Name: "append-chunks-" + trand.String(8), Provider: apc.AIS}
+			tools.CreateBucket(t, proxyURL, bck, &cmn.BpropsToSet{
+				Cksum: &cmn.CksumConfToSet{Type: apc.Ptr(cos.ChecksumOneXxh)},
+				Chunks: &cmn.ChunksConfToSet{
+					ObjSizeLimit: apc.Ptr(test.limit), ChunkSize: apc.Ptr(cos.SizeIEC(chunkPolicySize)),
+				},
+			}, true /*cleanup*/)
+			const objName = "append"
+			data := bytes.Repeat([]byte("original"), test.size/8+1)[:test.size]
+			tools.PutObject(t, bck, objName, readers.NewBytes(data), uint64(len(data)))
+			if test.limit > 0 && test.size >= int(test.limit) {
+				checkObjectChunked(t, bp, bck, objName, chunkPolicySize)
+			} else {
+				checkObjectMonolithic(t, bp, bck, objName)
+			}
+			var handle string
+			for _, tail := range []string{"x", "y"} {
+				var err error
+				handle, err = api.AppendObject(&api.AppendArgs{
+					BaseParams: bp, Bck: bck, Object: objName, Handle: handle,
+					Reader: readers.NewBytes([]byte(tail)),
+				})
+				tassert.CheckFatal(t, err)
+			}
+			err := api.FlushObject(&api.FlushArgs{BaseParams: bp, Bck: bck, Object: objName, Handle: handle})
+			tassert.CheckFatal(t, err)
+			data = append(data, 'x', 'y')
+			var actual bytes.Buffer
+			_, err = api.GetObject(bp, bck, objName, &api.GetArgs{Writer: &actual})
+			tassert.CheckFatal(t, err)
+			tassert.Errorf(t, bytes.Equal(data, actual.Bytes()), "appended content differs: got %d bytes, expected %d", actual.Len(), len(data))
+			op, err := api.HeadObjectV2(bp, bck, objName, apc.GetPropsChecksum, api.HeadArgs{})
+			tassert.CheckFatal(t, err)
+			tassert.Errorf(t, op.Cksum.Equal(cos.NewCksum(cos.ChecksumOneXxh, cos.ChecksumB2S(data, cos.ChecksumOneXxh))),
+				"appended object checksum differs: %v", op.Cksum)
+			if test.chunked {
+				checkObjectChunked(t, bp, bck, objName, chunkPolicySize)
+			} else {
+				checkObjectMonolithic(t, bp, bck, objName)
+			}
+		})
+	}
+}
+
 func TestCopyObject(t *testing.T) {
 	var (
 		proxyURL   = tools.RandomProxyURL(t)
@@ -577,6 +637,115 @@ func copyObjectEvictWorker(ctx context.Context, bp api.BaseParams, args *api.Cop
 		}
 	}
 	results <- nil
+}
+
+func TestCopyChunkedObjectChecksum(t *testing.T) {
+	proxyURL := tools.RandomProxyURL(t)
+	bp := tools.BaseAPIParams(proxyURL)
+	smap := tools.GetClusterMap(t, proxyURL)
+
+	for _, test := range []struct {
+		srcCksumTy string
+		dstCksumTy string
+		parts      int
+	}{
+		{cos.ChecksumCesXxh, cos.ChecksumCesXxh, 1},
+		{cos.ChecksumCesXxh, cos.ChecksumSHA256, 1},
+		{cos.ChecksumCesXxh, cos.ChecksumNone, 1},
+		{cos.ChecksumCesXxh, cos.ChecksumCesXxh, 3},
+		{cos.ChecksumCesXxh, cos.ChecksumSHA256, 3},
+		{cos.ChecksumCesXxh, cos.ChecksumNone, 3},
+		{cos.ChecksumCRC32C, cos.ChecksumCesXxh, 1},
+		{cos.ChecksumNone, cos.ChecksumCesXxh, 3},
+	} {
+		t.Run(fmt.Sprintf("%s-to-%s/%d-parts", test.srcCksumTy, test.dstCksumTy, test.parts), func(t *testing.T) {
+			bck := cmn.Bck{Name: "copy-checksum-" + trand.String(8), Provider: apc.AIS}
+			tools.CreateBucket(t, proxyURL, bck, &cmn.BpropsToSet{
+				Cksum: &cmn.CksumConfToSet{Type: apc.Ptr(test.srcCksumTy)},
+			}, true /*cleanup*/)
+			data := append(bytes.Repeat([]byte("checksum"), 8*cos.KiB), []byte("unequal last part")...)
+			data[len(data)/2] ^= 0xff
+			const srcName = "source"
+			tassert.CheckFatal(t, tools.PutMultipartObject(bp, bck, srcName, uint64(len(data)), &tools.PutObjectsArgs{
+				Reader: readers.NewBytes(data), MultipartNumChunks: test.parts,
+			}))
+			// parallel part uploads may produce CRC32C regardless of srcCksumTy
+			srcProps, err := api.HeadObjectV2(bp, bck, srcName, apc.GetPropsChecksum, api.HeadArgs{})
+			tassert.CheckFatal(t, err)
+			srcCksum := srcProps.ObjAttrs.Checksum()
+
+			_, err = api.SetBucketProps(bp, bck, &cmn.BpropsToSet{
+				Cksum: &cmn.CksumConfToSet{Type: apc.Ptr(test.dstCksumTy)},
+			})
+			tassert.CheckFatal(t, err)
+			dstName := tools.GenerateObjectNameForTarget(srcName, "copied-", bck, smap, true /*same target*/)
+
+			err = api.CopyObject(bp, &api.CopyArgs{FromBck: bck, FromObjName: srcName, ToBck: bck, ToObjName: dstName})
+			tassert.CheckFatal(t, err)
+
+			props, err := api.HeadObjectV2(bp, bck, dstName, apc.JoinProps(apc.GetPropsChecksum, apc.GetPropsSize), api.HeadArgs{})
+			tassert.CheckFatal(t, err)
+			tassert.Errorf(t, props.Size == int64(len(data)), "expected size %d, got %d", len(data), props.Size)
+			actual := props.ObjAttrs.Checksum()
+			if test.dstCksumTy == cos.ChecksumNone {
+				tassert.Errorf(t, cos.NoneC(actual), "expected no checksum, got %v", actual)
+				return
+			}
+			switch ty := srcCksum.Type(); {
+			case !cos.NoneC(srcCksum) && (ty == test.dstCksumTy || ty == cos.ChecksumCRC32C):
+				tassert.Errorf(t, srcCksum.Equal(actual), "expected source checksum %v, got %v", srcCksum, actual)
+			default:
+				tassert.Fatalf(t, actual.Type() == cos.ChecksumCRC32C, "expected combined CRC32C, got %v", actual)
+			}
+			expected := cos.NewCksum(actual.Type(), cos.ChecksumB2S(data, actual.Type()))
+			tassert.Errorf(t, expected.Equal(actual), "expected %v, got %v", expected, actual)
+		})
+	}
+}
+
+func TestCopyChunkedObjectInvalidSize(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
+	proxyURL := tools.RandomProxyURL(t)
+	bp := tools.BaseAPIParams(proxyURL)
+	smap := tools.GetClusterMap(t, proxyURL)
+	initMountpaths(t, proxyURL)
+
+	for _, test := range []struct {
+		checksum string
+		delta    int64
+	}{
+		{cos.ChecksumNone, -1},
+		{cos.ChecksumNone, 1},
+		{cos.ChecksumCesXxh, -1},
+		{cos.ChecksumCesXxh, 1},
+	} {
+		t.Run(fmt.Sprintf("%s/size-delta=%d", test.checksum, test.delta), func(t *testing.T) {
+			m := ioContext{
+				t:          t,
+				num:        1,
+				fileSize:   2 * cos.KiB,
+				chunksConf: &ioCtxChunksConf{numChunks: 2, multipart: true},
+			}
+			m.init(false /*bucket cleanup below*/)
+			tools.CreateBucket(t, proxyURL, m.bck, &cmn.BpropsToSet{
+				Cksum: &cmn.CksumConfToSet{Type: apc.Ptr(test.checksum)},
+			}, true /*cleanup*/)
+			m.puts()
+			srcName := m.objNames[0]
+			chunks := m.findObjChunksOnDisk(m.bck, srcName)
+			tassert.Fatalf(t, len(chunks) == 1, "expected one extra chunk, got %v", chunks)
+			info, err := os.Stat(chunks[0])
+			tassert.CheckFatal(t, err)
+			tassert.CheckFatal(t, os.Truncate(chunks[0], info.Size()+test.delta))
+			dstName := tools.GenerateObjectNameForTarget(srcName, "copied-", m.bck, smap, true /*same target*/)
+
+			err = api.CopyObject(bp, &api.CopyArgs{FromBck: m.bck, FromObjName: srcName, ToBck: m.bck, ToObjName: dstName})
+			tassert.Errorf(t, err != nil, "expected COPY to reject a chunk with size delta %d", test.delta)
+			_, err = api.HeadObjectV2(bp, m.bck, dstName, apc.GetPropsSize, api.HeadArgs{})
+			tassert.Errorf(t, cmn.IsStatusNotFound(err), "expected no destination object, got %v", err)
+			m.validateChunksOnDisk(m.bck, dstName, 0)
+		})
+	}
 }
 
 func TestCopyObjectChunksAboveMaxMonolithicSize(t *testing.T) {
