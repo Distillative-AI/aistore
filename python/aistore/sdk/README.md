@@ -56,6 +56,8 @@ from aistore.sdk import Client
 client = Client("http://localhost:8080")
 ```
 
+For initialization and cleanup, see [Client Lifecycle](#client-lifecycle).
+
 > Note: `http://localhost:8080` address (above and elsewhere) must be understood as a placeholder for an _arbitrary_ AIStore endpoint (`AIS_ENDPOINT`).
 
 The newly created `client` object can be used to interact with your AIS cluster, buckets, and objects. 
@@ -93,6 +95,54 @@ Please note that certain operations do **not** support external cloud storage bu
 
 ---
 
+## Client Lifecycle
+
+> These examples require Python SDK 2.3.0 or newer for lifecycle management support.
+
+### Explicit Initialization and Cleanup
+
+Creating a `Client` makes no network requests. The optional `initialize()` method
+fetches and caches cluster information, such as the AIS version, for compatibility
+and feature decisions. You can make SDK requests without calling it first.
+
+Call `close()` when finished to release HTTP connections and prevent further
+requests. The examples below read an existing object from `my-bucket`.
+
+```python
+from aistore.sdk import Client
+
+client = Client("http://localhost:8080")
+try:
+    client.initialize()  # Optional, fetches state from cluster
+    obj = client.bucket("my-bucket").object("hello.txt")
+    content = obj.get_reader().read_all()
+finally:
+    client.close()
+```
+
+Repeated calls to `initialize()` do not refetch cached state. Repeated calls to
+`close()` do nothing after the first call. After closing, `client.closed` is `True`.
+Requests through the client or its bucket and object handles raise
+`ClientClosedError`, a subclass of `RuntimeError`. Closing does not wait for active
+requests.
+
+### Context Manager
+
+If you prefer not to manage the lifecycle yourself, use `with` to initialize the
+client on entry and close it on exit:
+
+```python
+from aistore.sdk import Client
+
+with Client("http://localhost:8080") as client:
+    obj = client.bucket("my-bucket").object("hello.txt")
+    content = obj.get_reader().read_all()
+```
+
+Note that initialization is always run when using a context manager.
+
+---
+
 ## Environment Variables
 
 The AIS Python SDK supports several environment variables that allow you to configure client behavior without explicitly passing parameters to the `Client` constructor. This is particularly useful for containerized environments or when you want to centralize configuration.
@@ -125,7 +175,7 @@ ETL webservers support all SDK client environment variables above (same semantic
 
 ### Configuration Precedence
 
-When the `Client` is initialized, configuration values are resolved in the following order (highest to lowest precedence):
+When the `Client` is constructed, configuration values are resolved in the following order (highest to lowest precedence):
 
 1. **Explicit parameters** passed to the `Client()` constructor
 2. **Environment variables** (listed above)
@@ -196,11 +246,29 @@ To learn more about working with AIS ETL, check out [examples](https://github.co
 |[object.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/obj/object.py)|Contains class `Object` that represents an object belonging to a bucket in an AIS cluster, and contains all object-related operations, including (but not limited to) retrieving, adding and deleting objects.|
 |[object_group.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/multiobj/object_group.py)|Contains class `ObjectGroup`, representing a collection of objects belonging to a bucket in an AIS cluster. Includes all multi-object operations such as deleting, evicting, prefetching, copying, and transforming objects.|
 |[job.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/job.py)|Contains class `Job` and all job-related operations.|
-|[dsort/core.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/dsort/core.py)|Contains class `Dsort` and all dsort-related operations.|
+|[dsort/core.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/dsort/core.py)|**Deprecated.** Contains class `Dsort` and dsort-related operations for AIStore before 5.3.|
 |[etl.py](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/etl/etl.py)|Contains class `Etl` and all ETL-related operations.|
 
 For more information on SDK usage, refer to the [SDK reference documentation](https://docs.nvidia.com/aistore/python/aistore/sdk) or see the examples [here](https://github.com/NVIDIA/aistore/blob/main/python/examples/sdk/).
 
+---
+
+## Threading
+
+`Client`, `AuthNClient`, and `SessionManager` do not support concurrent use across threads. Use a separate client per thread, since bucket and object handles and internal `RequestClient` clones share the original client's session.
+
+## Multiprocessing
+
+Create a client in each process, or pass an open client and its handles using `fork`, `spawn`, or `forkserver`, with a separate session created from SDK configuration on first use in each child. For process setup, see Python's [multiprocessing documentation](https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods).
+
+For PyTorch DataLoader support and an example, see [PyTorch DataLoader](../pytorch/README.md#pytorch-dataloader).
+
+### Considerations
+
+- Forking a process with background threads is unsupported. Use `spawn` or `forkserver` instead.
+- Passing a client to `spawn` or `forkserver` workers resets a custom `RetryConfig.network_retry` policy to the SDK default. Create and configure the client inside each worker to use a custom network retry policy.
+- Sharing readers, writers, streaming responses, or iterators across threads or processes is unsupported. Finish requests and close streams, iterators, and file-like writers before closing the client.
+- Parallel reads (`Object.get_reader(num_workers=N)`) require fork support, always use `fork`, and are unsupported inside DataLoader workers. Close the returned `ParallelBuffer` or iterator when finished, including on early exit.
 
 ## References
 

@@ -5,6 +5,8 @@
 package ais
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -55,6 +57,7 @@ type (
 		globalConfigPath string // path to global config
 		role             string // proxy | target
 		daemonID         string // daemon ID to assign
+		daemonIDSource   string // node ID derivation mode
 		confCustom       string // "key1=value1,key2=value2" formatted to override selected entries in config
 		primary          struct {
 			ntargets    int  // expected number of targets in a starting-up cluster
@@ -86,7 +89,9 @@ var daemon = daemonCtx{}
 func initFlags(flset *flag.FlagSet) {
 	// role aka `DaeType`
 	flset.StringVar(&daemon.cli.role, "role", "", "_role_ of this aisnode: 'proxy' OR 'target'")
-	flset.StringVar(&daemon.cli.daemonID, "daemon_id", "", "user-specified node ID (advanced usage only!)")
+	flset.StringVar(&daemon.cli.daemonID, daemonIDFlag, "", "user-specified node ID (advanced usage only!)")
+	flset.StringVar(&daemon.cli.daemonIDSource, daemonIDSourceFlag, "",
+		"node ID source: k8s-pod or k8s-pod:<scope> (overrides "+daemonIDSourceEnv+")")
 
 	// config itself and its command line overrides
 	flset.StringVar(&daemon.cli.globalConfigPath, "config", "",
@@ -142,6 +147,9 @@ func initDaemon(version, buildTime string) cos.Runner {
 	// validation
 	if daemon.cli.role != apc.Proxy && daemon.cli.role != apc.Target {
 		cos.ExitLogf("invalid node's role %q, expecting %q or %q", daemon.cli.role, apc.Proxy, apc.Target)
+	}
+	if err := validatePodIDSource(); err != nil {
+		cos.ExitLog(err)
 	}
 	if daemon.cli.globalConfigPath == "" {
 		cos.ExitLogf(erfm, "config")
@@ -462,8 +470,66 @@ func (g *rungroup) runAll(mainRunner cos.Runner) error {
 ///////////////
 
 const (
-	daemonIDEnv = "AIS_DAEMON_ID"
+	daemonIDEnv  = "AIS_DAEMON_ID"
+	daemonIDFlag = "daemon_id"
+
+	daemonIDSourceEnv  = "AIS_DAEMON_ID_SOURCE"
+	daemonIDSourceFlag = "daemon_id_source"
 )
+
+func podIDSource() (source, option string) {
+	source, option = daemon.cli.daemonIDSource, "-"+daemonIDSourceFlag
+	if source == "" {
+		source, option = os.Getenv(daemonIDSourceEnv), daemonIDSourceEnv
+	}
+	return source, option
+}
+
+// validate syntax at startup, whether or not derivation is needed
+func validatePodIDSource() error {
+	source, option := podIDSource()
+	if source == "" {
+		return nil
+	}
+	if _, ok := parsePodIDSource(source); !ok {
+		return fmt.Errorf("invalid %s %q: expected k8s-pod or k8s-pod:<scope>", option, source)
+	}
+	return nil
+}
+
+func podDaemonID(daemonType string) (id string) {
+	source, option := podIDSource()
+	if source == "" {
+		return ""
+	}
+	scope, ok := parsePodIDSource(source)
+	debug.Assert(ok, source) // see validatePodIDSource
+	pod, ns := os.Getenv(env.AisK8sPod), os.Getenv(env.AisK8sNamespace)
+	if pod == "" || ns == "" {
+		cos.ExitLogf("%s requires %s and %s", option, env.AisK8sPod, env.AisK8sNamespace)
+	}
+
+	id = derivePodID(daemonType, ns, pod, scope)
+	name := meta.Pname(id)
+	if daemonType == apc.Target {
+		name = meta.Tname(id)
+	}
+	nlog.Infof("derived %s from %s=%q (pod %s/%s)", name, option, source, ns, pod)
+	return id
+}
+
+// parse "k8s-pod" or "k8s-pod:<scope>"
+func parsePodIDSource(source string) (scope string, ok bool) {
+	mode, scope, scoped := strings.Cut(source, ":")
+	return scope, mode == "k8s-pod" && (!scoped || scope != "")
+}
+
+// keep the encoding stable across restarts and upgrades
+// (same length and alphabet as cos.GenDaemonID)
+func derivePodID(daemonType, ns, pod, scope string) string {
+	sum := sha256.Sum256([]byte("ais-k8s-pod-v1\x00" + daemonType + "\x00" + ns + "\x00" + pod + "\x00" + scope))
+	return cos.HashDaemonID(binary.BigEndian.Uint64(sum[:cos.SizeofI64]))
+}
 
 func envDaemonID(daemonType string) (daemonID string) {
 	if daemon.cli.daemonID != "" {

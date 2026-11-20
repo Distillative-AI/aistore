@@ -97,7 +97,7 @@ QPARAM_NAMESPACE = "namespace"
 QPARAM_OBJ_APPEND = "append_type"
 QPARAM_OBJ_APPEND_HANDLE = "append_handle"
 QPARAM_OBJ_TO = "object_to"
-DSORT_UUID = "uuid"
+DSORT_UUID = "uuid"  # Deprecated: dSort was removed in AIStore 5.3.
 QPARAM_UUID = "uuid"
 QPARAM_LATEST = "latest-ver"
 QPARAM_SYNC = "synchronize"
@@ -120,6 +120,7 @@ ETL_WS_PATH = "path"
 # URL Param values
 # See api/apc/query.go
 WHAT_SMAP = "smap"
+WHAT_SOFTWARE_VERSION = "software_version"
 WHAT_ONE_XACT_STATUS = "status"
 WHAT_ALL_XACT_STATUS = "status_all"
 WHAT_ALL_RUNNING_STATUS = "running_all"
@@ -132,6 +133,11 @@ WHAT_CLUSTER_CONFIG = "cluster_config"
 QPARAM_LOG_SEV = "severity"
 QPARAM_ALL_LOGS = "all"
 
+# Separates the provider from the bucket in a bucket or object URL (see api/apc/provider.go)
+BCK_PROVIDER_SEPARATOR = "://"
+# Namespace prefixes in a bucket URL: "@uuid#name" (see NsUUIDPrefix, NsNamePrefix in api/apc/provider.go)
+NS_URL_PREFIXES = ("@", "#")
+
 # URL paths
 URL_PATH_CLUSTER = "cluster"
 URL_PATH_BUCKETS = "buckets"
@@ -140,9 +146,9 @@ URL_PATH_HEALTH = "health"
 URL_PATH_DAEMON = "daemon"
 URL_PATH_ETL = "etl"
 URL_PATH_ETL_LOGS = "logs"
-URL_PATH_DSORT = "sort"
+URL_PATH_DSORT = "sort"  # Deprecated: dSort was removed in AIStore 5.3.
 URL_PATH_REVERSE = "reverse"
-DSORT_ABORT = "abort"
+DSORT_ABORT = "abort"  # Deprecated: dSort was removed in AIStore 5.3.
 # AuthN
 URL_PATH_AUTHN_USERS = "users"
 URL_PATH_AUTHN_CLUSTERS = "clusters"
@@ -195,7 +201,7 @@ ACT_MPT_ABORT = "mpt-abort"
 DEFAULT_CHUNK_SIZE = 32 * KIB
 DEFAULT_PARALLEL_CHUNK_SIZE = 8 * MIB
 DEFAULT_JOB_WAIT_TIMEOUT = 300
-DEFAULT_DSORT_WAIT_TIMEOUT = 300
+DEFAULT_DSORT_WAIT_TIMEOUT = 300  # Deprecated: dSort was removed in AIStore 5.3.
 DEFAULT_DATASET_MAX_COUNT = 100000
 DEFAULT_JOB_POLL_TIME = 0.2
 DEFAULT_MAX_BUFFER_SIZE = 64 * KIB
@@ -315,6 +321,10 @@ GB_COLOC = "coloc"
 
 # Colocation Query Param
 QPARAM_COLOC = "coloc"
+
+# Prefetch: targets to run on, one value per target: tid=t1&tid=t2
+# (apc.QparamTID, api/apc/query.go)
+QPARAM_TID = "tid"
 
 # MossResp structs
 GB_OUT = "out"

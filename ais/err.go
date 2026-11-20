@@ -34,6 +34,7 @@ const (
 	tcodeKaliveRejected = "ErrKaliveRejected"
 	tcodeJoinRejected   = "ErrJoinRejected"   // the joining node must fix its request (e.g., placement weight)
 	tcodeJoinUnresolved = "ErrJoinUnresolved" // the joining node's public hostname does not resolve (yet)
+	tcodeNotReadyToJoin = "ErrNotReadyToJoin" // force-join destination is not ready yet or has rebalance enabled
 )
 
 // error types
@@ -61,6 +62,11 @@ type (
 	errDowngrade struct {
 		si       *meta.Snode
 		from, to string
+	}
+	errNodeVersDiffer struct {
+		si     *meta.Snode // self
+		action string
+		differ []string // "<node>(<version>)"
 	}
 	errNotPrimary struct {
 		si     *meta.Snode
@@ -121,6 +127,17 @@ func isErrJoinUnresolved(err error) bool {
 	return herr != nil && herr.Status == http.StatusBadRequest && herr.TypeCode == tcodeJoinUnresolved
 }
 
+func newErrNotReadyToJoin(r *http.Request, err error) *cmn.ErrHTTP {
+	herr := cmn.NewErrHTTP(r, err, http.StatusBadRequest)
+	herr.TypeCode = tcodeNotReadyToJoin
+	return herr
+}
+
+func isErrNotReadyToJoin(err error) bool {
+	herr := cmn.AsErrHTTP(err)
+	return herr != nil && herr.Status == http.StatusBadRequest && herr.TypeCode == tcodeNotReadyToJoin
+}
+
 func (e *errTgtBmdUUIDDiffer) Error() string { return e.detail }
 func (e *errBmdUUIDSplit) Error() string     { return e.detail }
 func (e *errPrxBmdUUIDDiffer) Error() string { return e.detail }
@@ -157,6 +174,11 @@ func newErrDowngrade(si *meta.Snode, from, to string) *errDowngrade {
 
 func (e *errDowngrade) Error() string {
 	return fmt.Sprintf("%s: attempt to downgrade %s to %s", e.si, e.from, e.to)
+}
+
+func (e *errNodeVersDiffer) Error() string {
+	return fmt.Sprintf("%s: cannot %s: node versions differ %v (have: %s) - complete the upgrade",
+		e.si, e.action, e.differ, cmn.VersionAIStore)
 }
 
 func isErrDowngrade(err error) bool {

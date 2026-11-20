@@ -22,6 +22,23 @@ import (
 
 const numBackendMetricks = 12
 
+// backend SDK client retry settings (provider-neutral)
+// - each backend converts it to its own SDK options (with few exceptions, e.g., GCS no-retry)
+// - an explicit operator setting in the SDK (env, profile) takes precedence over sdkRetryDflt
+type sdkRetry struct {
+	maxAttempts int  // including the first
+	noBackoff   bool // tests only
+}
+
+var (
+	sdkRetryDflt = sdkRetry{maxAttempts: cmn.BackendMaxAttempts}
+
+	// single attempt when:
+	// - caller retries on its own (see cmn.WithNoRetry)
+	// - reader is not seekable
+	sdkRetryNone = sdkRetry{maxAttempts: 1}
+)
+
 type base struct {
 	tstats   stats.Tracker
 	metrics  cos.StrKVs // this backend's metric names (below)
@@ -217,6 +234,13 @@ func (b *base) init(snode *meta.Snode, tr stats.Tracker, startingUp bool) {
 func (b *base) Provider() string { return b.provider }
 
 func (*base) CondWrite(*meta.Bck) bool { return false }
+
+// conditional write lost to a concurrent update (409); S3 clients may retry
+func errCondConflict(err error, status int) error {
+	herr := cmn.NewErrHTTP(nil, err, status)
+	herr.TypeCode = cmn.TcodeCondWriteConflict
+	return herr
+}
 
 func (b *base) MetricName(name string) string {
 	out, ok := b.metrics[name]

@@ -732,9 +732,26 @@ func (t *target) httpbckpost(w http.ResponseWriter, r *http.Request, apireq *api
 			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
 			return
 		}
-		if ecode, err := t.runPrefetch(msg.UUID, apireq.bck, prfMsg); err != nil {
+		// two-phase startup: designated target (DT), if any
+		dt := apireq.dpq.get(apc.QparamTID)
+		smap := t.owner.smap.get()
+		if dt != "" {
+			if ecode, err := t.ensureSameSmap(r.Header, smap); err != nil {
+				t.writeErr(w, r, err, ecode)
+				return
+			}
+			if smap.GetActiveNode(dt) == nil {
+				t.writeErr(w, r, &errNodeNotFound{si: t.si, smap: smap, msg: "prefetch DT", id: dt})
+				return
+			}
+		}
+		args := &xreg.PrefetchArgs{Msg: prfMsg, Smap: &smap.Smap, DT: dt}
+		if ecode, err := t.runPrefetch(msg.UUID, apireq.bck, args); err != nil {
 			t.writeErr(w, r, err, ecode)
 			return
+		}
+		if dt != "" {
+			w.Header().Set(apc.HdrNodeVersion, cmn.VersionAIStore) // (proxy checks)
 		}
 	case apc.ActRechunk:
 		rechunkMsg := &apc.RechunkMsg{}
@@ -805,14 +822,17 @@ func (t *target) runIndexShard(xactID string, bck *meta.Bck, msg *apc.IndexShard
 }
 
 // handle apc.ActPrefetchObjects <-- via api.Prefetch* and api.StartX*
-func (t *target) runPrefetch(xactID string, bck *meta.Bck, prfMsg *apc.PrefetchMsg) (int, error) {
+func (t *target) runPrefetch(xactID string, bck *meta.Bck, args *xreg.PrefetchArgs) (int, error) {
 	cs := fs.Cap()
 	if err := cs.Err(); err != nil {
 		return http.StatusInsufficientStorage, err
 	}
-	rns := xreg.RenewPrefetch(xactID, bck, prfMsg)
+	rns := xreg.RenewPrefetch(xactID, bck, args)
 	if rns.Err != nil {
 		return http.StatusBadRequest, rns.Err
+	}
+	if !rns.IsNew() {
+		return 0, nil
 	}
 
 	xctn := rns.Entry.Get()

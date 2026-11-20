@@ -8,23 +8,97 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 
 ### Compatibility changes
 
-- **BREAKING**: The MCP server now requires MCP Python SDK 2.x (`mcp[cli]>=2,<3`).
-  Existing environments with `mcp<2` must upgrade before starting the server:
-  `python -m pip install --upgrade "mcp[cli]>=2,<3"`.
+- **BREAKING**: `Bucket.list_objects()`, `list_all_objects()`, `list_objects_iter()`,
+  and `list_all_objects_iter()` now pass `start_after` to the server, enabling S3
+  range starts on supporting servers. Catch `AISError` instead of
+  `NotImplementedError` for unsupported providers. Iterator errors are raised
+  when the first page is requested.
 
 ### Added
 
-- `Client.close()`, `closed`, and context management. Requests through closed
-  clients and their handles raise `ClientClosedError`.
-- Python 3.15 support for the SDK, PyTorch integration, and pyaisloader, including
-  the `Etl.init_class()` runtime and CI test coverage.
-
-### Changed
-
-- Pickling or forking `SessionManager` no longer carries live sessions as the receiving process
-  creates its own on first use.
+- `Client.initialize()` and `version` to fetch and cache the AIS software version.
+  Initialization is idempotent and runs automatically on context entry; the client
+  is closed if initialization fails during context entry.
+- `ObjectGroup.prefetch()` accepts `targets` (target IDs or cluster-map `Snode`
+  entries) to run the job only on the selected targets, each fetching the objects
+  it owns. Requires AIStore v5.3 or later; an older cluster accepts the call but
+  ignores `targets` and runs the job on all targets.
 
 ### Fixed
+
+- Fixed SDK exception pickling to preserve error types, messages, and attributes
+  when errors pass between processes.
+### Deprecated
+
+- Deprecated `Client.dsort()`, all `aistore.sdk.dsort` APIs and models, and dSort
+  constants in `sdk.const` and `sdk.xact_const`. They remain available for older
+  servers and will be removed in a future SDK release. Creating a `Dsort` handle
+  directly or via `Client.dsort()` emits `DeprecationWarning`. AIStore 5.3 removes
+  dSort.
+
+## [2.2.0] - 2026-11-12
+
+This release adds an explicit client lifecycle (`Client.close()` and context
+management), isolates HTTP sessions per process, speeds up sequential reads via
+`ObjectReader.read_all()`, adds Python 3.15 support, and fixes URL parsing for
+object names that contain `#` or `?`. Review the compatibility changes before
+upgrading.
+
+### Compatibility changes
+
+- **BREAKING**: The MCP server now requires MCP Python SDK 2.x (`mcp[cli]>=2,<3`).
+  Existing environments with `mcp<2` must upgrade before starting the server:
+  `python -m pip install --upgrade "mcp[cli]>=2,<3"`. The core SDK is not
+  affected; `mcp` is installed only with the `mcp` extra.
+- `Client.get_object_from_url()` now raises `InvalidURLException` for namespaced
+  URLs such as `ais://@uuid#ns/bucket/object`, which it never resolved
+  correctly. Use `Client.bucket(..., namespace=...)` for buckets outside the
+  global namespace.
+- Custom `RetryConfig.network_retry` policies that retry on the result receive
+  `bytes`, not `requests.Response`, for sequential `ObjectReader.read_all()`.
+
+### Client lifecycle
+
+- Added `Client.close()`, the `Client.closed` property, and context management
+  (`with Client(...) as client:`). Closing releases the client's HTTP session
+  and connection pools; repeated calls are harmless.
+- Requests through a closed client or its bucket, object, job, and other
+  handles raise the new `ClientClosedError` without retries. Handles,
+  properties, and cached data remain accessible. `Cluster.is_ready()` also
+  raises `ClientClosedError` instead of returning `False`.
+- `Client.close()` does not wait for active requests. Finish them and close
+  streaming responses before closing the client.
+- Pickling or forking `SessionManager` no longer carries live sessions as the
+  receiving process creates its own on first use. Each process closes only
+  the session it owns.
+
+### Data transfers
+
+- Sequential `ObjectReader.read_all()` no longer reads the body in `requests`'
+  small chunks. A body of known length is read in one call and not copied again
+  when joined, which makes large reads faster and lowers peak memory usage.
+- `parse_url()` and `Client.get_object_from_url()` no longer truncate object
+  names at `#` or `?`. URLs for objects and archive members with these
+  characters, such as `s3://bucket/shard.tar/file_#1.wav`, now resolve to the
+  full name.
+- Documented blob-download limits enforced by AIStore servers newer than 5.2:
+  `num_workers` must be zero (the default) or at least two, and an object that
+  fits in a single chunk is served by regular GET without a blob-download job.
+  This applies to `BlobDownloadConfig` and `Object.blob_download()`.
+- Documented that `Object.get_reader(direct=True)` and `Smap.get_target_for_object()`
+  select targets with uniform HRW and do not apply target placement weights.
+  Keep `direct=False` (the default) for weighted buckets.
+
+### Packaging and integrations
+
+- Added Python 3.15 support for the SDK, PyTorch integration, and pyaisloader,
+  including the `Etl.init_class()` runtime and CI test coverage.
+
+- With `cont_on_err=False`, `Batch.get()` raises `BatchTruncatedError` (a `RuntimeError`)
+  if a TAR or ZIP archive ends before all requested entries, even when multipart metadata
+  also ends early. The error occurs during iteration, after entries already received are
+  yielded. Callers that collect results with `list()` must handle the error; no partial
+  list is returned. With `cont_on_err=True` (the default), the shortfall is only logged.
 
 ## [2.1.0] - 2026-10-28
 

@@ -16,6 +16,7 @@ require (
 	github.com/aws/smithy-go v1.28.5
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/googleapis/gax-go/v2 v2.26.2
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/json-iterator/go v1.1.12
 	github.com/karrick/godirwalk v1.17.0
@@ -26,7 +27,6 @@ require (
 	github.com/onsi/gomega v1.44.0
 	github.com/oracle/oci-go-sdk/v65 v65.126.2
 	github.com/pierrec/lz4/v4 v4.1.33
-	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/seiflotfy/cuckoofilter v0.0.0-20240715131351-a2f2c23f1771
 	github.com/tidwall/buntdb v1.3.2
@@ -117,7 +117,6 @@ require (
 	github.com/google/s2a-go v0.1.11 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.23 // indirect
-	github.com/googleapis/gax-go/v2 v2.26.2 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.31.0 // indirect
 	github.com/klauspost/compress v1.20.3 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect

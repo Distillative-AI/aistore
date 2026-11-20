@@ -73,6 +73,8 @@ const (
 	defaultClusterIPv4 = "127.0.0.1"
 
 	randomReadOff = "random" // -readoff=random
+
+	cachedText = "--cached option (to list \"cached\" objects only) "
 )
 
 type (
@@ -107,6 +109,7 @@ var (
 	accumulatedStats sts
 	objnameGetter    namegetter.Basic
 	objSizes         map[string]int64
+	putNames         []string // successful PUTs to delete upon cleanup (nil when not tracking)
 	statsPrintHeader = "%-10s%-6s%-22s\t%-22s\t%-36s\t%-22s\t%-10s\n"
 	statsdC          *statsd.Client
 
@@ -179,6 +182,9 @@ func Start(version, buildtime string) (err error) {
 		return err
 	}
 
+	// capture naming flags before initialization assigns the default seed
+	repeatFlags := runParams.repeatableNameFlags()
+
 	// validate and finish initialization
 	if err = initParams(runParams); err != nil {
 		return err
@@ -197,16 +203,6 @@ func Start(version, buildtime string) (err error) {
 		return nil
 	}
 
-	if runParams.duration.Val == 0 {
-		runParams.duration.Val = time.Duration(math.MaxInt64)
-	}
-
-	if runParams.readerType == readers.File && runParams.putPct > 0 {
-		if err := cos.CreateDir(runParams.tmpDir + "/" + myName); err != nil {
-			return fmt.Errorf("failed to create local test directory %q, err = %s", runParams.tmpDir, err.Error())
-		}
-	}
-
 	// usage is currently limited to selecting a random proxy (gateway)
 	// to access AIStore (done for every I/O request)
 	if runParams.randomProxy {
@@ -221,6 +217,29 @@ func Start(version, buildtime string) (err error) {
 	}
 	runParams.bp.Token = loggedUserToken
 	runParams.bp.UA = ua
+
+	if runParams.listOut != "" {
+		if !runParams.dryRun {
+			if err := runParams.checkListOut(); err != nil {
+				return err
+			}
+		}
+		names, _, _, err := listObjects()
+		if err != nil {
+			return err
+		}
+		return runParams.writeObjList(names)
+	}
+
+	if runParams.duration.Val == 0 {
+		runParams.duration.Val = time.Duration(math.MaxInt64)
+	}
+
+	if runParams.readerType == readers.File && runParams.putPct > 0 {
+		if err := cos.CreateDir(runParams.tmpDir + "/" + myName); err != nil {
+			return fmt.Errorf("failed to create local test directory %q, err = %s", runParams.tmpDir, err.Error())
+		}
+	}
 
 	// check stats destination before creating benchmark bucket
 	if runParams.statsOutputObj != "" && !runParams.dryRun {
@@ -239,6 +258,14 @@ func Start(version, buildtime string) (err error) {
 	var created bool
 	if err := setupBucket(runParams, &created); err != nil {
 		return err
+	}
+	// a bucket created by this run is destroyed as a whole - no need to track names
+	if runParams.cleanUp.Val && !created {
+		if len(repeatFlags) > 0 {
+			return fmt.Errorf("'-cleanup=true' with existing bucket %s is incompatible with %s: PUT object names can repeat across runs",
+				runParams.bck.Cname(""), strings.Join(repeatFlags, ", "))
+		}
+		putNames = []string{}
 	}
 
 	if isDirectS3() {
@@ -266,21 +293,22 @@ func Start(version, buildtime string) (err error) {
 		if err != nil {
 			return err
 		}
+		numListed := len(names)
+		if runParams.splitReads {
+			names, fcnt = loaderShare(names, runParams.loaderIdx, runParams.loaderCnt)
+		}
 
-		// more validations:
+		// validate the names to GET
 		var (
 			l               = len(names)
 			ng, isPermBased = newNameGetter(names)
 		)
-		if runParams.putPct < 100 && isPermBased && l < 2 {
-			mixed := cos.Ternary(runParams.putPct > 0, " mixed", " read-only")
-			return fmt.Errorf("need at least 2 existing objects for epochs-based%s workload (got %d)", mixed, l)
-		}
-		if runParams.putPct == 0 && l == 0 {
-			if runParams.subDir == "" {
-				return errors.New("the bucket is empty, cannot run 100% read benchmark")
+		if isPermBased && l < 2 {
+			msg := fmt.Sprintf("need at least 2 objects to GET from, got %d", l)
+			if runParams.splitReads {
+				msg += fmt.Sprintf(" (loader %d of %d's '-split-reads' share of %d names)", runParams.loaderIdx, runParams.loaderCnt, numListed)
 			}
-			return errors.New("no objects with prefix '" + runParams.subDir + "' in the bucket, cannot run 100% read benchmark")
+			return errors.New(msg)
 		}
 		if runParams.getBatchSize > l {
 			return fmt.Errorf("batch size (%d) exceeds dataset size (%d)", runParams.getBatchSize, l)
@@ -315,11 +343,11 @@ func Start(version, buildtime string) (err error) {
 	}
 
 	if runParams.cleanUp.Val {
-		v := "destroyed"
-		if !runParams.bck.IsAIS() {
-			v = "emptied"
+		if created {
+			fmt.Printf("Cleanup is enabled: bucket %s created by this run will be destroyed upon termination.\n", runParams.bck.String())
+		} else {
+			fmt.Printf("Cleanup is enabled: only objects PUT by this run will be deleted from %s upon termination.\n", runParams.bck.String())
 		}
-		fmt.Printf("BEWARE: cleanup is enabled, bucket %s will be %s upon termination!\n", runParams.bck.String(), v)
 		time.Sleep(time.Second)
 	}
 
@@ -484,30 +512,8 @@ Done:
 	finalizeStats(statsWriter)
 	err = errors.Join(err, output.closeAndUpload(runParams.bp))
 
-	// Verify chunked objects if multipart upload was used
-	if runParams.multipartChunks > 0 && runParams.putPct > 0 {
-		lsmsg := &apc.LsoMsg{Props: apc.GetPropsChunked}
-		if runParams.useNBI {
-			lsmsg.Flags |= apc.LsNBI
-		}
-		chunkedLs, err := api.ListObjects(runParams.bp, runParams.bck, lsmsg, api.ListArgs{})
-		if err != nil {
-			fmt.Println("failed to list chunked objects: ", err)
-		} else {
-			var actualChunked int64
-			for _, entry := range chunkedLs.Entries {
-				if entry.Flags&apc.EntryIsChunked != 0 {
-					actualChunked++
-				}
-			}
-			if actualChunked != accumulatedStats.putMPU.Total() {
-				fmt.Fprintf(os.Stderr, "Warning: Expected %d chunked objects but found %d\n", accumulatedStats.putMPU.Total(), actualChunked)
-			}
-		}
-	}
-
 	if runParams.cleanUp.Val {
-		cleanup()
+		cleanup(created)
 	}
 
 	fmt.Printf("\nActual run duration: %v\n", time.Since(tsStart))
@@ -576,8 +582,6 @@ func setupBucket(runParams *params, created *bool) error {
 		return err
 	}
 
-	const cachedText = "--cached option (to list \"cached\" objects only) "
-
 	if isDirectS3() {
 		if apc.ToScheme(runParams.bck.Provider) != apc.S3Scheme {
 			return fmt.Errorf("option --s3endpoint requires s3 bucket (have %s)", runParams.bck.String())
@@ -592,14 +596,8 @@ func setupBucket(runParams *params, created *bool) error {
 	if runParams.bck.Provider != apc.AIS {
 		return nil
 	}
-	if runParams.cached && !runParams.bck.IsRemote() {
-		return fmt.Errorf(cachedText+"applies to remote buckets only (have %s)", runParams.bck.Cname(""))
-	}
-	if runParams.listDirs && !runParams.bck.IsRemote() {
-		return fmt.Errorf("--list-dirs option applies to remote buckets only (have %s)", runParams.bck.Cname(""))
-	}
-	if runParams.useNBI && !runParams.bck.IsRemote() {
-		return fmt.Errorf("--nbi option applies to remote buckets only (have %s)", runParams.bck.Cname(""))
+	if err := runParams.validateListFlags(runParams.bck); err != nil {
+		return err
 	}
 
 	//
@@ -632,8 +630,9 @@ func setupBucket(runParams *params, created *bool) error {
 			if err != nil {
 				return fmt.Errorf("failed to create %s: %v", runParams.bck.String(), err)
 			}
+		} else {
+			*created = true
 		}
-		*created = true
 	}
 	if runParams.bPropsStr == "" {
 		return nil
@@ -701,31 +700,30 @@ func sendStatsdStats(s *sts) {
 	s.statsd.SendAll(statsdC)
 }
 
-func cleanup() {
+func cleanup(bucketCreatedByRun bool) {
 	stopping.Store(true)
 	time.Sleep(time.Second)
 	fmt.Println(now() + " Cleaning up...")
-	if objnameGetter != nil {
-		// `objnameGetter` has been actually assigned to/initialized.
+	if bucketCreatedByRun {
+		api.DestroyBucket(runParams.bp, runParams.bck)
+	} else if len(putNames) > 0 {
+		// existing bucket: delete only the objects PUT by this run
 		var (
 			w       = runParams.numWorkers
-			objsLen = objnameGetter.Len()
+			objs    = putNames
+			objsLen = len(objs)
 			n       = objsLen / w
 			wg      = &sync.WaitGroup{}
 		)
 		for i := range w {
 			wg.Add(1)
-			go cleanupObjs(objnameGetter.Names()[i*n:(i+1)*n], wg)
+			go cleanupObjs(objs[i*n:(i+1)*n], wg)
 		}
 		if objsLen%w != 0 {
 			wg.Add(1)
-			go cleanupObjs(objnameGetter.Names()[n*w:], wg)
+			go cleanupObjs(objs[n*w:], wg)
 		}
 		wg.Wait()
-	}
-
-	if runParams.bck.IsAIS() {
-		api.DestroyBucket(runParams.bp, runParams.bck)
 	}
 	fmt.Println(now() + " Done")
 }
@@ -738,33 +736,29 @@ func cleanupObjs(objs []string, wg *sync.WaitGroup) {
 		return
 	}
 
-	// Only delete objects if it's not an AIS bucket (because otherwise we just go ahead
-	// and remove the bucket itself)
-	if runParams.bck.IsRemote() {
-		b := min(t, runParams.evictBatchSize)
-		n := t / b
-		for i := range n {
-			evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: objs[i*b : (i+1)*b]}}
-			xid, err := api.DeleteMultiObj(runParams.bp, runParams.bck, evdMsg)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "delete multi-obj err:", err)
-			}
-			args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects}
-			if _, err = api.WaitForXactionIC(runParams.bp, &args); err != nil {
-				fmt.Fprintln(os.Stderr, "wait for xaction err:", err)
-			}
+	b := min(t, runParams.evictBatchSize)
+	n := t / b
+	for i := range n {
+		evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: objs[i*b : (i+1)*b]}}
+		xid, err := api.DeleteMultiObj(runParams.bp, runParams.bck, evdMsg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "delete multi-obj err:", err)
 		}
+		args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects}
+		if _, err = api.WaitForXactionIC(runParams.bp, &args); err != nil {
+			fmt.Fprintln(os.Stderr, "wait for xaction err:", err)
+		}
+	}
 
-		if t%b != 0 {
-			evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: objs[n*b:]}}
-			xid, err := api.DeleteMultiObj(runParams.bp, runParams.bck, evdMsg)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "delete err:", err)
-			}
-			args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects}
-			if _, err = api.WaitForXactionIC(runParams.bp, &args); err != nil {
-				fmt.Fprintln(os.Stderr, "wait for xaction err:", err)
-			}
+	if t%b != 0 {
+		evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: objs[n*b:]}}
+		xid, err := api.DeleteMultiObj(runParams.bp, runParams.bck, evdMsg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "delete err:", err)
+		}
+		args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects}
+		if _, err = api.WaitForXactionIC(runParams.bp, &args); err != nil {
+			fmt.Fprintln(os.Stderr, "wait for xaction err:", err)
 		}
 	}
 
@@ -803,6 +797,26 @@ func listObjects() (names []string, sizes map[string]int64, fcnt int, err error)
 		names, sizes, fcnt, err = listObjectData(runParams)
 	}
 	return names, sizes, fcnt, err
+}
+
+func loaderShare(names []string, loaderID, loaderCnt uint64) ([]string, int) {
+	var (
+		share = make([]string, 0, len(names)/int(loaderCnt)+1)
+		fcnt  int
+	)
+	for _, name := range names {
+		// hash the shard name, so that all files in a shard (with '-arch.list') go to the same loader
+		shard, archpath := decodeArchName(name)
+		if onexxh.Checksum64S(cos.UnsafeB(shard), cos.MLCG32)%loaderCnt != loaderID {
+			continue
+		}
+		share = append(share, name)
+		// count files inside shards in this share only, so Start() reports this loader's counts
+		if archpath != "" {
+			fcnt++
+		}
+	}
+	return share, fcnt
 }
 
 func objNamesFromFile(path string) ([]string, error) {

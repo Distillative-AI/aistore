@@ -299,19 +299,13 @@ func (t *target) init(config *cmn.Config) {
 	t.initPhase1(config)
 
 	// (a) get node ID from command-line or env var (see envDaemonID())
-	// (b) load existing node ID (replicated xattr at roots of respective mountpaths)
-	// (c) generate a new one (genDaemonID())
+	// (b) load existing node ID (mountpath xattrs, then VMD recovery)
+	// (c) derive node ID from K8s pod identity, when requested and nothing's persisted (see podDaemonID())
+	// (d) generate a new one (genDaemonID())
 	// - in that exact sequence
-	tid, generated := initTID(config)
-	if generated && len(config.FSP.Paths) > 0 {
-		var recovered bool
-		// in an unlikely event when losing all mountpath-stored IDs but still having a volume
-		tid, recovered = volume.RecoverTID(tid, config.FSP.Paths)
-		generated = !recovered
-
-		// TODO: generated == true will not sit well with loading a local copy of Smap
-		// later on during startup sequence - and not finding _this_ target in it
-	}
+	// - persisted ID takes precedence over (c) and (d)
+	tid := initTID(config)
+	// TODO: a generated ID will not sit well with loading a local Smap that lacks this target
 
 	keyPair := t.newKeyPair(tid, apc.Target)
 	t.si.Init(tid, apc.Target, keyPair.VerifyingKey)
@@ -330,7 +324,6 @@ func (t *target) init(config *cmn.Config) {
 	vini := volume.IniCtx{
 		UseLoopbacks:  daemon.cli.target.useLoopbackDevs,
 		IgnoreMissing: daemon.cli.target.startWithLostMountpath,
-		RandomTID:     generated,
 	}
 	newVol := volume.Init(t, config, vini)
 	if err := fs.SetVolSizeMedia(); err != nil {
@@ -392,30 +385,34 @@ func (t *target) initHostIP(config *cmn.Config) {
 	}
 }
 
-func initTID(config *cmn.Config) (tid string, generated bool) {
+func initTID(config *cmn.Config) (tid string) {
 	if tid = envDaemonID(apc.Target); tid != "" {
 		if err := cos.ValidateDaemonID(tid); err != nil {
 			cos.ExitLog(err) // FATAL
 		}
 		nlog.Infoln("initialized tid", meta.Tname(tid), "from env")
-		return tid, false
+		return tid
 	}
 
 	var err error
-	tid, err = fs.LoadNodeID(config.FSP.Paths)
-	switch {
-	case err != nil:
+	tid, err = fs.LoadNodeID(config.FSP.Paths, daemon.cli.target.startWithLostMountpath)
+	if err != nil {
 		cos.ExitLog(err) // FATAL
-	case tid != "":
-		nlog.Infof("loaded tid %s", meta.Tname(tid))
-	default:
-		tid = genDaemonID(apc.Target, config)
-		err = cos.ValidateDaemonID(tid)
-		debug.AssertNoErr(err)
-		nlog.Infoln("generated tid", meta.Tname(tid))
-		generated = true
 	}
-	return tid, generated
+	if tid == "" {
+		tid, _ = volume.RecoverTID("", config.FSP.Paths)
+	}
+	if tid != "" {
+		nlog.Infof("loaded tid %s", meta.Tname(tid))
+		return tid
+	}
+	if tid = podDaemonID(apc.Target); tid != "" {
+		return tid
+	}
+	tid = genDaemonID(apc.Target, config)
+	debug.AssertNoErr(cos.ValidateDaemonID(tid))
+	nlog.Infoln("generated tid", meta.Tname(tid))
+	return tid
 }
 
 func regDiskMetrics(node *meta.Snode, tstats *stats.Trunner, mpi fs.MPI) {
@@ -527,7 +524,6 @@ func (t *target) Run() error {
 	}
 
 	etl.Tinit()
-	t.initDsort(db, config) // note: conditional linkage
 	dload.Init(db, config.Client)
 
 	err = t.htrun.run(config)
@@ -668,7 +664,6 @@ func (t *target) initRecvHandlers() {
 
 		// plus, PromHandler() at "/metrics" (see ais/htrun)
 	)
-	networkHandlers = t.regDsort(networkHandlers)
 	t.regNetHandlers(networkHandlers)
 }
 
@@ -1522,7 +1517,7 @@ func (t *target) objHead(r *http.Request, whdr http.Header, dpq *dpq, bck *meta.
 	// 4. Cold HEAD: check remote backend if object not found locally or if latest version requested
 	latest := dpq.latestVer
 	if !exists || latest {
-		oa, ecode, err := t.HeadCold(lom, r)
+		oa, ecode, err := t.HeadCold(context.Background(), lom, r)
 		if err != nil {
 			switch {
 			case ecode == http.StatusTooManyRequests || ecode == http.StatusServiceUnavailable:
@@ -1728,15 +1723,13 @@ func (t *target) DeleteObject(lom *core.LOM, evict bool) (code int, err error) {
 	code, err, isback = t.delobj(lom, evict)
 	lom.Unlock(true)
 
-	// special corner-case retry (quote):
-	// - googleapi: "Error 503: We encountered an internal error. Please try again."
-	// - aws-error[InternalError: We encountered an internal error. Please try again.]
-	if err != nil && isback {
-		if code == http.StatusServiceUnavailable || strings.Contains(err.Error(), "try again") {
+	// retry a backend 503 once if the rate limiter has not exhausted its budget
+	if err != nil && isback && code == http.StatusServiceUnavailable {
+		if _, exhausted := errors.AsType[*cmn.ErrBackendRetry](err); !exhausted {
 			nlog.Errorf("failed to delete %s: %v(%d) - retrying...", lom, err, code)
 			time.Sleep(time.Second)
 			bp := t.Backend(lom.Bck())
-			code, err = bp.DeleteObj(context.Background(), lom)
+			code, err = bp.DeleteObj(cmn.WithNoRetry(context.Background()), lom)
 		}
 	}
 

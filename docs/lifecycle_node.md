@@ -1,6 +1,6 @@
 # AIStore Node Lifecycle
 
-AIStore operators can use this guide to understand node maintenance, shutdown, and decommission before changing cluster membership. These operations change node state; the diagram below shows the states and transitions.
+This guide covers how AIStore nodes join and rejoin a cluster, and how operators put nodes into maintenance, shut them down, or decommission them. The diagram shows the states and transitions for nodes that are already members.
 
 ![Node lifecycle: states and transitions](images/lifecycle-graceful-term.png)
 
@@ -26,6 +26,12 @@ Needless to say, there's no simple way back out of `decommission` - the proverbi
 ## Table of Contents
 
 - [Joining a Cluster: Discovery URL](#joining-a-cluster-discovery-url)
+- [Node identity and rejoining](#node-identity-and-rejoining)
+  - [Node ID sources](#node-id-sources)
+  - [Pod-derived IDs](#pod-derived-ids)
+  - [Operator-managed ID source](#operator-managed-id-source)
+  - [What happens after a pod restart](#what-happens-after-a-pod-restart)
+  - [Troubleshooting node IDs](#troubleshooting-node-ids)
 - [Cluster](#cluster)
 - [Privileges](#privileges)
 - [Rebalance](#rebalance)
@@ -72,6 +78,144 @@ $ ais config cluster proxy --json
     }
 }
 ```
+
+## Node identity and rejoining
+
+The discovery URL tells a starting node where to find the cluster. Its node ID tells the primary which member is joining. The ID appears in the cluster map (Smap), logs, and CLI. When the primary accepts a same-ID rejoin with changed network addresses, it updates the existing Smap entry.
+
+Object placement uses target IDs. When restarting or moving a target, keep its ID and its data volumes together.
+
+A node that loads a local Smap without its own ID stops at startup.
+
+### Node ID sources
+
+At startup, a node selects its ID from the sources below, in order; the first one that supplies an ID wins. The command line takes precedence over the environment: `-daemon_id` over `AIS_DAEMON_ID`, and `-daemon_id_source` over `AIS_DAEMON_ID_SOURCE`. An invalid ID source value stops startup, even when the node does not need to derive its ID.
+
+| | Target | Proxy in Kubernetes | Proxy elsewhere |
+|---|---|---|---|
+| 1. `-daemon_id` / `AIS_DAEMON_ID` | Must match the ID stored on the mountpaths, if any | Used as is | Must match `.ais.proxy_id`, if any |
+| 2. Stored ID | `user.ais.daemon_id` xattr at the mountpath roots, else `daemon_id` in `.ais.vmd` | Legacy `MY_NODE`-derived ID, when recorded in the local Smap (see [proxy startup](#proxy-startup)) | `.ais.proxy_id` in the configuration directory |
+| 3. [Pod-derived ID](#pod-derived-ids), when configured | Yes | Yes | Yes |
+| 4. Fallback | [Random](#generating-a-new-id) | Hash of `MY_NODE` | [Random](#generating-a-new-id) |
+| Where the selected ID is stored | Mountpath xattrs and VMD | Nowhere: recomputed at every startup | `.ais.proxy_id` |
+
+When row 1 or 2 supplies an ID, AIS does not derive one: changed scopes and missing pod metadata have no effect.
+
+#### Target startup
+
+The xattr identifies the owner of each mountpath. The replicated VMD records the same target ID along with the target's mountpath configuration. All IDs that the target finds must agree: conflicting xattrs or VMDs stop startup, and so does `-daemon_id`/`AIS_DAEMON_ID` that does not match them. With `-start_with_lost_mountpath`, missing paths are skipped; ownership checks still apply to the remaining mountpaths. See [System Files](/docs/sysfiles.md#system-files) and [storage integrity errors](/docs/troubleshooting.md#storage-integrity-errors-sie).
+
+#### Proxy startup
+
+In Kubernetes, a proxy neither reads nor writes `.ais.proxy_id`: proxy pods have no affinity to Kubernetes nodes, while their state directory may be node-local (hostPath).
+
+Before 5.3, a proxy in Kubernetes uses the hash of `MY_NODE`: the ID follows the Kubernetes node, regardless of pod name and IP address. On upgrade, the proxy keeps that ID when its local Smap records it, unless the Smap also records the proxy's pod-derived ID. A recreated pod usually comes back with a new IP address; that does not matter. If the local Smap records neither ID, the proxy continues with rows 3 and 4; stale local Smap copies may need to be removed before restarting.
+
+With `emptyDir` state, a recreated proxy pod has no local Smap. Enabling pod-derived IDs on a cluster deployed before 5.3 then changes the ID of each proxy once, when its pod gets recreated (e.g., during upgrade). The primary admits the new ID; the previous entry may remain in the Smap until removed.
+
+#### Generating a new ID
+
+The default generator produces eight random letters. In a development setup with `test_fspaths.count > 0`, it appends the role and public port to a random prefix. For example, a proxy ID ends in `p8080` and a target ID can end in `t8081`. See [the local playground](/docs/getting_started.md#local-playground).
+
+### Pod-derived IDs
+
+Opt-in mode for Kubernetes deployments: when no ID is specified (`-daemon_id`/`AIS_DAEMON_ID`) or persisted, AIS derives the node ID from the pod identity. This lets a replacement with fresh local state reconstruct the same ID across Kubernetes nodes. Enabling the setting on an existing cluster preserves its stored IDs; it does not convert them to pod-derived IDs.
+
+When derivation is needed, AIS computes the eight-letter ID from:
+
+* role (`-role`)
+* namespace (`K8S_NS`)
+* pod name (`MY_POD`)
+* scope: the part after `k8s-pod:`
+
+The `-daemon_id_source` flag takes precedence over the `AIS_DAEMON_ID_SOURCE` environment variable. AIS does not query Kubernetes for any of the inputs.
+
+Within a single Kubernetes cluster, namespace and pod name are already unique. The scope distinguishes:
+
+* AIS clusters with identical namespaces and pod names in different Kubernetes clusters
+* newly derived IDs in a re-created AIS cluster from those in its predecessor
+
+Scope applies only when deriving a new ID. Changing it does not replace stored IDs or invalidate old volumes. Use fresh configuration directories and volumes when creating a separate cluster.
+
+#### Division of responsibilities
+
+| Deployment ([AIS K8s Operator](https://github.com/NVIDIA/ais-k8s) or other) | AIS |
+|---|---|
+| Set `AIS_DAEMON_ID_SOURCE` on proxy and target containers | Validate it at startup; use it only when no ID is specified or persisted |
+| Set `MY_POD` and `K8S_NS` (the Operator always does) | Require both when derivation is needed |
+| Keep pod names stable (StatefulSet) | Derive the same ID for the same pod (targets: only when the volumes have no ID) |
+| Attach each target's volumes to the same pod after rescheduling (per-pod volume claims) | Load their stored ID; reject conflicting volume ownership |
+| Preserve the ID source and scope in every operation that starts or replaces a node | Derive the ID from the inputs supplied at startup (proxies: every startup; targets: volumes without an ID) |
+
+#### Recommended usage
+
+* Configure pod-derived IDs when creating a new cluster. On upgrades, stored IDs remain unchanged. A replacement with fresh local state derives an ID, which may differ from the existing node's stored ID.
+* One scope per AIS cluster, the same for proxies and targets. Keep it in the deployment spec: a value generated once survives deleting and re-creating the custom resource (with metadata preserved); the custom resource UID does not.
+* Leave `-daemon_id` and `AIS_DAEMON_ID` unset.
+* The unscoped `k8s-pod` is accepted but not recommended.
+
+For example, in the AIStore custom resource:
+
+```yaml
+spec:
+  proxySpec:
+    env:
+      - name: AIS_DAEMON_ID_SOURCE
+        value: k8s-pod:6f1c2b7e-3d4a-4c5b-9e8f-0a1b2c3d4e5f
+  targetSpec:
+    env:
+      - name: AIS_DAEMON_ID_SOURCE
+        value: k8s-pod:6f1c2b7e-3d4a-4c5b-9e8f-0a1b2c3d4e5f
+```
+
+When deriving an ID, the node logs it, for example:
+
+```
+derived t[GBLgBUup] from AIS_DAEMON_ID_SOURCE="k8s-pod:6f1c2b7e-3d4a-4c5b-9e8f-0a1b2c3d4e5f" (pod ais/ais-target-1)
+```
+
+### Operator-managed ID source
+
+For pod-derived IDs, it is recommended that AIS/K8s Operator API makes the ID source and optional scope a single **creation-time** setting in the AIStore custom resource.
+
+The Operator would set `AIS_DAEMON_ID_SOURCE` in both StatefulSet pod templates and reject attempts to add, remove, or change the setting on an existing resource. Restarts, upgrades, and rescheduling would then inherit the original setting.
+
+Use the environment variables in the example above today. When recreating the custom resource with existing volumes, restore the original ID source and scope from the deployment spec.
+
+See related [Troubleshooting node IDs](#troubleshooting-node-ids) section below.
+
+### What happens after a pod restart
+
+The following cases assume pod-derived IDs.
+
+| Event | Result |
+| --- | --- |
+| Proxy restarts with fresh local state and the same pod identity | The proxy derives the same ID and rejoins. |
+| Proxy or target moves to another Kubernetes node | Same ID. If the previous Smap entry is still present, an accepted self-join updates it. If the entry has already been removed, self-join adds it back. |
+| Target restarts or moves with its original volumes | The target loads its stored ID and VMD, and rejoins with its data. |
+| Target returns with blank volumes | The target derives the same ID and creates a new VMD. The primary treats it as the same member. |
+| Target receives another target's consistent set of volumes, without `-daemon_id`/`AIS_DAEMON_ID` | The stored ID wins. The target assumes the identity on those volumes; correct volume-to-pod mapping is required. |
+| Target receives volumes with conflicting stored IDs | Startup fails. |
+| Target retains its volumes while the scope changes | The stored ID wins; the changed derivation setting is ignored. |
+| Proxy restarts with a changed scope | The proxy derives a different ID. A local Smap that lacks the new ID stops startup. |
+
+At startup, AIS checks the target ID in mountpath extended attributes and VMD for the volumes it will use, the same way as for an ID specified via `-daemon_id`/`AIS_DAEMON_ID`. It stamps mountpaths that lack an ID, independently of the object metadata write policy (`write_policy.md`). At runtime, attaching or enabling a mountpath with a foreign ID in its extended attribute fails with `sie#10`. See the [storage integrity error reference](/docs/troubleshooting.md#sie-error-reference).
+
+**Blank volumes do not recover local data.** AIS does not detect that an existing target has returned with blank volumes. Objects backed by remote buckets can be fetched again on a cold GET. Objects in `ais://` buckets with no surviving copies are lost.
+
+### Troubleshooting node IDs
+
+Keep the original ID source and scope in the deployment spec or launch configuration. Stored IDs can hide a changed or missing setting until a replacement starts with fresh local state. Check the effective value: a nonempty `-daemon_id_source` overrides `AIS_DAEMON_ID_SOURCE`. `-daemon_id`/`AIS_DAEMON_ID` overrides both; otherwise, persistence takes precedence.
+
+| Symptom | Cause | Action |
+|---|---|---|
+| A replacement with fresh local state comes back with a different ID, or startup reports that its ID is absent from the local Smap | The original derivation inputs were changed or omitted, or the original ID was not pod-derived. | Restore the original source, scope, role, `MY_POD`, and `K8S_NS`, or supply the known ID via `-daemon_id`/`AIS_DAEMON_ID`. |
+| A changed source or scope has no effect after restart | AIS loaded a persisted ID. | Expected behavior. Preserve the original derivation settings for replacements that lose their local identity. |
+| Exit: `invalid AIS_DAEMON_ID_SOURCE` | The value is neither `k8s-pod` nor `k8s-pod:<scope>` (checked at startup, whether or not derivation is needed). | Fix the value. |
+| Exit: `AIS_DAEMON_ID_SOURCE requires MY_POD and K8S_NS` | Derivation is needed, but pod metadata is missing. | Set both from the pod's `metadata.name` and `metadata.namespace`. |
+| Target exits with `sie#10` or `sie#20`, or reports conflicting target IDs | Stored volume identities disagree, or `-daemon_id`/`AIS_DAEMON_ID` does not match the volumes. | Restore the correct volume-to-target mapping and ID settings. Do not remove ownership metadata to force startup. |
+| Target rejoins with no objects | Blank volumes | See the note on blank volumes above. |
+| Proxy rescheduled to another Kubernetes node exits: `[bad cluster map]` ... `(self) is not present in loaded Smap` | The proxy uses a legacy `MY_NODE`-derived ID (cluster deployed before 5.3) and keeps its state on a persistent volume: the retained local Smap records the ID derived from the previous node. Not specific to pod-derived IDs. | Remove the stale local Smap from the proxy's state volume and restart; the proxy rejoins with a new ID. |
 
 ## Cluster
 

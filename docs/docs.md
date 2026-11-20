@@ -77,14 +77,15 @@ Use this page as a quick orientation and navigation map:
 
 ## Operations
 
-- [Production deployment](https://github.com/NVIDIA/aistore/blob/main/deploy/README.md)
+- [Production deployment guide](https://github.com/NVIDIA/ais-k8s/blob/main/docs/README.md)
+- [Development deployments](/deploy/README.md)
 - [Local and production Kubernetes paths](/docs/kubernetes.md)
 - [AIStore on Kubernetes](https://github.com/NVIDIA/ais-k8s)
 - [Kubernetes Operator](https://github.com/NVIDIA/ais-k8s/blob/main/operator/README.md)
 - [Ansible playbooks](https://github.com/NVIDIA/ais-k8s/blob/main/playbooks/README.md)
 - [Helm charts](https://github.com/NVIDIA/ais-k8s/tree/main/helm)
 - [Deployment monitoring](https://github.com/NVIDIA/ais-k8s/blob/main/monitoring/README.md)
-- [Node lifecycle: maintenance, shutdown, decommission](/docs/lifecycle_node.md)
+- [Node lifecycle: identity, rejoining, maintenance, shutdown, and decommission](/docs/lifecycle_node.md)
 - [Global rebalance](/docs/rebalance.md)
 - [Placement weights](/docs/placement.md)
 - [Resilver](/docs/resilver.md)
@@ -170,4 +171,3 @@ Use this page as a quick orientation and navigation map:
 - [Custom transformers](https://github.com/NVIDIA/ais-etl/tree/main/transformers)
 - [ETL Python webserver SDK](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/etl/webserver/README.md)
 - [ETL Go webserver package](https://github.com/NVIDIA/aistore/blob/main/ext/etl/webserver/README.md)
-- [Initial sharding utility (`ishard`)](https://github.com/NVIDIA/aistore/blob/main/cmd/ishard/README.md)

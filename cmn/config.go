@@ -113,7 +113,7 @@ type (
 		// optional sections: absent via ordinary serialization
 		Ext     any          `json:"ext,omitempty"`              // reserved
 		Tracing *TracingConf `json:"tracing,omitempty"`          // see cmn/gco fixup; build tag
-		Dsort   *DsortConf   `json:"distributed_sort,omitempty"` // ditto; build tag
+		Dsort   *DsortConf   `json:"distributed_sort,omitempty"` // Deprecated: dsort is removed; accepted and dropped
 
 		// default-omittable sections: pruned at encode time when wholly default
 		WritePolicy *WritePolicyConf `json:"write_policy,omitempty"` // object metadata: (immediate | delayed | never)
@@ -915,6 +915,10 @@ type (
 		Timeout *cos.Duration `json:"timeout,omitempty"`
 	}
 
+	// Deprecated: dsort is removed
+	// - keep the section (and its "to-set" counterpart) to load existing configs
+	//   and to accept set-config from older clients; ignored otherwise
+	// TODO: remove one release later
 	DsortConf struct {
 		DuplicatedRecords   string `json:"duplicated_records"`
 		MissingShards       string `json:"missing_shards"` // cmn.SupportedReactions enum
@@ -1622,7 +1626,7 @@ func (c *ClientConf) Validate() error {
 		errExpectedRange = "(expected range [1s, 30m])"
 	)
 	// hydrate first: zero means no end-to-end timeout for http.Client
-	// (see ec/getx, reb/globrun, ext/dsort/manager)
+	// (see ec/getx, reb/globrun)
 	if c.Timeout == 0 {
 		c.Timeout = cos.Duration(clientTimeoutDflt)
 	}
@@ -3403,7 +3407,7 @@ const (
 // - renewal size: XferRenewSize(window) bytes - each one transferred renews the deadline for another window
 // - minimum transfer rate: renewal size / window = XferMinRate, until clamped
 //
-// e.g.: 1m => 3.75MiB (config-validated minimum, see TimeoutConf.Validate); 5m => 18.75MiB;
+// e.g.: 1m => 3.75MiB (config-validated minimum except in a testing env, see TimeoutConf.Validate); 5m => 18.75MiB;
 // >= ~17m => 64MiB (max; the minimum transfer rate then decreases: 64MiB/window)
 const (
 	XferMinRate  = 64 * cos.KiB // bytes per second
@@ -3429,6 +3433,8 @@ func (c *TimeoutConf) ColdRangeBackoff() time.Duration {
 	cgc := cos.NonZero(c.ColdGetConflict.D(), ColdGetConflictDflt)
 	return cos.ClampDuration(2*cgc, floor, max(c.MaxHostBusy.D(), floor))
 }
+
+const minSendFileTest = 5 * time.Second // timeout.send_file_time in a testing env
 
 func (c *TimeoutConf) Validate() error {
 	debug.Assert(SharedStreamsDflt >= 2*hk.Prune2mIval)
@@ -3456,8 +3462,8 @@ func (c *TimeoutConf) Validate() error {
 		return fmt.Errorf("invalid timeout.join_startup_time=%s, must be >= 2*(timeout.startup_time=%s)",
 			c.JoinAtStartup, c.Startup)
 	}
-	if c.SendFile.D() < time.Minute {
-		return fmt.Errorf("invalid timeout.send_file_time=%s (cannot be less than 1m)", c.SendFile)
+	if minSendFile := cos.Ternary(Rom.TestingEnv(), minSendFileTest, time.Minute); c.SendFile.D() < minSendFile {
+		return fmt.Errorf("invalid timeout.send_file_time=%s (cannot be less than %v)", c.SendFile, minSendFile)
 	}
 	// must be greater than (2 * keepalive.interval*keepalive.factor)
 	if c.EcStreams > 0 && c.EcStreams.D() < SharedStreamsMin {
@@ -3745,6 +3751,7 @@ func LoadConfig(globalConfPath, localConfPath, daeRole string, config *Config) e
 	}
 
 	nlog.SetPre(config.LogDir, daeRole)
+	Rom.testingEnv = config.TestingEnv()
 
 	// Global (aka Cluster) config
 	// Normally, when the node is being deployed the very first time the last updated version
@@ -3777,7 +3784,7 @@ func LoadConfig(globalConfPath, localConfPath, daeRole string, config *Config) e
 		debug.Assert(config.Version > 0 && config.UUID != "")
 	}
 
-	dropDsortConfig(config) // 4.3 update: conditional linkage
+	config.Dsort = nil // dsort is removed; see DsortConf
 
 	// `log` is used before the override-merge and Config.Validate below
 	if err := config.ClusterConfig.HydrateOmittables(); err != nil {
@@ -3796,7 +3803,6 @@ func LoadConfig(globalConfPath, localConfPath, daeRole string, config *Config) e
 	// initialize atomic part of the config including most often used timeouts and features
 	debug.Assert(onSignVerifyToggle == nil, "startup sequence: must not trigger runtime sign/verify hook")
 	Rom.Set(&config.ClusterConfig)
-	Rom.testingEnv = config.TestingEnv()
 
 	// create dirs
 	if err := cos.CreateDir(config.LogDir); err != nil {

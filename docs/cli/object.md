@@ -1308,10 +1308,7 @@ Waiting time may be even greater if you are copying data to an AIStore `s3://`, 
 
 Copying, or generally, working in any shape and form with many (millions of) small files comes with significant and unavoidable overhead, both networking and storage-wise.
 
-Use our `ishard` tool to convert and serialize your data using the preferred formatting (a.k.a. WebDataset convention):
-
-* [`ishard` readme](https://github.com/NVIDIA/aistore/blob/main/cmd/ishard/README.md)
-* [`ishard` blog](https://aistore.nvidia.com/blog/2024/08/16/ishard)
+Use the Python SDK [dataset writer](https://github.com/NVIDIA/aistore/blob/main/python/aistore/sdk/dataset/README.md#writing-datasets) to create WebDataset-formatted shards from local files.
 
 # Promote files and directories
 
@@ -2046,7 +2043,8 @@ NAME:
      - 'prefetch gs://abc --template images/'                       - same as above;
      - 'prefetch gs://abc/images/'                                  - same as above;
      - 'prefetch gs://abc --template "shard-{0000..9999}.tar.lz4"'  - prefetch the matching range (prefix + brace expansion);
-     - 'prefetch "gs://abc/shard-{0000..9999}.tar.lz4"'             - same as above (notice double quotes)
+     - 'prefetch "gs://abc/shard-{0000..9999}.tar.lz4"'             - same as above (notice double quotes);
+     - 'prefetch gs://abc --targets t[abc],t[xyz]'                  - prefetch only the objects that the two specified targets own;
 
 USAGE:
    ais prefetch BUCKET[/OBJECT_NAME_or_TEMPLATE] [BUCKET[/OBJECT_NAME_or_TEMPLATE] ...] [command options]
@@ -2095,6 +2093,10 @@ OPTIONS:
                       1) adding remote bucket to aistore without first checking the bucket's accessibility
                          (e.g., to configure the bucket's aistore properties with alternative security profile and/or endpoint)
                       2) listing public-access Cloud buckets where certain operations (e.g., 'HEAD(bucket)') may be disallowed
+   targets           Comma-separated list of targets to run prefetch on (press <TAB-TAB> to select);
+                     each selected target fetches only the objects it owns; when omitted, prefetch runs on all targets, e.g.:
+                     --targets t[abc]
+                     --targets 't[abc],t[xyz]'
    template          Template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
                      (with optional steps and gaps), e.g.:
                      --template "" # (an empty or '*' template matches everything)
@@ -2164,6 +2166,18 @@ prefetch-objects[MV4ex8u6h]: prefetch "10" from s3://cloud-bucket. To monitor th
 ```
 
 > The prefix in the example is "10"
+
+To run the same job only on selected targets, each fetching the objects it owns:
+
+```console
+$ ais prefetch s3://cloud-bucket --prefix 10 --targets t[KactABCD],t[XXytEFGH]
+
+prefetch-objects[URTstyvxY]: prefetch "10" from s3://cloud-bucket. To monitor the progress, run 'ais show job URTstyvxY'
+```
+
+> Press `<TAB-TAB>` after `--targets` to select from the cluster's targets. When the option is omitted, prefetch runs on all targets.
+
+> `--targets` requires AIStore v5.3 or later. An older cluster ignores the option and runs prefetch on all targets.
 
 ### Monitoring progress
 
@@ -2401,12 +2415,12 @@ removed files in the range 'test-{001..003}' from ais://mybucket bucket
 And one other example (that also includes generating .tar shards):
 
 ```console
-$ ais archive gen-shards "ais://dsort-testing/shard-{001..999}.tar" --fcount 256
+$ ais archive gen-shards "ais://archive-testing/shard-{001..999}.tar" --fcount 256
 Shards created: 999/999 [==============================================================] 100 %
 
 # NOTE: make sure to use double or single quotations to specify the template (aka "range")
-$ ais object rm ais://dsort-testing --template 'shard-{900..999}.tar'
-removed from ais://dsort-testing objects in the range "shard-{900..999}.tar", use 'ais job show xaction EH291ljOy' to monitor the progress
+$ ais object rm ais://archive-testing --template 'shard-{900..999}.tar'
+removed from ais://archive-testing objects in the range "shard-{900..999}.tar", use 'ais job show xaction EH291ljOy' to monitor the progress
 ```
 
 ### See also:

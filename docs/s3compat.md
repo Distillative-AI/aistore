@@ -48,11 +48,13 @@ AIS exposes a *pure* S3 surface for seamless compatibility and a *native* API fo
   * [JWT authentication](#authentication-jwt-tips)
 * [Supported Operations](#supported-operations)
   * [PUT / GET / HEAD](#put--get--head)
+  * [Conditional writes](#conditional-writes)
   * [Range reads](#range-reads)
   * [Multipart uploads (aws CLI)](#multipart-uploads-with-aws-cli)
   * [Presigned requests](#presigned-s3-requests)
 * [Use Native Bucket Inventory](#use-native-bucket-inventory)
 * [Deleting nonexistent object](#deleting-nonexistent-object)
+* [S3 backend: SDK retries](#s3-backend-sdk-retries)
 * [Compatibility Matrix](#compatibility-matrix)
 * [Boto3 Examples](#boto3-examples)
 * [FAQs & Troubleshooting](#faqs--troubleshooting)
@@ -347,6 +349,22 @@ ais get ais://demo/obj output.txt
 ais object show ais://demo/obj
 ```
 
+### Conditional writes
+
+AIStore forwards `If-Match` and `If-None-Match` on PUT and multipart completion to Amazon S3, S3-compatible endpoints, and OCI. The remote store evaluates the conditions. For a custom S3 endpoint, enforcement depends on that endpoint's support for conditional writes.
+
+A failed precondition typically returns HTTP 412. A concurrent write can cause HTTP 409 (`ConditionalRequestConflict`).
+
+Other buckets - GCP, Azure, remote AIS, and `ais://` buckets without a backend - ignore write conditions.
+
+A rejected condition leaves the in-cluster copy of the object as is. If that copy is stale - the remote object was updated out of band - a read-modify-write loop through AIS keeps reading the same stale ETag, and each conditional PUT fails again. To read the current version:
+
+- per bucket: enable `versioning.validate_warm_get` - see [Out-of-band updates](/docs/out_of_band.md#out-of-band-updates);
+- per request: GET with the latest-version option - see [GET latest version](/docs/out_of_band.md#get-latest-version);
+- per batch: prefetch or copy with `--latest` - see [Lesser scope](/docs/out_of_band.md#lesser-scope).
+
+Conditional PUTs to S3 and OCI always reach the remote store. Any other PUT that supplies a checksum matching the in-cluster object is a no-op, unless the bucket's chunking policy applies to the object.
+
 ### Range reads
 
 S3 API supports byte range requests for partial object downloads:
@@ -468,6 +486,24 @@ we return whatever the backend gives us - which, for S3, is 204 (no error).
 
 Apart from this single exception, returning an error on delete of a nonexistent
 object is an intentional semantic choice for consistency with the rest of AIS.
+
+---
+
+## S3 backend: SDK retries
+
+AIS makes at most two attempts per S3 request (the initial request and one retry), unless `max_attempts` in the AWS profile or `AWS_MAX_ATTEMPTS` sets a different positive limit. AIS rejects negative values. Each bucket can select its own profile with `extra.aws.profile`, so a named profile sets the limit per bucket. Set the profile in the AWS config file on every target.
+
+```ini
+[profile prod-account]
+region = us-east-2
+max_attempts = 4
+```
+
+```console
+ais bucket props set s3://#prod/data extra.aws.profile=prod-account
+```
+
+When AIS retries an operation, for example with [backend rate limiting](/docs/rate_limit.md), each S3 SDK request gets one attempt regardless of `max_attempts`. See [v5.3 release notes](/docs/relnotes/5.3.md#sdk-retries).
 
 ---
 

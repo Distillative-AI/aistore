@@ -5,6 +5,7 @@
 package aisloader
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -22,8 +23,12 @@ func TestParamsValidate(t *testing.T) {
 				bck: cmn.Bck{Provider: apc.AIS},
 			},
 			workloadParams: workloadParams{
-				duration: DurationExt{Val: time.Minute},
-				putPct:   50,
+				duration:   DurationExt{Val: time.Minute},
+				putPct:     50,
+				numWorkers: 10,
+			},
+			readParams: readParams{
+				evictBatchSize: 1000,
 			},
 			sizeCksumParams: sizeCksumParams{
 				minSize:   cos.KiB,
@@ -31,7 +36,7 @@ func TestParamsValidate(t *testing.T) {
 				cksumType: cos.ChecksumOneXxh,
 			},
 			loaderParams: loaderParams{
-				loaderID: "0",
+				loaderID: StringExt{Val: "0"},
 			},
 		}
 	}
@@ -70,6 +75,60 @@ func TestParamsValidate(t *testing.T) {
 				p.fileList = "/some/filelist.txt"
 			},
 			wantErr: "'-filelist' and '-filelist-obj' are mutually exclusive",
+		},
+		{
+			name: "loaderid equal to loadernum",
+			mutate: func(p *params) {
+				p.loaderID, p.loaderCnt = StringExt{IsSet: true, Val: "4"}, 4
+			},
+			wantErr: "loaderid has to be smaller than loadernum",
+		},
+		{
+			name: "split reads",
+			mutate: func(p *params) {
+				p.loaderID, p.loaderCnt, p.splitReads = StringExt{IsSet: true, Val: "3"}, 4, true
+			},
+			check: func(t *testing.T, p *params) {
+				if p.loaderIdx != 3 {
+					t.Fatalf("expected loaderIdx 3 (parsed '-loaderid'), got %d", p.loaderIdx)
+				}
+			},
+		},
+		{
+			name: "split reads without loaderid",
+			mutate: func(p *params) {
+				p.loaderCnt, p.splitReads = 4, true
+			},
+			wantErr: "'-split-reads' requires both '-loaderid' and '-loadernum'",
+		},
+		{
+			name: "split reads without loadernum",
+			mutate: func(p *params) {
+				p.loaderID, p.splitReads = StringExt{IsSet: true, Val: "0"}, true
+			},
+			wantErr: "'-split-reads' requires both '-loaderid' and '-loadernum'",
+		},
+		{
+			name: "split reads with 100% PUT",
+			mutate: func(p *params) {
+				p.loaderID, p.loaderCnt, p.splitReads = StringExt{IsSet: true, Val: "0"}, 4, true
+				p.putPct = 100
+			},
+			wantErr: "'-split-reads' requires a workload that reads",
+		},
+		{
+			name: "zero workers",
+			mutate: func(p *params) {
+				p.numWorkers = 0
+			},
+			wantErr: "numworkers 0",
+		},
+		{
+			name: "negative workers",
+			mutate: func(p *params) {
+				p.numWorkers = -1
+			},
+			wantErr: "numworkers -1",
 		},
 		{
 			name: "size range",
@@ -299,7 +358,7 @@ func TestParamsValidate(t *testing.T) {
 		},
 		{
 			name:    "empty loader ID",
-			mutate:  func(p *params) { p.loaderID = "" },
+			mutate:  func(p *params) { p.loaderID = StringExt{IsSet: true} },
 			wantErr: "loaderID can't be empty",
 		},
 		{
@@ -314,6 +373,21 @@ func TestParamsValidate(t *testing.T) {
 				p.randomProxy = true
 			},
 			wantErr: "'-s3endpoint' and '-randomproxy' are mutually exclusive",
+		},
+		{
+			name: "allow cleanup with updates",
+			mutate: func(p *params) {
+				p.cleanUp = BoolExt{IsSet: true, Val: true}
+				p.updateExistingPct = 10
+			},
+		},
+		{
+			name: "reject cleanup with zero evict batch size",
+			mutate: func(p *params) {
+				p.cleanUp = BoolExt{IsSet: true, Val: true}
+				p.evictBatchSize = 0
+			},
+			wantErr: "invalid option: evict-batchsize 0 (must be > 0 with '-cleanup=true')",
 		},
 	}
 
@@ -338,6 +412,171 @@ func TestParamsValidate(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("validate() error = %v, expected substring %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateListOut(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*params)
+		wantErr string
+		check   func(*testing.T, *params)
+	}{
+		{
+			name: "valid",
+			check: func(t *testing.T, p *params) {
+				if p.bck.Name != "workload" || p.bck.Provider != apc.AIS {
+					t.Fatalf("expected '-bucket' resolved to ais://workload, got %s", p.bck.String())
+				}
+				if p.listOutBck.Name != "lists" || p.listOutObjName != "names.txt" {
+					t.Fatalf("expected '-list-out' resolved to ais://lists/names.txt, got %s", p.listOutBck.Cname(p.listOutObjName))
+				}
+			},
+		},
+		{
+			// a list step that shares the benchmark run's config
+			name: "ignore benchmark run options",
+			mutate: func(p *params) {
+				p.splitReads = true
+				p.loaderCnt = 4
+				p.duration.Val = 0
+				p.putPct = 100
+			},
+		},
+		{
+			name:    "require bucket",
+			mutate:  func(p *params) { p.bck.Name = "" },
+			wantErr: "'-list-out' requires '-bucket'",
+		},
+		{
+			name:    "reject invalid list-out URI",
+			mutate:  func(p *params) { p.listOut = "ais://lists" },
+			wantErr: "invalid '-list-out=ais://lists'",
+		},
+		{
+			name:    "reject filelist",
+			mutate:  func(p *params) { p.fileList = "names.txt" },
+			wantErr: "'-list-out' cannot be combined with '-filelist' or '-filelist-obj'",
+		},
+		{
+			name:    "reject filelist-obj",
+			mutate:  func(p *params) { p.fileListObj = "ais://lists/names-2.txt" },
+			wantErr: "'-list-out' cannot be combined with '-filelist' or '-filelist-obj'",
+		},
+		{
+			name:    "reject direct S3",
+			mutate:  func(_ *params) { s3Endpoint = "http://localhost:9000" },
+			wantErr: "'-list-out' with direct S3 access is not supported",
+		},
+		{
+			name:    "reject getloaderid",
+			mutate:  func(p *params) { p.getLoaderID = true },
+			wantErr: "'-list-out' cannot be combined with '-getloaderid'",
+		},
+		{
+			name:    "reject cached for local bucket",
+			mutate:  func(p *params) { p.cached = true },
+			wantErr: "applies to remote buckets only",
+		},
+		{
+			name:    "reject nbi for local bucket",
+			mutate:  func(p *params) { p.useNBI = true },
+			wantErr: "--nbi option applies to remote buckets only",
+		},
+		{
+			name: "allow nbi for remote bucket",
+			mutate: func(p *params) {
+				p.bck.Name = "s3://workload"
+				p.useNBI = true
+			},
+		},
+		{
+			name:   "clean subdir",
+			mutate: func(p *params) { p.subDir = "a/b/" },
+			check: func(t *testing.T, p *params) {
+				if p.subDir != "a/b" {
+					t.Fatalf("expected subdir %q, got %q", "a/b", p.subDir)
+				}
+			},
+		},
+		{
+			name:    "reject absolute subdir",
+			mutate:  func(p *params) { p.subDir = "/a" },
+			wantErr: "object name prefix can't start with /",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resetValidationGlobals(t)
+
+			p := &params{
+				bucketParams: bucketParams{bck: cmn.Bck{Name: "ais://workload", Provider: apc.AIS}},
+				workloadParams: workloadParams{
+					duration: DurationExt{Val: time.Minute},
+					putPct:   50,
+				},
+			}
+			p.listOut = "ais://lists/names.txt"
+			if test.mutate != nil {
+				test.mutate(p)
+			}
+
+			err := p.validateListOut()
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateListOut() unexpected error: %v", err)
+				}
+				if test.check != nil {
+					test.check(t, p)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("validateListOut() error = %v, expected substring %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestRepeatableNameFlags(t *testing.T) {
+	tests := []struct {
+		name            string
+		seed            int64
+		loaderCnt       uint64
+		loaderIDHashLen uint
+		randomObjName   bool
+		want            []string
+	}{
+		{name: "automatic seed", randomObjName: true},
+		{name: "explicit seed", randomObjName: true, seed: 1, want: []string{"-seed"}},
+		{name: "counter names", want: []string{"-randomname=false"}},
+		{name: "loader count", randomObjName: true, loaderCnt: 2, want: []string{"-loadernum"}},
+		{name: "loader hash", randomObjName: true, loaderIDHashLen: 8, want: []string{"-loaderidhashlen"}},
+		{
+			name: "loader count and seed", randomObjName: true, loaderCnt: 2, seed: 1,
+			want: []string{"-loadernum", "-seed"},
+		},
+		{
+			name: "counter names and loader hash", loaderIDHashLen: 8,
+			want: []string{"-randomname=false", "-loaderidhashlen"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			p := &params{
+				workloadParams: workloadParams{putPct: 50, seed: test.seed},
+				namingParams:   namingParams{randomObjName: test.randomObjName},
+				loaderParams:   loaderParams{loaderCnt: test.loaderCnt, loaderIDHashLen: test.loaderIDHashLen},
+			}
+			if got := p.repeatableNameFlags(); !slices.Equal(got, test.want) {
+				t.Fatalf("repeatableNameFlags() = %v, want %v", got, test.want)
+			}
+			p.putPct = 0
+			if got := p.repeatableNameFlags(); len(got) != 0 {
+				t.Fatalf("repeatableNameFlags() without PUTs = %v, want no flags", got)
 			}
 		})
 	}

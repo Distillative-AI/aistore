@@ -80,7 +80,7 @@ func (t *target) PutObject(lom *core.LOM, params *core.PutParams) (err error) {
 	return err
 }
 
-func (t *target) FinalizeObj(lom *core.LOM, workFQN string, xctn core.Xact, owt cmn.OWT) (ecode int, err error) {
+func (t *target) FinalizeObj(lom *core.LOM, workFQN string, xctn core.Xact, owt cmn.OWT, rmWork bool) (ecode int, err error) {
 	if err = cos.Stat(workFQN); err != nil {
 		return
 	}
@@ -92,6 +92,7 @@ func (t *target) FinalizeObj(lom *core.LOM, workFQN string, xctn core.Xact, owt 
 		poi.workFQN = workFQN
 		poi.owt = owt
 		poi.xctn = xctn
+		poi.keepWork = !rmWork
 	}
 	ecode, err = poi.finalize()
 	freePOI(poi)
@@ -205,13 +206,13 @@ func (t *target) GetColdBlob(params *core.BlobParams, oa *cmn.ObjAttrs) (xctn co
 	return xblob, nil
 }
 
-func (t *target) HeadCold(lom *core.LOM, origReq *http.Request) (oa *cmn.ObjAttrs, ecode int, err error) {
+func (t *target) HeadCold(ctx context.Context, lom *core.LOM, origReq *http.Request) (oa *cmn.ObjAttrs, ecode int, err error) {
 	var (
 		bp    = t.Backend(lom.Bck())
 		now   = mono.NanoTime()
 		vlabs = map[string]string{stats.VlabBucket: lom.Bck().Cname("")}
 	)
-	oa, ecode, err = bp.HeadObj(context.Background(), lom, origReq)
+	oa, ecode, err = bp.HeadObj(ctx, lom, origReq)
 	if err != nil {
 		t.statsT.IncWith(stats.ErrHeadCount, vlabs)
 	} else {

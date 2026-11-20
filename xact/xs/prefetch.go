@@ -30,7 +30,7 @@ import (
 type (
 	prfFactory struct {
 		xctn *prefetch
-		msg  *apc.PrefetchMsg
+		*xreg.PrefetchArgs
 		xreg.RenewBase
 	}
 	pebl struct {
@@ -59,6 +59,7 @@ type (
 		msg    *apc.PrefetchMsg
 		xlabs  map[string]string
 		brl    *cos.BurstRateLim
+		pages  *lrpages // R-flow: designated target (DT) lists remote prefix
 		pebl   pebl
 		stats  prfStats
 		lrit
@@ -75,23 +76,24 @@ var (
 )
 
 func (*prfFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
-	msg := args.Custom.(*apc.PrefetchMsg)
+	custom := args.Custom.(*xreg.PrefetchArgs)
+	msg := custom.Msg
 	debug.AssertFunc(func() bool { return !msg.IsList() || !msg.HasTemplate() })
-	np := &prfFactory{RenewBase: xreg.RenewBase{Args: args, Bck: bck}, msg: msg}
+	np := &prfFactory{RenewBase: xreg.RenewBase{Args: args, Bck: bck}, PrefetchArgs: custom}
 	return np
 }
 
 func (p *prfFactory) Start() (err error) {
-	if err := apc.ValidateBlobWorkers(p.msg.BlobNumWorkers); err != nil {
+	if err := apc.ValidateBlobWorkers(p.Msg.BlobNumWorkers); err != nil {
 		return fmt.Errorf("blob-num-workers: %w", err)
 	}
-	if p.msg.BlobThreshold < 0 {
-		return fmt.Errorf("invalid blob-threshold=%d: expecting a non-negative value", p.msg.BlobThreshold)
+	if p.Msg.BlobThreshold < 0 {
+		return fmt.Errorf("invalid blob-threshold=%d: expecting a non-negative value", p.Msg.BlobThreshold)
 	}
-	if p.msg.BlobThreshold > 0 && p.msg.BlobThreshold < core.MinBlobDlPrefetchSize {
-		a, b := cos.IEC(p.msg.BlobThreshold, 0), cos.IEC(core.MinBlobDlPrefetchSize, 0)
+	if p.Msg.BlobThreshold > 0 && p.Msg.BlobThreshold < core.MinBlobDlPrefetchSize {
+		a, b := cos.IEC(p.Msg.BlobThreshold, 0), cos.IEC(core.MinBlobDlPrefetchSize, 0)
 		nlog.Warningln("blob-threshold (", a, ") is too small, must be at least", b, "- updating...")
-		p.msg.BlobThreshold = core.MinBlobDlPrefetchSize
+		p.Msg.BlobThreshold = core.MinBlobDlPrefetchSize
 	}
 
 	b := p.Bck
@@ -104,20 +106,20 @@ func (p *prfFactory) Start() (err error) {
 	chunks := b.Props.Chunks
 
 	// see docs/storage_svcs.md#prefetch-mechanism
-	if p.msg.BlobThreshold > 0 {
+	if p.Msg.BlobThreshold > 0 {
 		if chunks.AutoEnabled() {
-			p.msg.BlobThreshold = max(p.msg.BlobThreshold, int64(chunks.ObjSizeLimit))
-			if p.msg.BlobChunkSize != 0 {
+			p.Msg.BlobThreshold = max(p.Msg.BlobThreshold, int64(chunks.ObjSizeLimit))
+			if p.Msg.BlobChunkSize != 0 {
 				nlog.Warningf("%s: ignoring blob-chunk-size=%s; bucket auto-chunking uses chunks.chunk_size=%s",
-					xact.Cname(p.Kind(), p.UUID()), cos.IEC(p.msg.BlobChunkSize, 0), chunks.ChunkSize)
+					xact.Cname(p.Kind(), p.UUID()), cos.IEC(p.Msg.BlobChunkSize, 0), chunks.ChunkSize)
 			}
-			p.msg.BlobChunkSize = int64(chunks.ChunkSize)
+			p.Msg.BlobChunkSize = int64(chunks.ChunkSize)
 		} else {
 			nlog.Warningf("%s: bucket auto-chunking is disabled; blob-prefetched objects stay chunked; "+
 				"run 'ais bucket rechunk' to restore the bucket layout", xact.Cname(p.Kind(), p.UUID()))
 		}
 	}
-	p.xctn, err = newPrefetch(&p.Args, p.Kind(), b, p.msg)
+	p.xctn, err = newPrefetch(&p.Args, p.Kind(), b, p.PrefetchArgs)
 	return err
 }
 
@@ -128,11 +130,15 @@ func (*prfFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) {
 	return xreg.WprKeepAndStartNew, nil
 }
 
-func newPrefetch(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.PrefetchMsg) (r *prefetch, err error) {
-	var lsflags uint64
+func newPrefetch(xargs *xreg.Args, kind string, bck *meta.Bck, args *xreg.PrefetchArgs) (r *prefetch, err error) {
+	var (
+		lsflags uint64
+		msg     = args.Msg
+		smap    = args.Smap
+	)
 	r = &prefetch{config: cmn.GCO.Get(), msg: msg}
+	r.InitBase(context.Background(), xargs.UUID, kind, bck)
 
-	smap := core.T.Sowner().Get()
 	nat := smap.CountActiveTs()
 	r.brl, err = bck.NewFrontendRateLim(nat) // TODO: support RateLimitConf.Verbs - here and elsewhere; `nat` vs num-workers
 	if err != nil {
@@ -146,7 +152,6 @@ func newPrefetch(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.Prefetch
 	if err != nil {
 		return nil, err
 	}
-	r.InitBase(context.Background(), xargs.UUID, kind, bck)
 	r.latestVer = bck.VersionConf().ValidateWarmGet || msg.LatestVer
 
 	r.bp = core.T.Backend(bck)
@@ -154,22 +159,47 @@ func newPrefetch(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.Prefetch
 		stats.VlabBucket: bck.Cname(""),
 		stats.VlabXkind:  r.Kind(),
 	}
-	r.ctx = xact.WithCtxVlabs(r.Context(), r.xlabs)
+	r.ctx = xact.WithCtxVlabs(r.BackendCtx(), r.xlabs)
 
 	if r.msg.BlobThreshold > 0 {
 		r.pebl.init(r)
+	}
+	if args.DT != "" && r.lrp == lrpPrefix {
+		if r.pages, err = newLrpages(&r.lrit, r.config, smap, args.DT); err != nil {
+			return nil, err
+		}
+		r.lrit.pageR = r.pages.next
 	}
 	return r, nil
 }
 
 func (r *prefetch) Run(wg *sync.WaitGroup) {
-	nlog.Infoln(r.Name())
+	var dt string
+	if r.pages != nil {
+		dt = r.pages.dt
+	}
+	switch dt {
+	case "":
+		nlog.Infoln(r.Name())
+	case core.T.SID():
+		nlog.Infoln(core.T.String(), r.Name(), "DT (self)")
+	default:
+		nlog.Infoln(core.T.String(), r.Name(), "[ DT:", dt, "]")
+	}
 
 	wg.Done()
 
-	err := r.lrit.run(r, core.T.Sowner().Get(), false /*prealloc buf*/)
+	smap := core.T.Sowner().Get()
+	if r.pages != nil {
+		smap = r.pages.smap
+	}
+	err := r.lrit.run(r, smap, false /*prealloc buf*/)
 	if err != nil {
-		r.AddErr(err, 5, cos.ModXs) // duplicated?
+		if r.pages != nil {
+			r.Abort(err)
+		} else {
+			r.AddErr(err, 5, cos.ModXs)
+		}
 	}
 	r.lrit.wait()
 
@@ -182,7 +212,20 @@ func (r *prefetch) Run(wg *sync.WaitGroup) {
 		}
 	}
 
+	if r.pages != nil {
+		r.pages.cleanup()
+	}
 	r.Finish()
+}
+
+func (r *prefetch) Abort(err error) bool {
+	if !r.Base.Abort(err) {
+		return false
+	}
+	if r.pages != nil {
+		r.BcastAbort(r.pages.smap)
+	}
+	return true
 }
 
 // NOTE ref 6735188: _not_ setting negative atime, flushing lom metadata
@@ -223,7 +266,7 @@ func (r *prefetch) do(lom *core.LOM, lrit *lrit, _ []byte) {
 	// find the size iff blob-download is an option; retain the attrs for it
 	blobOK := r.msg.BlobThreshold > 0 && !r.pebl.busy()
 	if blobOK && oa == nil {
-		oa, ecode, err = core.T.HeadCold(lom, nil /*origReq*/)
+		oa, ecode, err = core.T.HeadCold(r.BackendCtx(), lom, nil /*origReq*/)
 		if err != nil {
 			// listed (not range or prefix) and not found remotely - an error
 			if !cos.IsNotExist(err, ecode) || lrit.lrp == lrpList {
@@ -351,7 +394,7 @@ func (r *prefetch) blobdl(lom *core.LOM, oa *cmn.ObjAttrs) (int, error) {
 	// bucket auto-chunking has already taken precedence in prfFactory.Start
 	params := &core.BlobParams{
 		Lom:     &core.LOM{ObjName: lom.ObjName},
-		Context: r.Context(),
+		Context: r.BackendCtx(), // stop range reads while the iterator is still unwinding
 		Msg: &apc.BlobMsg{
 			ChunkSize:  r.msg.BlobChunkSize,
 			NumWorkers: r.msg.BlobNumWorkers,

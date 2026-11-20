@@ -101,11 +101,16 @@ type (
 		fileListObj   string // object on the configured cluster containing object names to use
 		numVirtDirs   uint64 // spread generated objects across that many virtual subdirectories (< 100k or "%05x")
 		randomObjName bool   // generate random 32-char object names
+		listOut       string // object URI to write the listed object names to, then exit
 		skipList      bool   // skip listing bucket before 100% PUT workload
 
 		// resolved file-list object
 		fileListBck     cmn.Bck
 		fileListObjName string
+
+		// resolved if listOut is set
+		listOutBck     cmn.Bck
+		listOutObjName string
 	}
 
 	// Read operation configuration
@@ -115,7 +120,7 @@ type (
 		readLen        int64  // read range length (bytes, 0 = full object)
 		readOff        int64  // read range offset (bytes)
 		readOffRandom  bool   // random read range offset per GET (-readoff=random)
-		evictBatchSize int    // batch size for list and evict operations
+		evictBatchSize int    // batch size for deleting objects PUT by the run on cleanup
 		getBatchSize   int    // use GetBatch API instead of GetObject (ML workloads)
 		latest         bool   // check metadata and GET latest version from remote bucket
 		cached         bool   // list only cached objects from remote bucket
@@ -152,10 +157,14 @@ type (
 
 	// Loader instance identification for fleet coordination
 	loaderParams struct {
-		loaderID        string // unique identifier for this loader instance
-		loaderCnt       uint64 // total number of concurrent loader instances
-		loaderIDHashLen uint   // bit length of generated loader ID (0-63)
-		getLoaderID     bool   // print loader ID and exit
+		loaderID        StringExt // unique identifier for this loader instance
+		loaderCnt       uint64    // total number of concurrent loader instances
+		loaderIDHashLen uint      // bit length of generated loader ID (0-63)
+		getLoaderID     bool      // print loader ID and exit
+		splitReads      bool      // read only this loader's share of object names (requires loaderCnt)
+
+		// resolved if loaderCnt > 0
+		loaderIdx uint64 // numeric loaderID in [0, loaderCnt)
 	}
 
 	// Statistics and monitoring configuration
@@ -175,7 +184,7 @@ type (
 
 	// Miscellaneous (cleanup, dry-run, et al.)
 	miscParams struct {
-		cleanUp    BoolExt // destroy/empty bucket on termination
+		cleanUp    BoolExt // remove run-created objects/bucket on termination
 		stoppable  bool    // allow termination via Ctrl-C
 		dryRun     bool    // print config and exit without running
 		traceHTTP  bool    // trace HTTP request latencies
@@ -274,6 +283,7 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 		"when true, generate object names of 32 random characters. This option is ignored when loadernum is defined")
 	f.StringVar(&p.fileList, "filelist", "", "local or locally-accessible text file containing object names (for subsequent reading)")
 	f.StringVar(&p.fileListObj, "filelist-obj", "", "object URI of a list of object names to read, one per line (fetched through AIS)")
+	f.StringVar(&p.listOut, "list-out", "", "object URI to write listed object names to, one per line, and exit")
 	f.BoolVar(&p.skipList, "skiplist", false, "when true, skip listing objects in a bucket before running 100% PUT workload")
 
 	// ============ Read operations ============
@@ -285,7 +295,7 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 	f.BoolVar(&p.cached, "cached", false, "list in-cluster objects - only those objects from a remote bucket that are present (\"cached\")")
 	f.BoolVar(&p.listDirs, "list-dirs", false, "list virtual subdirectories (remote buckets only)")
 	f.BoolVar(&p.useNBI, "nbi", false, "list via native bucket inventory (NBI) snapshot (remote buckets only); the inventory must already exist - aisloader does not create it (see docs/nbi.md)")
-	f.IntVar(&p.evictBatchSize, "evict-batchsize", 1000, "batch size to list and evict the _next_ batch of remote objects")
+	f.IntVar(&p.evictBatchSize, "evict-batchsize", 1000, "batch size for deleting objects PUT by this run on cleanup ('-cleanup=true')")
 	f.BoolVar(&p.continueOnErr, "cont-on-err", false, "GetBatch: ignore missing files and/or objects - include them under \"__404__/\" prefix and keep going")
 
 	// ============ Multipart ============
@@ -302,11 +312,13 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 	f.StringVar(&p.etlSpecPath, "etl-spec", "", "path to an ETL spec to be applied to each object on GET request.")
 
 	// ============ Loader instance ============
-	f.StringVar(&p.loaderID, "loaderid", "0", "ID to identify a loader among multiple concurrent instances")
+	StringExtVar(f, &p.loaderID, "loaderid", "0", "ID to identify a loader among multiple concurrent instances")
 	f.Uint64Var(&p.loaderCnt, "loadernum", 0,
 		"total number of aisloaders running concurrently and generating combined load. If defined, must be greater than the loaderid and cannot be used together with loaderidhashlen")
 	f.UintVar(&p.loaderIDHashLen, "loaderidhashlen", 0,
 		"Size (in bits) of the generated aisloader identifier. Cannot be used together with loadernum")
+	f.BoolVar(&p.splitReads, "split-reads", false,
+		"when true, each loader only GETs a share of the object names; requires '-loaderid' and '-loadernum'")
 	f.BoolVar(&p.getLoaderID, "getloaderid", false,
 		"when true, print stored/computed unique loaderID aka aisloader identifier and exit")
 
@@ -320,7 +332,7 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 	f.BoolVar(&p.jsonFormat, "json", false, "when true, print output in JSON format")
 
 	// ============ Miscellaneous ============
-	BoolExtVar(f, &p.cleanUp, "cleanup", "when true, remove bucket upon benchmark termination (must be specified for AIStore buckets)")
+	BoolExtVar(f, &p.cleanUp, "cleanup", "when true, delete objects PUT by this run and destroy the bucket only if this run created it; required with '-bucket'")
 	f.StringVar(&p.configPath, "config", "", "load runtime settings from a YAML file; explicit CLI flags take precedence")
 	f.BoolVar(&p.stoppable, "stoppable", false, "when true, stop upon CTRL-C")
 	f.BoolVar(&p.dryRun, "dry-run", false, "when true, show the configuration and parameters that aisloader will use for benchmark")
@@ -361,24 +373,30 @@ func initParams(p *params) (err error) {
 			s3Endpoint = ep
 		}
 	}
+	if p.listOut != "" {
+		// '-list-out' only lists and exits: benchmark run options do not apply
+		err = p.validateListOut()
+	} else {
+		err = p.initRunParams()
+	}
+	if err != nil {
+		return err
+	}
+	return p.initClient()
+}
+
+// parse/validate benchmark run options
+func (p *params) initRunParams() (err error) {
 	if p.bck.Name != "" {
 		if p.cleanUp.Val && isDirectS3() {
 			return errors.New("direct S3 access via '-s3endpoint': option '-cleanup' is not supported yet")
 		}
 		if !p.cleanUp.IsSet && !isDirectS3() {
-			fmt.Println("\nNote: `-cleanup` is a required option. Beware! When -cleanup=true the bucket will be destroyed upon completion of the benchmark.")
+			fmt.Println("\nNote: `-cleanup` is a required option. Beware! When -cleanup=true, the bucket or objects created by this run will be deleted!")
 			fmt.Println("      Specify `--cleanup=false` on the command line or `cleanup: false` in the config file.")
 			os.Exit(1)
 		}
 	}
-
-	if p.seed == 0 {
-		p.seed = mono.NanoTime()
-	}
-	rnd = rand.New(cos.NewRandSource(uint64(p.seed)))
-	// separate stream with a different seed: '-readoff=random' must not alter the (seeded) sequence
-	// of selected objects, nor repeat its draws (that would tie each object to a narrow range of offsets)
-	readOffRnd = rand.New(cos.NewRandSource(uint64(p.seed) + 1))
 
 	//
 	// parse sizes
@@ -430,6 +448,14 @@ func initParams(p *params) (err error) {
 		return err
 	}
 
+	if p.seed == 0 {
+		p.seed = mono.NanoTime()
+	}
+	rnd = rand.New(cos.NewRandSource(uint64(p.seed)))
+	// separate stream with a different seed: '-readoff=random' must not alter the (seeded) sequence
+	// of selected objects, nor repeat its draws (that would tie each object to a narrow range of offsets)
+	readOffRnd = rand.New(cos.NewRandSource(uint64(p.seed) + 1))
+
 	if p.bPropsStr != "" {
 		var bprops cmn.Bprops
 		jsonStr := strings.TrimRight(p.bPropsStr, ",")
@@ -478,7 +504,11 @@ func initParams(p *params) (err error) {
 			}
 		}
 	}
+	return nil
+}
 
+// initialize the AIS endpoint and HTTP client
+func (p *params) initClient() error {
 	var useHTTPS bool
 	if !isDirectS3() {
 		// AIS endpoint: http://ip:port _or_ AIS_ENDPOINT env
@@ -550,6 +580,28 @@ func (p *params) noWorkload() bool {
 	return p.duration.Val == 0 && p.putSizeUpperBound == 0 && p.numEpochs == 0 && !p.stoppable
 }
 
+// flags that can make PUT object names repeat across runs
+func (p *params) repeatableNameFlags() (flags []string) {
+	if p.putPct == 0 {
+		return nil
+	}
+	// counter-based names
+	if !p.randomObjName {
+		flags = append(flags, "-randomname=false")
+	}
+	if p.loaderCnt > 0 {
+		flags = append(flags, "-loadernum")
+	}
+	if p.loaderIDHashLen > 0 {
+		flags = append(flags, "-loaderidhashlen")
+	}
+	// seeded random names repeat when re-run with the same seed
+	if p.seed != 0 {
+		flags = append(flags, "-seed")
+	}
+	return flags
+}
+
 func _parseSize(valueStr, name string, defaultVal int64) (int64, error) {
 	if valueStr == "" {
 		return defaultVal, nil
@@ -582,6 +634,15 @@ func (p *params) validate() error {
 	}
 	if p.updateExistingPct < 0 || p.updateExistingPct > 100 {
 		return fmt.Errorf("invalid %d percentage of GET requests that are followed by a PUT \"update\"", p.updateExistingPct)
+	}
+	if p.cleanUp.Val {
+		if p.evictBatchSize <= 0 {
+			return fmt.Errorf("invalid option: evict-batchsize %d (must be > 0 with '-cleanup=true')", p.evictBatchSize)
+		}
+	}
+
+	if p.numWorkers <= 0 {
+		return fmt.Errorf("invalid option: numworkers %d (must be > 0)", p.numWorkers)
 	}
 
 	if cargs.IdleConnsPerHost < 0 {
@@ -712,11 +773,11 @@ func (p *params) validate() error {
 		return fmt.Errorf("invalid option: stats show interval %d", p.statsShowInterval)
 	}
 
-	if p.loaderID == "" {
+	if p.loaderID.Val == "" {
 		return errors.New("loaderID can't be empty")
 	}
 
-	loaderID, parseErr := strconv.ParseUint(p.loaderID, 10, 64)
+	loaderID, parseErr := strconv.ParseUint(p.loaderID.Val, 10, 64)
 	if p.loaderCnt == 0 && p.loaderIDHashLen == 0 {
 		if p.randomObjName {
 			useRandomObjName = true
@@ -742,26 +803,32 @@ func (p *params) validate() error {
 			}
 
 			suffixIDMaskLen = ceilAlign(p.loaderIDHashLen, 4)
-			suffixID = getIDFromString(p.loaderID, suffixIDMaskLen)
+			suffixID = getIDFromString(p.loaderID.Val, suffixIDMaskLen)
 		} else {
 			// p.loaderCnt > 0
 			if parseErr != nil {
 				return errors.New("loadername has to be a number when using loadernum")
 			}
-			if loaderID > p.loaderCnt {
+			if loaderID >= p.loaderCnt {
 				return errors.New("loaderid has to be smaller than loadernum")
 			}
 
+			p.loaderIdx = loaderID
 			suffixIDMaskLen = loaderMaskFromTotalLoaders(p.loaderCnt)
 			suffixID = loaderID
 		}
 	}
-
-	if p.subDir != "" {
-		p.subDir = filepath.Clean(p.subDir)
-		if p.subDir[0] == '/' {
-			return errors.New("object name prefix can't start with /")
+	if p.splitReads {
+		if !p.loaderID.IsSet || p.loaderCnt == 0 {
+			return errors.New("'-split-reads' requires both '-loaderid' and '-loadernum'")
 		}
+		if p.putPct == 100 {
+			return errors.New("'-split-reads' requires a workload that reads ('-pctput' below 100)")
+		}
+	}
+
+	if err := p.cleanSubdir(); err != nil {
+		return err
 	}
 
 	if p.numVirtDirs >= 100_000 {
@@ -857,5 +924,34 @@ func (p *params) validate() error {
 		}
 	}
 
+	return nil
+}
+
+// '-subdir': object name prefix for both listing and PUTs
+func (p *params) cleanSubdir() error {
+	if p.subDir == "" {
+		return nil
+	}
+	p.subDir = filepath.Clean(p.subDir)
+	if p.subDir[0] == '/' {
+		return errors.New("object name prefix can't start with /")
+	}
+	return nil
+}
+
+// listing options that apply to remote buckets only
+func (p *params) validateListFlags(bck cmn.Bck) error {
+	if bck.IsRemote() {
+		return nil
+	}
+	if p.cached {
+		return fmt.Errorf(cachedText+"applies to remote buckets only (have %s)", bck.Cname(""))
+	}
+	if p.listDirs {
+		return fmt.Errorf("--list-dirs option applies to remote buckets only (have %s)", bck.Cname(""))
+	}
+	if p.useNBI {
+		return fmt.Errorf("--nbi option applies to remote buckets only (have %s)", bck.Cname(""))
+	}
 	return nil
 }

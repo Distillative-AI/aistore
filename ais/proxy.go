@@ -22,6 +22,7 @@ import (
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/env"
+	"github.com/NVIDIA/aistore/cmd/authn/tok"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/atomic"
@@ -30,7 +31,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/k8s"
-	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
@@ -74,12 +74,7 @@ type (
 
 		notifs notifs
 
-		remais struct {
-			old []*meta.RemAis // to facilitate a2u resolution (and, therefore, offline access)
-			meta.RemAisVec
-			mu sync.RWMutex
-			in atomic.Bool
-		}
+		remais remaisCache
 
 		settingNewPrimary atomic.Bool // when executing "set new primary" request (transition)
 
@@ -115,11 +110,18 @@ func (p *proxy) iniPrimaryState() {
 func (p *proxy) init(config *cmn.Config) {
 	p.initPhase1(config)
 
-	// (a) get node ID from command-line or env var (see envDaemonID())
-	// (b) load existing ID from config file stored under local config `confdir` (compare w/ target)
-	// (c) generate a new one (genDaemonID())
+	// (a) get node ID from command-line or env var (see envDaemonID()); outside K8s, must match (b) if exists
+	// (b) outside K8s: load existing ID from the file stored under local config `confdir` (compare w/ target)
+	// (c) K8s: retain legacy MY_NODE-derived ID when local Smap records it
+	// (d) derive node ID from K8s pod identity, when requested (see podDaemonID())
+	// (e) K8s: hash K8s node name
+	// (f) generate a new one (genDaemonID())
 	// - in that sequence
-	pid := initPID(config)
+	// - persist outside K8s only; K8s IDs get recomputed at every startup
+	pid, err := initPID(config)
+	if err != nil {
+		cos.ExitLog(err) // FATAL
+	}
 
 	keyPair := p.newKeyPair(pid, apc.Proxy)
 	p.si.Init(pid, apc.Proxy, keyPair.VerifyingKey)
@@ -155,49 +157,93 @@ func (p *proxy) init(config *cmn.Config) {
 	p.ec.init()
 }
 
-func initPID(config *cmn.Config) string {
-	// 1. ID from env
-	if pid := envDaemonID(apc.Proxy); pid != "" {
-		if err := cos.ValidateDaemonID(pid); err != nil {
-			nlog.Errorln("Daemon ID loaded from env is invalid:", err)
+// select a proxy ID and persist it outside K8s
+func initPID(config *cmn.Config) (string, error) {
+	var (
+		pid    = envDaemonID(apc.Proxy)
+		src    string
+		loaded string
+	)
+	// K8s proxies have no pod <=> node affinity
+	if !k8s.IsK8s() {
+		var err error
+		if loaded, err = readProxyID(config); err != nil {
+			return "", err
 		}
-		nlog.Infoln("Initialized", meta.Pname(pid), "from env")
-		return pid
 	}
-
-	// 2. ID from Kubernetes Node name.
-	if k8s.IsK8s() {
-		pid := cos.HashK8sProxyID(k8s.NodeName)
-		nlog.Infoln("Initialized", meta.Pname(pid), "from K8s node nam", k8s.NodeName)
-		return pid
+	if pid != "" {
+		if err := cos.ValidateDaemonID(pid); err != nil {
+			return "", fmt.Errorf("invalid proxy ID from command-line or env: %w", err)
+		}
+		if loaded != "" && loaded != pid {
+			return "", fmt.Errorf("proxy ID mismatch: %q (command-line or env) vs %q (%s)", pid, loaded, fname.ProxyID)
+		}
+		src = "command-line or env"
+	} else {
+		if loaded != "" {
+			nlog.Infof("Initialized %s from file %q", meta.Pname(loaded), fname.ProxyID)
+			return loaded, nil
+		}
+		if pid = _loadPre53PID(config); pid != "" {
+			src = "legacy K8s ID recorded in Smap"
+		} else if pid = podDaemonID(apc.Proxy); pid != "" {
+			src = "K8s pod identity"
+		} else if k8s.IsK8s() {
+			pid = cos.HashK8sProxyID(k8s.NodeName)
+			src = "K8s node name " + k8s.NodeName
+		} else {
+			pid = genDaemonID(apc.Proxy, config)
+			debug.AssertNoErr(cos.ValidateDaemonID(pid))
+			src = "randomly generated ID"
+		}
 	}
-
-	// 3. Read ID from persistent file.
-	if pid := readProxyID(config); pid != "" {
-		nlog.Infof("Initialized %s from file %q", meta.Pname(pid), fname.ProxyID)
-		return pid
+	if !k8s.IsK8s() {
+		if err := os.WriteFile(filepath.Join(config.ConfigDir, fname.ProxyID), []byte(pid), cos.PermRWR); err != nil {
+			return "", fmt.Errorf("failed to persist %s: %w", meta.Pname(pid), err)
+		}
 	}
-
-	// 4. initial deployment
-	pid := genDaemonID(apc.Proxy, config)
-	err := cos.ValidateDaemonID(pid)
-	debug.AssertNoErr(err)
-
-	// store ID on disk
-	if err := os.WriteFile(filepath.Join(config.ConfigDir, fname.ProxyID), []byte(pid), cos.PermRWR); err != nil {
-		cos.ExitLog("failed to write PID:", err, "[", meta.Pname(pid), "]")
-	}
-	nlog.Infoln("Initialized", meta.Pname(pid), "from randomly generated ID")
-	return pid
+	nlog.Infoln("Initialized", meta.Pname(pid), "from", src)
+	return pid, nil
 }
 
-func readProxyID(config *cmn.Config) (pid string) {
-	if b, err := os.ReadFile(filepath.Join(config.ConfigDir, fname.ProxyID)); err == nil {
-		pid = string(b)
-	} else if !cos.IsNotExist(err) {
-		nlog.Errorln(err)
+// K8s: return legacy MY_NODE-derived ID if local Smap records it (and does not record the pod-derived one)
+// - same as pre-5.3: proxy ID follows K8s node, whichever pod runs there (and at whichever IP)
+func _loadPre53PID(config *cmn.Config) string {
+	if !k8s.IsK8s() {
+		return ""
 	}
-	return pid
+	smap, err := _loadSmap(filepath.Join(config.ConfigDir, fname.Smap))
+	if err != nil {
+		return ""
+	}
+
+	source, _ := podIDSource()
+	pod, ns := os.Getenv(env.AisK8sPod), os.Getenv(env.AisK8sNamespace)
+	if scope, ok := parsePodIDSource(source); ok && pod != "" && ns != "" {
+		if smap.GetProxy(derivePodID(apc.Proxy, ns, pod, scope)) != nil {
+			return ""
+		}
+	}
+	if pid := cos.HashK8sProxyID(k8s.NodeName); smap.GetProxy(pid) != nil {
+		return pid
+	}
+	return ""
+}
+
+func readProxyID(config *cmn.Config) (string, error) {
+	fpath := filepath.Join(config.ConfigDir, fname.ProxyID)
+	b, err := os.ReadFile(fpath)
+	if err != nil {
+		if cos.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to read proxy ID %q: %w", fpath, err)
+	}
+	pid := string(b)
+	if err := cos.ValidateDaemonID(pid); err != nil {
+		return "", fmt.Errorf("invalid proxy ID in %q: %w", fpath, err)
+	}
+	return pid, nil
 }
 
 func (p *proxy) pready(smap *smapX, withRR bool /* also check readiness to rebalance */) error {
@@ -246,7 +292,6 @@ func (p *proxy) Run() error {
 		nlog.Infoln(cmn.NetIntraData+":", "\t", p.si.DataNet.URL)
 	}
 
-	p.initDsort(config) // note: conditional linkage
 	return p.htrun.run(config)
 }
 
@@ -307,9 +352,9 @@ func (p *proxy) initRecvHandlers() {
 
 		// plus:
 		// - PromHandler() at "/metrics" (see ais/htrun)
-		// - dsortHandler
+		// - dsort stub (removed; see ais/dsort_hdl_stub.go)
 	)
-	networkHandlers = p.regDsort(networkHandlers)
+	networkHandlers = p.regDsortStub(networkHandlers)
 	p.regNetHandlers(networkHandlers)
 }
 
@@ -1133,7 +1178,7 @@ func (p *proxy) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *ap
 		ecode, e = bckArgs.init()
 		if e != nil {
 			if ecode != http.StatusNotFound && !cmn.IsErrRemoteBckNotFound(e) {
-				p.writeErr(w, r, e, ecode)
+				p.writeErr(w, r, tok.NoTokenToHTTP(r, e), ecode)
 			}
 		}
 	} else {
@@ -1598,7 +1643,7 @@ func (p *proxy) httpbckput(w http.ResponseWriter, r *http.Request) {
 }
 
 // +gen:endpoint POST /v1/buckets/{bucket-name}[apc.QparamProvider=string,apc.QparamNamespace=string,\
-// apc.QparamBckTo=string,apc.QparamDontHeadRemote=bool] \
+// apc.QparamBckTo=string,apc.QparamDontHeadRemote=bool,apc.QparamTID=string] \
 // action=[apc.ActCreateBck=cmn.BpropsToSet|\
 // apc.ActMoveBck=apc.ActMsg|\
 // apc.ActCopyBck=apc.TCBMsg|\
@@ -1652,8 +1697,8 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 		errPrependSync  = "prepend option (%q) is incompatible with the request to synchronize buckets"
 	)
 	var (
-		query    = r.URL.Query()
-		bck, err = newBckFromQ(bucket, query, nil)
+		query, qerr = url.ParseQuery(r.URL.RawQuery) // r.URL.Query() that keeps the parsing error
+		bck, err    = newBckFromQ(bucket, query, nil)
 	)
 	if err != nil {
 		p.writeErr(w, r, err)
@@ -1887,7 +1932,12 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 			ns := query.Get(apc.QparamNamespace)
 			debug.Assertf(!strings.Contains(ns, "remais"), "query has alias: bck=%s, ns=%s", bck, ns)
 		})
-		if xid, err = p.bcastBckAction(r.Method, bucket, msg, query); err != nil {
+		// malformed pairs are dropped from the query; a dropped target ID would widen the selection
+		if qerr != nil {
+			p.writeErr(w, r, qerr)
+			return
+		}
+		if xid, err = p.prefetch(bucket, msg, query); err != nil {
 			p.writeErr(w, r, err)
 			return
 		}
@@ -2667,6 +2717,172 @@ func (p *proxy) listBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.Qu
 	}
 }
 
+// run prefetch on the selected targets, if any; otherwise, on all active targets
+func (p *proxy) prefetch(bucket string, msg *apc.ActMsg, query url.Values) (string, error) {
+	tids := query[apc.QparamTID] // one value per target: tid=t1&tid=t2
+	if len(tids) == 0 {
+		return p._prefetchDT(bucket, msg, query)
+	}
+	query.Del(apc.QparamTID) // used by the proxy only; not forwarded to targets
+
+	var (
+		smap    = p.owner.smap.get()
+		targets = make(meta.NodeMap, len(tids))
+	)
+	for _, tid := range tids {
+		if targets.Contains(tid) {
+			return "", fmt.Errorf("duplicate prefetch target %q", tid)
+		}
+		tsi := smap.GetTarget(tid)
+		if tsi == nil {
+			return "", fmt.Errorf("cannot prefetch: %q is not a target", tid)
+		}
+		if tsi.InMaintOrDecomm() {
+			return "", cmn.NewErrXactTgtInMaint(msg.Action, tsi.StringEx())
+		}
+		targets[tid] = tsi
+	}
+	var (
+		actMsgExt = p.newAmsg(msg, nil, cos.GenUUID())
+		body      = cos.MustMarshal(actMsgExt)
+		path      = apc.URLPathBuckets.Join(bucket)
+	)
+	nlb := xact.NewXactNL(actMsgExt.UUID, actMsgExt.Action, &smap.Smap, targets)
+	nlb.SetOwner(equalIC)
+	p.ic.registerEqual(regIC{smap: smap, query: query, nl: nlb})
+	args := allocBcArgs()
+	{
+		args.req = cmn.HreqArgs{Method: http.MethodPost, Path: path, Query: query, Body: body}
+		args.smap = smap
+		args.network = cmn.NetIntraControl
+		args.selected = targets.ActiveNodes()
+		args.nodeCount = len(targets)
+		args.timeout = apc.DefaultTimeout
+	}
+	results := p.bcastSelected(args)
+	freeBcArgs(args)
+	var err error
+	for _, res := range results {
+		if res.err == nil {
+			continue
+		}
+		err = res.errorf("%s failed to %q List/Range", res.si, msg.Action)
+		break
+	}
+	freeBcastRes(results)
+	return actMsgExt.UUID, err
+}
+
+// prefetch on all active targets - two-phase startup (compare with x-moss in ais/ml.go):
+// - select designated target (DT): HRW(xid)
+// - phase 1: start all other targets (receivers)
+// - phase 2: start DT (sender)
+// - targets learn DT via apc.QparamTID and verify same Smap
+// - abort all on failure; fail on mixed node versions
+// (user-selected targets, if any: single bcast and no DT - see above)
+func (p *proxy) _prefetchDT(bucket string, msg *apc.ActMsg, query url.Values) (string, error) {
+	smap := p.owner.smap.get()
+	if smap.CountActiveTs() <= 1 {
+		return p.bcastBckAction(http.MethodPost, bucket, msg, query)
+	}
+	var (
+		actMsgExt = p.newAmsg(msg, nil, cos.GenUUID())
+		xid       = actMsgExt.UUID
+		dt, err   = smap.HrwTargetTask(xid)
+	)
+	if err != nil {
+		return "", err
+	}
+	nlb := xact.NewXactNL(xid, actMsgExt.Action, &smap.Smap, nil)
+	nlb.SetOwner(equalIC)
+	p.ic.registerEqual(regIC{smap: smap, query: query, nl: nlb})
+
+	query.Set(apc.QparamTID, dt.ID())
+	var (
+		active = smap.Tmap.ActiveNodes()
+		hreq   = cmn.HreqArgs{
+			Method: http.MethodPost,
+			Path:   apc.URLPathBuckets.Join(bucket),
+			Query:  query,
+			Body:   cos.MustMarshal(actMsgExt),
+		}
+	)
+
+	// phase 1: all other targets
+	selected := make(meta.Nodes, 0, len(active)-1)
+	for _, tsi := range active {
+		if tsi.ID() != dt.ID() {
+			selected = append(selected, tsi)
+		}
+	}
+	args := allocBcArgs()
+	{
+		args.req = hreq
+		args.smap = smap
+		args.network = cmn.NetIntraControl
+		args.selected = selected
+		args.nodeCount = len(selected)
+		args.timeout = apc.DefaultTimeout
+	}
+	results := p.bcastSelected(args)
+	freeBcArgs(args)
+	for _, res := range results {
+		if err = p._prfStarted(res, msg.Action, "phase 1"); err != nil {
+			break
+		}
+	}
+	freeBcastRes(results)
+	if err != nil {
+		p._prfAbort(xid, smap, active, err)
+		return xid, err
+	}
+
+	// phase 2: DT
+	cargs := allocCargs()
+	{
+		cargs.si = dt
+		cargs.req = hreq
+		cargs.timeout = apc.DefaultTimeout
+	}
+	res := p.call(cargs, smap)
+	err = p._prfStarted(res, msg.Action, "phase 2: DT")
+	freeCR(res)
+	freeCargs(cargs)
+	if err != nil {
+		p._prfAbort(xid, smap, active, err)
+	}
+	return xid, err
+}
+
+// check call result and node version (two-phase startup)
+func (p *proxy) _prfStarted(res *callResult, action, phase string) error {
+	if res.err != nil {
+		return res.errorf("%s failed to %q [%s]", res.si, action, phase)
+	}
+	return p.checkPeerVer(res, action)
+}
+
+func (p *proxy) _prfAbort(xid string, smap *smapX, active meta.Nodes, cause error) {
+	nlog.Errorln(p.String(), "aborting two-phase startup", xact.Cname(apc.ActPrefetchObjects, xid), "[", cause, "]")
+
+	msg := apc.ActMsg{
+		Action: apc.ActXactStop,
+		Value:  xact.ArgsMsg{ID: xid, Kind: apc.ActPrefetchObjects},
+	}
+	args := allocBcArgs()
+	{
+		args.req = cmn.HreqArgs{Method: http.MethodPut, Path: apc.URLPathXactions.S, Body: cos.MustMarshal(&msg)}
+		args.smap = smap
+		args.network = cmn.NetIntraControl
+		args.selected = active
+		args.nodeCount = len(active)
+		args.timeout = cmn.Rom.MaxKeepalive()
+		args.noResults = true
+	}
+	p.bcastSelected(args)
+	freeBcArgs(args)
+}
+
 func (p *proxy) bcastBckAction(method, bucket string, msg *apc.ActMsg, query url.Values) (xid string, err error) {
 	var (
 		smap      = p.owner.smap.get()
@@ -2799,6 +3015,9 @@ func (p *proxy) httpdaeget(w http.ResponseWriter, r *http.Request) {
 			p.writeJSON(w, r, ds, what)
 		}
 
+	case apc.WhatRemoteAIS:
+		p.writeJSON(w, r, p._remaisCopy(), what)
+
 	case apc.WhatSysInfo:
 		p.writeJSON(w, r, apc.GetMemCPU(), what)
 
@@ -2826,7 +3045,7 @@ func (p *proxy) httpdaeget(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if checkReady := r.Header.Get(apc.HdrReadyToJoinClu); checkReady != "" {
-			if err := p.readyToJoinClu(smap); err != nil {
+			if err := p.readyToJoinClu(r, smap); err != nil {
 				p.writeErr(w, r, err)
 				return
 			}
@@ -2837,17 +3056,20 @@ func (p *proxy) httpdaeget(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *proxy) readyToJoinClu(smap *smapX) error {
+func (p *proxy) readyToJoinClu(r *http.Request, smap *smapX) error {
 	switch {
 	case !smap.IsPrimary(p.si):
 		return newErrNotPrimary(p.si, smap)
 	case cmn.GCO.Get().Rebalance.Enabled && smap.CountTargets() > 1:
-		return errors.New(p.String() +
-			": destination cluster has rebalance enabled; disable global rebalance on the destination cluster for the duration of the critical force-join operation")
+		return newErrNotReadyToJoin(r, errors.New(p.String()+
+			": destination cluster has rebalance enabled; disable global rebalance on the destination cluster for the duration of the critical force-join operation"))
 	case nlog.Stopping():
 		return p.errStopping()
 	}
-	return p.pready(smap, true)
+	if err := p.pready(smap, true); err != nil {
+		return newErrNotReadyToJoin(r, err)
+	}
+	return nil
 }
 
 // +gen:endpoint PUT /v1/daemon[apc.QparamForce=bool]
@@ -3068,87 +3290,8 @@ func (p *proxy) receiveConfig(newConfig *globalConfig, msg *actMsgExt, payload m
 		return // nothing to do
 	}
 
-	go p._remais(&newConfig.ClusterConfig, false)
+	go p.remaisRefresh(&newConfig.ClusterConfig)
 	return
-}
-
-// refresh local p.remais cache via intra-cluster call to a random target
-// NOTE:
-// - best-effort: provides eventual consistency for remote-AIS metadata
-// TODO:
-// - split blocking path to proceed without retry loops
-// - return the current version and/or error (or success flag)
-// - make remais.Ver atomic
-func (p *proxy) _remais(newConfig *cmn.ClusterConfig, blocking bool) {
-	const maxretries = 5
-	if !p.remais.in.CAS(false, true) {
-		return
-	}
-	var (
-		sleep      time.Duration
-		retries    = maxretries
-		warn       string
-		over, nver int64
-	)
-	if blocking {
-		retries = 1
-	} else {
-		sleep = newConfig.Timeout.CplaneOperation.D()
-		maxsleep := newConfig.Timeout.MaxKeepalive.D()
-		if uptime := p.keepalive.cluUptime(mono.NanoTime()); uptime < maxsleep {
-			sleep = 2 * maxsleep
-		}
-	}
-	for ; retries > 0; retries-- {
-		if !blocking {
-			time.Sleep(sleep)
-		}
-		all, err := p.getRemAisVec(false /*refresh*/)
-		if err != nil {
-			if retries < maxretries {
-				nlog.Errorf("%s: failed to get remais (%d attempts)", p, retries-1)
-			}
-			continue
-		}
-		p.remais.mu.Lock()
-		if over <= 0 {
-			over = p.remais.Ver
-		}
-		if p.remais.Ver < all.Ver {
-			// keep old/detached clusters to support access to existing ("cached") buckets
-			// i.e., the ability to resolve remote alias to Ns.UUID (see p.a2u)
-			for _, a := range p.remais.RemAisVec.A {
-				var found bool
-				for _, b := range p.remais.old {
-					if b.UUID == a.UUID {
-						*b = *a
-						found = true
-						break
-					}
-					if b.Alias == a.Alias {
-						warn = fmt.Sprintf("duplicated remais alias: (%q, %q) vs (%q, %q)", a.UUID, a.Alias, b.UUID, b.Alias)
-					}
-				}
-				if !found {
-					p.remais.old = append(p.remais.old, a)
-				}
-			}
-
-			p.remais.RemAisVec = *all
-			nver = p.remais.Ver
-			p.remais.mu.Unlock()
-			break
-		}
-		p.remais.mu.Unlock()
-		nlog.Errorf("%s: retrying remais ver=%d (%d attempts)", p, all.Ver, retries-1)
-		sleep = newConfig.Timeout.CplaneOperation.D()
-	}
-
-	p.remais.in.Store(false)
-	if warn != "" {
-		nlog.Warningln(warn)
-	}
-	nlog.Infof("%s: remais v%d => v%d", p, over, nver)
 }
 
 func (p *proxy) receiveRMD(newRMD *rebMD, msg *actMsgExt, sender string) error {

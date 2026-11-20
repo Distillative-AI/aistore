@@ -443,9 +443,7 @@ func TestBlobDownloadParentCancellation(t *testing.T) {
 		snaps, err = api.WaitForSnaps(bp, xargs, blobdlFinished)
 		tassert.CheckFatal(t, err)
 		tassert.Fatalf(t, len(snaps[tid]) == 1, "expected blob download %s on %s", xargs.ID, tid)
-		// parent's abort reaches the child two ways - whichever comes first:
-		// - context cancellation (the child's context derives from the parent's)
-		// - explicit abort (see xs/prefetch pebl)
+		// the child can finish on I/O cancellation before prefetch explicitly aborts it
 		fin := snaps[tid][0]
 		tassert.Fatalf(t, fin.AbortedX || strings.Contains(fin.Err, context.Canceled.Error()),
 			"expected blob download aborted or context-canceled, got err=%q, abort-err=%q", fin.Err, fin.AbortErr)
@@ -862,7 +860,7 @@ func testBlobDownloadLatestVersion(t *testing.T, latest bool) {
 	m.validateChunksOnDisk(bck, objName, int(objSize/chunkSize))
 }
 
-func TestBlobDownloadRemoteAISReadTimeout(t *testing.T) {
+func TestBlobDownloadRemaisReadTimeout(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{RequiresRemoteCluster: true})
 	const objSize = 2 * cmn.ChunkSizeMin
 	var (
@@ -1912,15 +1910,13 @@ func TestRemaisBlobDownloadVersionPin(t *testing.T) {
 	backend.Set(apc.AIS, cmn.BackendConfAIS{"pin-" + trand.String(8): []string{bridge.URL}})
 	t.Cleanup(func() {
 		tlog.Logfln("restoring backend config")
-		err := api.SetClusterConfigUsingMsg(bp, &cmn.ConfigToSet{Backend: &config.Backend}, false)
-		tassert.CheckError(t, err)
-		if err == nil {
-			// give proxies time to refresh the restored route before closing the bridge
-			time.Sleep(2 * config.Timeout.CplaneOperation.D())
-		}
+		setRemaisBackend(t, bp, &config.Backend)
 	})
 	tlog.Logfln("routing remote requests through %s", bridge.URL)
-	tassert.CheckFatal(t, api.SetClusterConfigUsingMsg(bp, &cmn.ConfigToSet{Backend: &backend}, false))
+	setRemaisBackend(t, bp, &backend)
+	if t.Failed() {
+		t.FailNow()
+	}
 
 	msg := &apc.BlobMsg{ChunkSize: chunkSize, NumWorkers: 2}
 	// pin v1, then change the source between ranges

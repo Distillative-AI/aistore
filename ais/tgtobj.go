@@ -67,11 +67,11 @@ type (
 		restful     bool          // being invoked via RESTful API
 		t2t         bool          // by another target
 		skipEC      bool          // do not erasure-encode when finalizing
+		keepWork    bool          // keep workFQN on error (the caller removes it or rolls back)
 		skipVC      bool          // skip loading existing Version and skip comparing Checksums (skip VC)
 		skipBackend bool          // don't write to backend (e.g., cold-GET caching, rechunk)
 		locked      bool          // true if the LOM is already locked by the caller
 		remoteErr   bool          // to exclude `putRemote` errors when counting soft IO errors
-		condWrite   bool          // forwarding client write conditions to the backend (see core.Backend.CondWrite)
 	}
 
 	getOI struct {
@@ -87,7 +87,6 @@ type (
 		ranges     byteRanges // range read (see https://www.rfc-editor.org/rfc/rfc7233#section-2.1)
 		atime      int64      // access time.Now()
 		ltime      int64      // mono.NanoTime, to measure latency
-		chunked    bool       // chunked transfer (en)coding: https://tools.ietf.org/html/rfc7230#page-36
 		unlocked   bool       // internal
 		verchanged bool       // version changed
 		retry      bool       // once
@@ -150,24 +149,6 @@ type (
 // PUT(object)
 //
 
-// validate client write conditions to be forwarded to the remote backend;
-// return true if forwarding
-func (t *target) condWrite(bck *meta.Bck, r *http.Request) (bool, int, error) {
-	if r == nil || !cos.IsCondWrite(r.Header) || !bck.IsRemote() {
-		return false, 0, nil
-	}
-	if !t.Backend(bck).CondWrite(bck) {
-		if bck.IsRemoteS3() {
-			return false, http.StatusNotImplemented, cmn.NewErrUnsupp("conditionally write to", bck.Cname(""))
-		}
-		return false, 0, nil
-	}
-	if _, err := cos.ParseCondWrite(r.Header); err != nil {
-		return false, http.StatusBadRequest, err
-	}
-	return true, 0, nil
-}
-
 // poi.restful entry point
 func (poi *putOI) do(resphdr http.Header, r *http.Request, dpq *dpq) (ecode int, err error) {
 	poi.oreq = r
@@ -175,11 +156,6 @@ func (poi *putOI) do(resphdr http.Header, r *http.Request, dpq *dpq) (ecode int,
 	poi.resphdr = resphdr
 	poi.workFQN = poi.lom.GenFQN(fs.WorkCT, fs.WorkfilePut)
 	poi.owt = cmn.OwtPut // default
-
-	// validate before receiving the body
-	if poi.condWrite, ecode, err = poi.t.condWrite(poi.lom.Bck(), r); err != nil {
-		return ecode, err
-	}
 
 	oah := poi.lom.ObjAttrs()
 	if poi.cksumToUse, err = oah.FromHeader(r.Header); err != nil {
@@ -321,6 +297,19 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 	return ecode, err
 }
 
+// true when the backend must evaluate client write conditions (and the PUT cannot be a no-op);
+// backends that don't support conditional writes: no-op
+//
+// rejected conditions (412) leave the in-cluster copy as is, possibly stale; for read-modify-write
+// with If-Match, see versioning.validate_warm_get, apc.QparamLatestVer, and (batch) LatestVer
+func (poi *putOI) condWrite() bool {
+	if poi.oreq == nil || !cos.IsCondWrite(poi.oreq.Header) {
+		return false
+	}
+	bck := poi.lom.Bck()
+	return bck.IsRemote() && poi.t.Backend(bck).CondWrite(bck)
+}
+
 func (poi *putOI) putObject() (ecode int, err error) {
 	chunkSize := poi.lom.Bprops().Chunks.ChunkSizeFor(poi.size)
 	// TODO: validate cksumToUse while chunking before completing the internal upload
@@ -335,15 +324,13 @@ func (poi *putOI) putObject() (ecode int, err error) {
 
 	// if checksums match PUT is a no-op
 	// (unless the backend must evaluate write conditions)
-	if !poi.skipVC && !poi.skipBackend && !poi.condWrite {
-		if poi.lom.EqCksum(poi.cksumToUse) {
-			if cmn.Rom.V(4, cos.ModAIS) {
-				nlog.Infoln(poi.lom.String(), "has identical", poi.cksumToUse.String(), "- PUT is a no-op")
-			}
-			cos.DrainReader(poi.r)
-			cmn.CloseRemote(poi.r, poi.lom, 4, cos.ModAIS)
-			return 0, nil
+	if !poi.skipVC && !poi.skipBackend && poi.lom.EqCksum(poi.cksumToUse) && !poi.condWrite() {
+		if cmn.Rom.V(4, cos.ModAIS) {
+			nlog.Infoln(poi.lom.String(), "has identical", poi.cksumToUse.String(), "- PUT is a no-op")
 		}
+		cos.DrainReader(poi.r)
+		cmn.CloseRemote(poi.r, poi.lom, 4, cos.ModAIS)
+		return 0, nil
 	}
 
 	buf, slab, lmfh, erw := poi.write()
@@ -364,7 +351,7 @@ func (poi *putOI) putObject() (ecode int, err error) {
 			poi.xctn.InObjsAdd(1, poi.lom.Lsize())
 		}
 		// from ETL direct put
-		if poi.owt == cmn.OwtTransform && poi.t2t {
+		if poi.owt == cmn.OwtTransform && poi.restful {
 			poi.xctn.InObjsAdd(1, poi.lom.Lsize())
 		}
 	} else if !poi.t2t && poi.owt == cmn.OwtPut && poi.restful {
@@ -465,7 +452,8 @@ func (poi *putOI) loghdr() string {
 
 func (poi *putOI) finalize() (ecode int, err error) {
 	if ecode, err = poi.fini(); err != nil {
-		if err1 := cos.Stat(poi.workFQN); err1 == nil || !cos.IsNotExist(err1) {
+		rmWork := !poi.keepWork // (see FinalizeObj)
+		if err1 := cos.Stat(poi.workFQN); rmWork && (err1 == nil || !cos.IsNotExist(err1)) {
 			// cleanup: rm work-fqn
 			if err1 == nil {
 				err1 = err
@@ -499,7 +487,7 @@ func (poi *putOI) finalize() (ecode int, err error) {
 // - see docs/rate-limit
 func (poi *putOI) _retry503() (ecode int, err error) {
 	time.Sleep(time.Second)
-	ecode, err = poi.putRemote()
+	ecode, err = poi.putRemote(cmn.WithNoRetry(context.Background()))
 	if err != nil {
 		return ecode, err
 	}
@@ -515,7 +503,7 @@ func (poi *putOI) fini() (ecode int, err error) {
 	)
 	// put remote
 	if bck.IsRemote() && poi.owt < cmn.OwtRebalance {
-		ecode, err = poi.putRemote()
+		ecode, err = poi.putRemote(context.Background())
 		if err != nil {
 			if cmn.Rom.V(5, cos.ModAIS) {
 				loghdr := poi.loghdr()
@@ -582,7 +570,7 @@ func (poi *putOI) fini() (ecode int, err error) {
 }
 
 // via backend.PutObj()
-func (poi *putOI) putRemote() (int, error) {
+func (poi *putOI) putRemote(ctx context.Context) (int, error) {
 	var (
 		lom       = poi.lom
 		startTime = mono.NanoTime()
@@ -598,7 +586,7 @@ func (poi *putOI) putRemote() (int, error) {
 		ecode int
 		bp    = poi.t.Backend(lom.Bck())
 	)
-	ecode, err = bp.PutObj(context.Background(), lmfh, lom, poi.oreq)
+	ecode, err = bp.PutObj(ctx, lmfh, lom, poi.oreq)
 	if err == nil {
 		if !lom.Bck().IsRemoteAIS() {
 			lom.SetCustomKey(cmn.SourceObjMD, bp.Provider())
@@ -932,7 +920,7 @@ func (goi *getOI) coldGet(bp core.Backend, config *cmn.Config) (int, error) {
 
 	// get remote reader (compare w/ t.GetCold)
 	goi.rget = true
-	res, stopFirst := goi.coldReader(bp, true /*parallel*/)
+	res, stopFirst := goi.coldReader(bp)
 	if stopFirst != nil {
 		defer stopFirst()
 		if res.Err == nil {
@@ -987,8 +975,7 @@ func (goi *getOI) coldGet(bp core.Backend, config *cmn.Config) (int, error) {
 func (goi *getOI) coldRefetch(bp core.Backend) core.GetReaderResult {
 	goi.lom.Reset()
 	goi.lom.SetAtimeUnix(goi.atime)
-	res, _ := goi.coldReader(bp, false /*parallel*/)
-	return res
+	return bp.GetObjReader(cmn.WithNoRetry(goi.ctx), goi.lom, 0, 0)
 }
 
 func (goi *getOI) coldPut(res *core.GetReaderResult, config *cmn.Config) (int, error) {
@@ -2053,7 +2040,11 @@ func (coi *coi) do(t *target, dm *bundle.DM, lom *core.LOM) (res xs.CoiRes) {
 			resp := coi.GetROC(lom, coi.LatestVer, coi.Sync, coi.ETLArgs)
 			// skip t2t send if encounter error during GetROC, (etl direct put will return ErrSkip in this case)
 			if resp.Err != nil {
-				return xs.CoiRes{Err: resp.Err, Ecode: resp.Ecode}
+				res = xs.CoiRes{Err: resp.Err, Ecode: resp.Ecode}
+				if resp.Err == cmn.ErrSkip {
+					res.Lsize = resp.OAH.Lsize() // size reported by the ETL
+				}
+				return res
 			}
 			coi.OAH = resp.OAH
 			r = resp.R
@@ -2163,9 +2154,8 @@ func (coi *coi) _writer(t *target, lom, dst *core.LOM, args *core.ETLArgs) (res 
 
 	// finalize
 	dst.SetSize(size)
-	ecode, err = t.FinalizeObj(dst, workFQN, coi.Xact, coi.OWT)
+	ecode, err = t.FinalizeObj(dst, workFQN, coi.Xact, coi.OWT, true /*rm work*/)
 	if err != nil {
-		cos.RemoveFile(workFQN)
 		return xs.CoiRes{Err: err, Ecode: ecode}
 	}
 	res.Lsize = size

@@ -492,7 +492,7 @@ func (p *proxy) setBprops(msg *apc.ActMsg, bck *meta.Bck, nprops *cmn.Bprops) (s
 	)
 	if _rePlacement(bprops, nprops, smap) {
 		gfnCtx = &smapModifier{smap: smap}
-		if err := p.notifyEarlyGFN(gfnCtx, smap, ""); err != nil {
+		if err := p.notifyEarlyGFN(gfnCtx, smap, "", nil); err != nil {
 			return "", err
 		}
 		defer func() {
@@ -1371,6 +1371,7 @@ func (r *_tcbfin) cb(nl nl.Listener) {
 		return
 	default:
 		nlog.Warningln("abort:", err)
+		// TODO: match a tcode in NotifMsg
 		if r.existed || nlog.Stopping() || strings.Contains(err.Error(), apc.ActShutdownCluster) {
 			return
 		}

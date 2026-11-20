@@ -173,6 +173,7 @@ func NewErrs(maxErrs ...int) Errs {
 
 func (e *Errs) Add(err error) {
 	debug.Assert(err != nil)
+	debug.Assert(e.cap > 0, "use cos.NewErrs")
 	e.mu.Lock()
 	// first, check for duplication
 	for _, added := range e.errs {
@@ -237,7 +238,7 @@ func IsPathErr(err error) bool {
 // - len(pathname) > PATH_MAX = 4096
 // - len(basename) > 255
 func IsErrFntl(err error) bool {
-	return strings.Contains(err.Error(), "too long") && errors.Is(err, syscall.ENAMETOOLONG)
+	return errors.Is(err, syscall.ENAMETOOLONG)
 }
 
 // likely out of socket descriptors

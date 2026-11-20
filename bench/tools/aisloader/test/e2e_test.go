@@ -131,15 +131,107 @@ func TestAISLoaderWorkloads(t *testing.T) {
 		t.FailNow()
 	}
 
-	t.Run("GetBatch And Cleanup", func(t *testing.T) {
-		report := runner.run(t, "get-batch", shorter, time.Minute, runner.created,
+	t.Run("GetBatch", func(t *testing.T) {
+		report := runner.run(t, "get-batch", shorter, time.Minute, false,
 			"-subdir="+runner.rootPrefix,
 			"-pctput=0",
 			"-get-batchsize=32",
 		)
 		assertOperation(t, "GetBatch", report.GetBatch)
+	})
+}
+
+func TestAISLoaderCleanup(t *testing.T) {
+	duration := configuredDuration(t)
+
+	t.Run("New Bucket", func(t *testing.T) {
+		runner := newE2ERunner(t, "cleanup-new")
+		if !runner.created {
+			t.Skip("requires a bucket that does not already exist")
+		}
+
+		report := runner.run(t, "cleanup-new", duration, time.Minute, true,
+			"-subdir="+runner.rootPrefix,
+			"-pctput=100",
+			"-maxsize=1KiB",
+			"-minsize=1KiB",
+			"-maxputs=100",
+		)
+		assertOperation(t, "PUT", report.Put)
+		runner.assertBucketDestroyed(t)
+	})
+
+	t.Run("Existing Bucket", func(t *testing.T) {
+		runner := newE2ERunner(t, "cleanup-existing")
 		if runner.created {
-			runner.assertBucketDestroyed(t)
+			tools.CreateBucket(t, runner.proxyURL, runner.bck, nil, false)
+		}
+
+		// pre-existing objects: cleanup must preserve them
+		const seedCount = 100
+		seeded := runner.rootPrefix + "/seeded"
+		_, _, err := tools.PutRandObjs(tools.PutObjectsArgs{
+			Context:   t.Context(),
+			ProxyURL:  runner.proxyURL,
+			Bck:       runner.bck,
+			ObjPath:   seeded,
+			ObjCnt:    seedCount,
+			ObjSize:   cos.KiB,
+			FixedSize: true,
+		})
+		tassert.CheckFatal(t, err)
+
+		// regular and multipart PUTs next to them, with cleanup
+		report := runner.run(t, "cleanup-existing", duration, time.Minute, true,
+			"-subdir="+runner.rootPrefix,
+			"-pctput=100",
+			"-minsize=20MiB",
+			"-maxsize=20MiB",
+			"-maxputs=16",
+			"-multipart-chunks=4",
+			"-pctmultipart=50",
+		)
+		assertOperation(t, "PUT", report.Put)
+		assertOperation(t, "multipart PUT", report.PutMPU)
+
+		// only the seeded objects remain
+		bp := tools.BaseAPIParams(runner.proxyURL)
+		result, err := api.ListObjects(bp, runner.bck, &apc.LsoMsg{Prefix: runner.rootPrefix + "/"}, api.ListArgs{})
+		tassert.CheckFatal(t, err)
+		tassert.Fatalf(t, len(result.Entries) == seedCount, "expected %d seeded objects, got %d", seedCount, len(result.Entries))
+		for _, entry := range result.Entries {
+			tassert.Fatalf(t, strings.HasPrefix(entry.Name, seeded+"/"), "run-created object survived cleanup: %s", entry.Name)
+		}
+	})
+
+	t.Run("Repeatable Names", func(t *testing.T) {
+		runner := newE2ERunner(t, "cleanup-repeatable")
+		if runner.created {
+			tools.CreateBucket(t, runner.proxyURL, runner.bck, nil, false)
+		}
+		args := append(slices.Clone(runner.baseArgs),
+			"-subdir="+runner.rootPrefix,
+			"-duration=10s",
+			"-pctput=100",
+			"-maxputs=100",
+			"-minsize=1KiB",
+			"-maxsize=1KiB",
+			"-cleanup=true",
+		)
+		for _, flags := range [][]string{
+			{"-seed=1"},
+			{"-randomname=false"},
+			{"-loadernum=2"},
+			{"-loaderidhashlen=8"},
+			{"-loadernum=2", "-seed=1"},
+			{"-randomname=false", "-loaderidhashlen=8"},
+		} {
+			t.Run(strings.Join(flags, ","), func(t *testing.T) {
+				cmdArgs := append(slices.Clone(args), flags...)
+				output, err := runner.exec(t, "cleanup-repeatable-existing", time.Minute, cmdArgs...)
+				tassert.Fatalf(t, err != nil && strings.Contains(string(output), "PUT object names can repeat across runs"),
+					"expected cleanup rejection, got err=%v\n%s", err, output)
+			})
 		}
 	})
 }
@@ -204,6 +296,120 @@ func TestAISLoaderFileListObj(t *testing.T) {
 		var exitErr *exec.ExitError
 		tassert.Fatalf(t, errors.As(err, &exitErr), "expected nonzero exit for missing manifest, got %v\n%s", err, output)
 		tassert.Fatalf(t, strings.Contains(string(output), "failed to get '-filelist-obj="+uri+"'"), "expected manifest error with source URI\n%s", output)
+	})
+}
+
+func TestAISLoaderListOut(t *testing.T) {
+	t.Run("Missing List Bucket", func(t *testing.T) {
+		runner := newE2ERunner(t, "missing-list-bucket")
+		if !runner.created {
+			t.Skip("requires a new local AIS benchmark bucket; unset BUCKET")
+		}
+		badBck := cmn.Bck{Name: "missing-list-bucket" + strings.ToLower(trand.String(10)), Provider: apc.AIS}
+		uri := badBck.Cname("names.txt")
+		args := append(slices.Clone(runner.baseArgs), "-list-out="+uri)
+		output, err := runner.exec(t, "missing-list-bucket", time.Minute, args...)
+		var exitErr *exec.ExitError
+		tassert.Fatalf(t, errors.As(err, &exitErr), "expected failure: %v\n%s", err, output)
+		wantErr := "failed to check '-list-out=" + uri + "' bucket"
+		tassert.Fatalf(t, strings.Contains(string(output), wantErr), "missing %q:\n%s", wantErr, output)
+
+		exists, _ := tools.BucketExists(t, runner.proxyURL, runner.bck)
+		tassert.Fatalf(t, !exists, "expected benchmark bucket %s to be absent after the run", runner.bck.String())
+	})
+
+	t.Run("Overwrite List and Check", func(t *testing.T) {
+		runner := newE2ERunner(t, "list-out")
+		bp := tools.BaseAPIParams(runner.proxyURL)
+		if runner.created {
+			tools.CreateBucket(t, runner.proxyURL, runner.bck, nil, false)
+		}
+
+		subdir := runner.rootPrefix + "/in"
+		putArgs := tools.PutObjectsArgs{
+			Context:   t.Context(),
+			ProxyURL:  runner.proxyURL,
+			Bck:       runner.bck,
+			ObjPath:   subdir,
+			ObjCnt:    20,
+			ObjSize:   cos.KiB,
+			FixedSize: true,
+		}
+		want, _, err := tools.PutRandObjs(putArgs)
+		tassert.CheckFatal(t, err)
+		slices.Sort(want)
+		putArgs.ObjPath, putArgs.ObjCnt = runner.rootPrefix+"/out", 1
+		_, _, err = tools.PutRandObjs(putArgs)
+		tassert.CheckFatal(t, err)
+
+		// an existing list to be overwritten
+		const listObjName = "run/names.txt"
+		listBck := cmn.Bck{Name: "aisloader-list-" + strings.ToLower(trand.String(10)), Provider: apc.AIS}
+		tools.CreateBucket(t, runner.proxyURL, listBck, nil, true)
+		_, err = api.PutObject(&api.PutArgs{BaseParams: bp, Bck: listBck, ObjName: listObjName, Reader: readers.NewBytes([]byte("stale\n"))})
+		tassert.CheckFatal(t, err)
+		uri := listBck.Cname(listObjName)
+
+		// overwrite and check for warning
+		args := append(slices.Clone(runner.baseArgs), "-subdir="+subdir, "-list-out="+uri)
+		output, err := runner.exec(t, "list-out", time.Minute, args...)
+		tassert.Fatalf(t, err == nil, "aisloader list-out failed: %v\n%s", err, output)
+		wantWarn := "will overwrite existing object: " + uri
+		tassert.Fatalf(t, strings.Contains(string(output), wantWarn), "missing %q:\n%s", wantWarn, output)
+
+		// check list obj has the correct names
+		var buf bytes.Buffer
+		_, err = api.GetObject(bp, listBck, listObjName, &api.GetArgs{Writer: &buf})
+		tassert.CheckFatal(t, err)
+		got := strings.Fields(buf.String())
+		slices.Sort(got)
+		tassert.Fatalf(t, slices.Equal(got, want), "expected the list to hold each of %q exactly once, got %q", want, got)
+	})
+
+	t.Run("Empty Listing", func(t *testing.T) {
+		runner := newE2ERunner(t, "list-out-empty")
+		if runner.created {
+			tools.CreateBucket(t, runner.proxyURL, runner.bck, nil, false)
+		}
+		listBck := cmn.Bck{Name: "aisloader-list-" + strings.ToLower(trand.String(10)), Provider: apc.AIS}
+		tools.CreateBucket(t, runner.proxyURL, listBck, nil, true)
+
+		uri := listBck.Cname("names.txt")
+		args := append(slices.Clone(runner.baseArgs), "-subdir="+runner.rootPrefix+"/empty", "-list-out="+uri)
+		output, err := runner.exec(t, "list-out-empty", time.Minute, args...)
+		tassert.Fatalf(t, err == nil, "aisloader list-out failed: %v\n%s", err, output)
+		wantWarn := "no objects listed; writing an empty list to " + uri
+		tassert.Fatalf(t, strings.Contains(string(output), wantWarn), "missing %q:\n%s", wantWarn, output)
+		obj, err := api.GetObject(tools.BaseAPIParams(runner.proxyURL), listBck, "names.txt", &api.GetArgs{})
+		tassert.CheckFatal(t, err)
+		tassert.Fatalf(t, obj.Size() == 0, "expected empty list, got %d bytes", obj.Size())
+	})
+
+	t.Run("List to Benchmark Bucket", func(t *testing.T) {
+		runner := newE2ERunner(t, "list-out-same-bucket")
+		if !runner.created {
+			t.Skip("requires a new local AIS benchmark bucket; unset BUCKET")
+		}
+		tools.CreateBucket(t, runner.proxyURL, runner.bck, nil, false)
+
+		subdir := runner.rootPrefix + "/in"
+		_, _, err := tools.PutRandObjs(tools.PutObjectsArgs{
+			Context:   t.Context(),
+			ProxyURL:  runner.proxyURL,
+			Bck:       runner.bck,
+			ObjPath:   subdir,
+			ObjCnt:    1,
+			ObjSize:   cos.KiB,
+			FixedSize: true,
+		})
+		tassert.CheckFatal(t, err)
+
+		uri := runner.bck.Cname(runner.rootPrefix + "/names.txt")
+		args := append(slices.Clone(runner.baseArgs), "-subdir="+subdir, "-list-out="+uri)
+		output, err := runner.exec(t, "list-out-same-bucket", time.Minute, args...)
+		tassert.Fatalf(t, err == nil, "aisloader list-out failed: %v\n%s", err, output)
+		wantWarn := "may be included as a workload object in later runs: " + uri
+		tassert.Fatalf(t, strings.Contains(string(output), wantWarn), "missing %q:\n%s", wantWarn, output)
 	})
 }
 

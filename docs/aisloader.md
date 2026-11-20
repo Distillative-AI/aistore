@@ -34,6 +34,7 @@ To integrate aisloader with Prometheus-based observability stacks, run the offic
   - [Command Line Options Grouped by Category](#command-line-options-grouped-by-category)
 - [Assorted Command Line](#assorted-command-line)
   - [Object-name lists](#object-name-lists)
+  - [Writing an object-name list](#writing-an-object-name-list)
 - [Environment variables](#environment-variables)
 - [Archive Workload](#archive-workload)
 - [Multipart Download Stream](#multipart-download-stream)
@@ -121,7 +122,7 @@ For the most recently updated command-line options and examples, please run `ais
 | -bucket | `string` | Bucket name or bucket URI. If empty, aisloader generates a new random bucket name | `""` |
 | -cached | `bool` | List in-cluster objects - only those objects from a remote bucket that are present ("cached") | `false` |
 | -cksum-type | `string` | Checksum type to use for PUT object requests | `xxhash` |
-| -cleanup | `bool` | When true, remove bucket upon benchmark termination (must be specified for AIStore buckets) | `n/a` (required) |
+| -cleanup | `bool` | When true, delete objects PUT by this run and destroy the bucket only if this run created it. Required with `-bucket` | `false` |
 | -config | `string` | Load runtime settings from a [YAML file](#yaml-configuration); explicit CLI flags take precedence | `""` |
 | -cont-on-err | `bool` | GetBatch: ignore missing files and/or objects - include them under `__404__/` prefix and keep going | `false` |
 | -dry-run | `bool` | Show the entire set of parameters that aisloader will use when actually running | `false` |
@@ -129,9 +130,9 @@ For the most recently updated command-line options and examples, please run `ais
 | -epochs | `int` | Number of "epochs" to run whereby each epoch entails full pass through the entire listed bucket | `0` |
 | -etl | `string` | Built-in ETL, one of: `transformer-echo`, `tar2tf`, `transformer-md5`, or `parquet-parser`. Each object that aisloader GETs undergoes the selected transformation | `""` |
 | -etl-spec | `string` | Custom ETL runtime specification (pathname) | `""` |
-| -evict-batchsize | `int` | Batch size to list and evict the next batch of remote objects | `1000` |
+| -evict-batchsize | `int` | Batch size for deleting objects PUT by this run on cleanup (`-cleanup=true`) | `1000` |
 | -filelist | `string` | Local or locally accessible text file containing object names (for subsequent reading) | `""` |
-| -filelist-obj | `string` | object URI of a list of object names to read, one per line (fetched through AIS) | `""` |
+| -filelist-obj | `string` | object URI of a list of object names to read, one per line (fetched through AIS). To write one, see [Writing an object-name list](#writing-an-object-name-list) | `""` |
 | -get-batchsize | `int` | Use GetBatch API (ML endpoint) instead of GetObject | `0` |
 | -getloaderid | `bool` | When true, print stored/computed unique loaderID and exit | `false` |
 | -idle-conns-per-host | `int` | Maximum idle (keep-alive) connections per host, AIS gateway or S3 endpoint (0 = size the pool to the concurrent workload, minimum 32) | `0` |
@@ -139,6 +140,7 @@ For the most recently updated command-line options and examples, please run `ais
 | -json | `bool` | When true, print the output in JSON | `false` |
 | -latest | `bool` | When true, check in-cluster metadata and possibly GET the latest object version from the associated remote bucket | `false` |
 | -list-dirs | `bool` | List virtual subdirectories (remote buckets only) | `false` |
+| -list-out | `string` | Object URI to write listed object names to, one per line, and exit. See [Writing an object-name list](#writing-an-object-name-list) | `""` |
 | -loaderid | `string` | ID to identify a loader among multiple concurrent instances | `0` |
 | -loaderidhashlen | `int` | Size (in bits) of the generated aisloader identifier. Cannot be used together with loadernum | `0` |
 | -loadernum | `int` | Total number of aisloaders running concurrently and generating combined load. If defined, must be greater than the loaderid and cannot be used together with loaderidhashlen | `0` |
@@ -170,6 +172,7 @@ For the most recently updated command-line options and examples, please run `ais
 | -s3-use-path-style | `bool` | Use older path-style addressing (e.g., `https://s3.amazonaws.com/BUCKET/KEY`). Should only be used with `-s3endpoint` | `false` |
 | -seed | `int` | Random seed to achieve deterministic reproducible results (0 = use current time in nanoseconds) | `0` |
 | -skiplist | `bool` | When true, skip listing objects in a bucket before running 100% PUT workload | `false` |
+| -split-reads | `bool` | When true, each loader only GETs a share of the object names; requires `-loaderid` and `-loadernum` (see [Splitting reads across loaders](#splitting-reads-across-loaders)) | `false` |
 | -stats-output | `string` | Filename to log statistics (empty string = standard output) | `""` |
 | -stats-output-obj | `string` | URI of an object in a local AIS bucket to save statistics after the run | `""` |
 | -statsdip | `string` | **Deprecated** - StatsD IP address or hostname | `localhost` |
@@ -256,8 +259,9 @@ For the most recently updated command-line options and examples, please run `ais
 | --- | --- | --- | --- |
 | -num-subdirs | `int` | Spread generated objects over this many virtual subdirectories (< 100k) | `0` |
 | -filelist | `string` | Local or locally accessible text file containing object names (for subsequent reading) | `""` |
-| -filelist-obj | `string` | object URI of a list of object names to read, one per line (fetched through AIS) | `""` |
+| -filelist-obj | `string` | object URI of a list of object names to read, one per line (fetched through AIS). To write one, see [Writing an object-name list](#writing-an-object-name-list) | `""` |
 | -list-dirs | `bool` | List virtual subdirectories (remote buckets only) | `false` |
+| -list-out | `string` | Object URI to write listed object names to, one per line, and exit. See [Writing an object-name list](#writing-an-object-name-list) | `""` |
 | -randomname | `bool` | When true, generate object names of 32 random characters. This option is ignored when loadernum is defined | `true` |
 | -subdir | `string` | For GET: prefix that may or may not be an actual [virtual directory](/docs/howto_virt_dirs.md). For PUT: virtual destination directory for all generated objects. See [CLI `--prefix`](/docs/cli/object.md) | `""` |
 | -putshards | `int` | **Deprecated** - use `-num-subdirs` instead | `0` |
@@ -272,7 +276,7 @@ For the most recently updated command-line options and examples, please run `ais
 | -latest | `bool` | When true, check in-cluster metadata and possibly GET the latest object version from the associated remote bucket | `false` |
 | -cached | `bool` | List in-cluster objects - only those objects from a remote bucket that are present ("cached") | `false` |
 | -nbi | `bool` | List via [native bucket inventory](/docs/nbi.md) (NBI) snapshot. Remote buckets only; the inventory must already exist - aisloader does **not** create it | `false` |
-| -evict-batchsize | `int` | Batch size to list and evict the next batch of remote objects | `1000` |
+| -evict-batchsize | `int` | Batch size for deleting objects PUT by this run on cleanup (`-cleanup=true`) | `1000` |
 | -cont-on-err | `bool` | GetBatch: ignore missing files and/or objects - include them under `__404__/` prefix and keep going | `false` |
 
 #### Multipart Upload Settings (`multipartParams`)
@@ -304,6 +308,7 @@ For the most recently updated command-line options and examples, please run `ais
 | -loaderid | `string` | ID to identify a loader among multiple concurrent instances | `0` |
 | -loadernum | `int` | Total number of aisloaders running concurrently and generating combined load. If defined, must be greater than the loaderid and cannot be used together with loaderidhashlen | `0` |
 | -loaderidhashlen | `int` | Size (in bits) of the generated aisloader identifier. Cannot be used together with loadernum | `0` |
+| -split-reads | `bool` | When true, each loader only GETs a share of the object names; requires `-loaderid` and `-loadernum` (see [Splitting reads across loaders](#splitting-reads-across-loaders)) | `false` |
 | -getloaderid | `bool` | When true, print stored/computed unique loaderID and exit | `false` |
 
 #### Statistics and Monitoring (`statsParams`)
@@ -322,7 +327,7 @@ For the most recently updated command-line options and examples, please run `ais
 
 | Command-line option | Type | Description | Default |
 | --- | --- | --- | --- |
-| -cleanup | `bool` | When true, remove bucket upon benchmark termination (must be specified for AIStore buckets) | `n/a` (required) |
+| -cleanup | `bool` | When true, delete objects PUT by this run and destroy the bucket only if this run created it. Required with `-bucket` | `false` |
 | -config | `string` | Load runtime settings from a [YAML file](#yaml-configuration); explicit CLI flags take precedence | `""` |
 | -dry-run | `bool` | Show the entire set of parameters that aisloader will use when actually running | `false` |
 | -trace-http | `bool` | Trace HTTP latencies (see [HTTP tracing](#http-tracing)) | `false` |
@@ -393,6 +398,31 @@ List format and restrictions:
 * `-filelist-obj` cannot be combined with `-s3endpoint` (direct S3 access). An S3-hosted list must be read through AIS.
 * Failure to open, fetch, or read the list stops startup. Missing workload objects are reported as GET errors during the run.
 
+### Writing an object-name list
+
+Use `-list-out` to list a bucket and save the names for later runs or for use on split reads (see [Splitting reads across loaders](#splitting-reads-across-loaders)). Aisloader lists objects with the same options as a benchmark run (`-subdir`, `-cached`, `-list-dirs`, `-nbi`, `-arch.list`), writes the names to a single object, one per line, and exits.
+
+```console
+$ aisloader -config=get.yaml -list-out=ais://lists/run-1.txt
+```
+
+* The destination bucket must already exist. An existing list is overwritten with a warning. Writing to the benchmark bucket, or an empty listing, also prints a warning.
+* With `-arch.list`, each file inside an archive is a separate entry (the archive name and the file's path, separated by a NUL byte), and archives themselves are not listed. The first GET of any file in an archive that is not yet in the cluster brings in the whole archive, so turn `-arch.list` off for cold-GET benchmarks.
+* `-list-out` is CLI-only and cannot be combined with `-filelist`, `-filelist-obj`, `-getloaderid`, or `-s3endpoint`.
+
+### Splitting reads across loaders
+
+With `-split-reads`, several aisloader instances can read the same objects without overlap. Each instance reads only its share of the object names, whether they are listed from `-bucket` or read from `-filelist` or `-filelist-obj`. Every name belongs to exactly one loader, even when loaders list the bucket at different times.
+
+```console
+# loader 0 of 4 (run loaders 1, 2 and 3 the same way)
+$ aisloader -bucket=ais://images -filelist-obj=ais://lists/names.txt -loaderid=0 -loadernum=4 -split-reads -pctput=0 -duration=10s -cleanup=false
+```
+
+* `-split-reads` requires `-loaderid`, `-loadernum`, and a workload that reads (`-pctput` below 100). Without it, every loader reads every name.
+* Shares are close to equal only for large lists. In a 100% read run (`-pctput=0`), a loader whose share has fewer than 2 names stops at startup.
+* With `-arch.list`, names are split by shard, so all files in a shard go to the same loader.
+
 ### Read range
 
 The loader can read the entire object (default) **or** a range of object bytes.
@@ -417,18 +447,20 @@ To read a different segment on each GET, use `-readoff=random`. For each GET, th
 
 ### Cleanup
 
-**NOTE**: `-cleanup` is a mandatory option defining whether to destroy bucket upon completion of the benchmark.
+**NOTE**: `-cleanup` defines whether to delete objects PUT by the run upon completion of the benchmark. The bucket is destroyed only if the run created it.
 
-The option must be specified in the command line.
+The option is required whenever `-bucket` is specified, either on the command line or in the [config file](#yaml-configuration).
 
 Example:
 
 ```console
 $ aisloader -bucket=ais://abc -pctput=100 -totalputsize=16348 -cleanup=false
-$ aisloader -bucket=ais://abc -duration 1h -pctput=0 -cleanup=true
+$ aisloader -bucket=ais://abc -duration 1h -pctput=30 -cleanup=true
 ```
 
-The first line in this example above fills the bucket "abc" with 16MiB of random data. The second - uses existing data to test read performance for 1 hour, and then removes all data.
+The first line in this example above fills the bucket "abc" with 16MiB of random data. The latter uses existing data to test mixed read/write performance for 1 hour, and then removes the objects it wrote.
+
+Objects the run did not PUT are preserved. When the benchmark bucket already exists and the workload has PUTs, `-cleanup=true` is incompatible with options that make object names repeat across runs: `-randomname=false`, `-loadernum`, `-loaderidhashlen`, or a non-zero `-seed`. PUT "updates" (`-pctupdate`) overwrite existing objects but are not deleted on cleanup.
 
 To destroy a bucket, use `ais bucket rm <BUCKET>`. Alternatively, to empty a bucket, use `ais object rm <BUCKET> --all`.
 
@@ -716,7 +748,7 @@ For the most recently updated command-line options and examples, please run `ais
     01:52:54 Clean up done
     ```
 
-**2**. Time-based 100% PUT into ais bucket. Upon exit the bucket is destroyed:
+**2**. Time-based 100% PUT into ais bucket:
 
     ```console
     $ aisloader -bucket=nvais -duration 10s -cleanup=true -numworkers=3 -minsize=1K -maxsize=1K -pctput=100 -provider=ais
@@ -728,7 +760,7 @@ For the most recently updated command-line options and examples, please run `ais
     $ aisloader -bucket=aws://nvaws -duration 1h -numworkers=30 -pctput=0 -cleanup=false
     ```
 
-**4**. Mixed 30%/70% PUT and GET of variable-size objects to/from a Cloud bucket. PUT will generate random object names and is limited by the 10GB total size. Cleanup enabled - upon completion all generated objects and the bucket itself will be deleted:
+**4**. Mixed 30%/70% PUT and GET of variable-size objects to/from a Cloud bucket. PUT will generate random object names and is limited by the 10GB total size:
 
     ```console
     $ aisloader -bucket=s3://nvaws -duration 0s -cleanup=true -numworkers=3 -minsize=1024 -maxsize=1MB -pctput=30 -totalputsize=10G
@@ -749,7 +781,7 @@ For the most recently updated command-line options and examples, please run `ais
 **7**. PUT 2000 objects named as `aisloader/hex({0..2000}{loaderid})`:
 
     ```console
-    $ aisloader -bucket=nvais -duration 10s -numworkers=3 -loaderid=11 -loadernum=20 -maxputs=2000 -objNamePrefix="aisloader" -cleanup=false
+    $ aisloader -bucket=nvais -numworkers=3 -pctput=100 -minsize=1K -maxsize=1K -loaderid=11 -loadernum=20 -maxputs=2000 -subdir=aisloader -cleanup=false
     ```
 
 **8**. Use random object names and loaderID to report statistics:

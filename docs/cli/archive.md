@@ -1,6 +1,6 @@
 # Working with Archives (Shards)
 
-In AIStore, *archives* (also called *shards*) are special objects that contain multiple files packaged together in formats like TAR, TGZ, ZIP, or TAR.LZ4. Working with archives is essential for efficiently managing collections of related files and for operations like distributed sorting.
+In AIStore, *archives* (also called *shards*) are special objects that contain multiple files packaged together in formats like TAR, TGZ, ZIP, or TAR.LZ4. Working with archives is essential for efficiently managing collections of related files and for machine learning data loading.
 
 In this document:
 * Commands to read, write, extract, and list *archives* - objects formatted as `TAR`, `TGZ` (or `TAR.GZ`) , `ZIP`, or `TAR.LZ4`.
@@ -318,6 +318,8 @@ OPTIONS:
               and similarly, when specifying files and directories:
               --template '/home/dir/subdir/'
               --template "/abc/prefix-{0010..9999..2}-suffix"
+   timeout    Maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
+              valid time units: ns, us (or µs), ms, s (default), m, h
    wait       Wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
    help, h    Show help
 
@@ -409,14 +411,15 @@ g.tar
 - `--dry-run`: Preview the results without executing
 - `--include-src-bck`: Prefix archived file names with the source bucket name
 - `--skip-lookup`: Skip checking bucket existence for better performance
-- `--wait`: Wait for the asynchronous operation to complete
+- `--timeout`: Maximum time to wait for the operation to complete
+- `--wait`: Wait for the asynchronous operation to complete and report its errors
 
 ### Complete Examples
 
 **1**. Archive objects with a specific prefix, non-recursively:
 
 ```console
-$ ais archive bucket s3://src-bck/aaa/ ais://dst/example.tar --nr
+$ ais archive bucket s3://src-bck/aaa/ ais://dst/example.tar --nr --wait
 Archived s3://src-bck/aaa/ => ais://dst/example.tar
 
 $ ais ls ais://dst/example.tar --archive
@@ -433,8 +436,8 @@ example.tar			  106.00KiB
 **2**. Archive objects using a template range:
 
 ```console
-$ ais archive bucket ais://src ais://dst/range.tar --template "obj-{0..9}"
-Archiving "ais://dst/range.tar" ...
+$ ais archive bucket ais://src ais://dst/range.tar --template "obj-{0..9}" --wait
+Archived ais://src/obj-{0..9} => ais://dst/range.tar
 
 $ ais archive ls ais://dst/range.tar
 
@@ -449,37 +452,36 @@ range.tar                92.60KiB
 **3**. Incrementally append to an existing archive:
 
 ```console
-$ ais archive bucket ais://bck/incremental.tar --template "obj{1..3}"
-Archived "ais://bck/incremental.tar" ...
+$ ais archive bucket ais://bck ais://bck/incremental.tar --template "obj{1..3}" --wait
+Archived ais://bck/obj{1..3} => ais://bck/incremental.tar
 
-$ ais archive bucket ais://bck/incremental.tar --template "obj{4..5}" --append
-Archived "ais://bck/incremental.tar"
+$ ais archive bucket ais://bck ais://bck/incremental.tar --template "obj{4..5}" --append-or-put --wait
+Archived ais://bck/obj{4..5} => ais://bck/incremental.tar
 ```
 
 **4**. Archive a list of objects from a given bucket:
 
 ```console
-$ ais archive bucket ais://bck/arch.tar --list obj1,obj2
-Archiving "ais://bck/arch.tar" ...
+$ ais archive bucket ais://bck ais://bck/arch.tar --list obj1,obj2
+Archiving ais://bck/obj1, obj2 => ais://bck/arch.tar. To monitor the progress, run 'ais show job <JOB_ID>'
 ```
 
-Resulting `ais://bck/arch.tar` contains objects `ais://bck/obj1` and `ais://bck/obj2`.
+When the job finishes, `ais://bck/arch.tar` contains objects `ais://bck/obj1` and `ais://bck/obj2`.
 
 **5**. Archive objects from a different bucket, use template (range):
 
 ```console
 $ ais archive bucket ais://src ais://dst/arch.tar --template "obj-{0..9}"
-
-Archiving "ais://dst/arch.tar" ...
+Archiving ais://src/obj-{0..9} => ais://dst/arch.tar. To monitor the progress, run 'ais show job <JOB_ID>'
 ```
 
-`ais://dst/arch.tar` now contains 10 objects from bucket `ais://src`: `ais://src/obj-0`, `ais://src/obj-1` ... `ais://src/obj-9`.
+When the job finishes, `ais://dst/arch.tar` contains 10 objects from bucket `ais://src`: `ais://src/obj-0`, `ais://src/obj-1` ... `ais://src/obj-9`.
 
 **6**. Archive 3 objects and then append 2 more:
 
 ```console
-$ ais archive bucket ais://bck/arch1.tar --template "obj{1..3}"
-Archived "ais://bck/arch1.tar" ...
+$ ais archive bucket ais://bck ais://bck/arch1.tar --template "obj{1..3}" --wait
+Archived ais://bck/obj{1..3} => ais://bck/arch1.tar
 $ ais archive ls ais://bck/arch1.tar
 NAME                     SIZE
 arch1.tar                31.00KiB
@@ -487,8 +489,8 @@ arch1.tar                31.00KiB
     arch1.tar/obj2       9.26KiB
     arch1.tar/obj3       9.26KiB
 
-$ ais archive bucket ais://bck/arch1.tar --template "obj{4..5}" --append
-Archived "ais://bck/arch1.tar"
+$ ais archive bucket ais://bck ais://bck/arch1.tar --template "obj{4..5}" --append-or-put --wait
+Archived ais://bck/obj{4..5} => ais://bck/arch1.tar
 
 $ ais archive ls ais://bck/arch1.tar
 NAME                     SIZE
@@ -936,7 +938,7 @@ $ ais archive get ais://abc/trunk-0123.tar 333.tar --archregx=subdir/ --archmode
 
 `ais archive gen-shards "BUCKET/TEMPLATE.EXT"`
 
-Put randomly generated shards that can be used for dSort testing.
+Put randomly generated shards for archive testing.
 The `TEMPLATE` must be bash-like brace expansion (see examples) and `.EXT` must be one of: `.tar`, `.tar.gz`.
 
 **Warning**: Remember to always quote the argument (`"..."`) otherwise the brace expansion will happen in terminal.
@@ -971,13 +973,13 @@ OPTIONS:
 
 #### Generate shards with varying numbers of files and file sizes
 
-Generate 10 shards each containing 100 files of size 256KB and put them inside `ais://dsort-testing` bucket (creates it if it does not exist).
+Generate 10 shards each containing 100 files of size 256KB and put them inside `ais://archive-testing` bucket (creates it if it does not exist).
 Shards will be named: `shard-0.tar`, `shard-1.tar`, ..., `shard-9.tar`.
 
 ```console
-$ ais archive gen-shards "ais://dsort-testing/shard-{0..9}.tar" --fsize 262144 --fcount 100
+$ ais archive gen-shards "ais://archive-testing/shard-{0..9}.tar" --fsize 262144 --fcount 100
 Shards created: 10/10 [==============================================================] 100 %
-$ ais ls ais://dsort-testing
+$ ais ls ais://archive-testing
 NAME		SIZE		VERSION
 shard-0.tar	25.05MiB	1
 shard-1.tar	25.05MiB	1
@@ -993,13 +995,13 @@ shard-9.tar	25.05MiB	1
 
 #### Generate shards using custom naming template
 
-Generates 100 shards each containing 5 files of size 256KB and put them inside `dsort-testing` bucket.
+Generates 100 shards each containing 5 files of size 256KB and put them inside `archive-testing` bucket.
 Shards will be compressed and named: `super_shard_000_last.tgz`, `super_shard_001_last.tgz`, ..., `super_shard_099_last.tgz`
 
 ```console
-$ ais archive gen-shards "ais://dsort-testing/super_shard_{000..099}_last.tar" --fsize 262144 --cleanup
+$ ais archive gen-shards "ais://archive-testing/super_shard_{000..099}_last.tar" --fsize 262144 --cleanup
 Shards created: 100/100 [==============================================================] 100 %
-$ ais ls ais://dsort-testing
+$ ais ls ais://archive-testing
 NAME				SIZE	VERSION
 super_shard_000_last.tgz	1.25MiB	1
 super_shard_001_last.tgz	1.25MiB	1

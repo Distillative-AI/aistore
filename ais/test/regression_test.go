@@ -5,6 +5,8 @@
 package integration_test
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,11 +26,13 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/docker"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
 	"github.com/NVIDIA/aistore/tools/tlog"
+	"github.com/NVIDIA/aistore/tools/trand"
 	"github.com/NVIDIA/aistore/xact"
 )
 
@@ -708,6 +713,198 @@ func TestPrefetchList(t *testing.T) {
 	}
 }
 
+func TestPrefetchSpecificTargets(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: cliBck, MinTargets: 3})
+
+	// 1. Set up a unique prefix and register cleanup for the test objects.
+	m := ioContext{t: t, bck: cliBck, prefix: "prefetch-target-" + cos.GenUUID() + "/", skipRemoteEvict: true}
+	m.initAndSaveState(false /*cleanup*/)
+
+	t.Cleanup(func() { m.del() })
+	bp := tools.BaseAPIParams(m.proxyURL)
+
+	// 2. Use the server's bucket properties and remote identity for placement.
+	props, err := api.HeadBucket(bp, m.bck, false /*dontAddRemote*/)
+	tassert.CheckFatal(t, err)
+	placementBck := meta.CloneBck(&m.bck)
+	placementBck.Props = props
+	if m.bck.IsRemoteAIS() {
+		remotes, err := api.GetRemoteAIS(bp)
+		tassert.CheckFatal(t, err)
+		for _, remote := range remotes.A {
+			if placementBck.Ns.UUID == remote.Alias {
+				placementBck.Ns.UUID = remote.UUID
+				break
+			}
+		}
+	}
+
+	// 3. Create one object per target; numeric names allow a range over two owners.
+	targets := m.smap.Tmap.ActiveNodes()[:3]
+	for _, target := range targets {
+		name := tools.GenerateObjectNameOnTarget(m.prefix+"1", *placementBck.Bucket(), m.smap, target)
+		reader, err := readers.New(&readers.Arg{Type: readers.Rand, Size: cos.KiB, CksumType: props.Cksum.Type})
+		tassert.CheckFatal(t, err)
+		_, err = api.PutObject(&api.PutArgs{BaseParams: bp, Bck: m.bck, ObjName: name, Reader: reader})
+		tassert.CheckFatal(t, err)
+		m.objNames = append(m.objNames, name)
+		m.num++
+	}
+	owners := cos.NewStrKVs(m.num)
+	for _, name := range m.objNames {
+		owner, err := m.smap.HrwObjName2T(placementBck, name)
+		tassert.CheckFatal(t, err)
+		owners[name] = owner.ID()
+	}
+
+	// The range contains exactly one selected-target object and one excluded-target object.
+	rangeNames := []string{m.objNames[0], m.objNames[2]}
+	first, err := strconv.Atoi(strings.TrimPrefix(rangeNames[0], m.prefix))
+	tassert.CheckFatal(t, err)
+	last, err := strconv.Atoi(strings.TrimPrefix(rangeNames[1], m.prefix))
+	tassert.CheckFatal(t, err)
+	first, last = min(first, last), max(first, last)
+	rangeTmpl := fmt.Sprintf("%s{%d..%d..%d}", m.prefix, first, last, last-first)
+	tassert.Fatalf(t, owners[rangeNames[0]] == targets[0].ID() && owners[rangeNames[1]] == targets[2].ID(),
+		"range must cover selected and excluded owners")
+
+	// 4. Test one target, a subset, the default set, and a selection owned by an excluded target.
+	pair := []string{targets[0].ID(), targets[1].ID()}
+	excluded := m.objNames[len(m.objNames)-1:]
+	t.Run("subset-prefix-list", func(t *testing.T) {
+		tools.CheckSkip(t, &tools.SkipTestArgs{RequiredDeployment: tools.ClusterTypeLocal})
+		remote := attachLsoCtxRemote(t, bp, m.smap.CountActiveTs())
+		b := remote.addBck(t, bp, "prefetch-targets", lsoCtxLastPage)
+		msg := &apc.PrefetchMsg{ListRange: apc.ListRange{Template: "prefix/"}}
+		xid, err := api.Prefetch(bp, b.bck, msg, pair...)
+		tassert.CheckFatal(t, err)
+		args := &xact.ArgsMsg{ID: xid, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout}
+		status, err := api.WaitForXactionIC(bp, args)
+		tassert.CheckFatal(t, err)
+		tassert.Fatalf(t, status.IsFinished() && !status.AbortedX && status.ErrMsg == "", "prefetch did not finish cleanly: %+v", status)
+		snaps, err := api.QueryXactionSnaps(bp, args)
+		tassert.CheckFatal(t, err)
+		tassert.Fatalf(t, len(snaps) == len(pair), "expected targets %v, got %v", pair, snaps)
+		for _, tid := range pair {
+			tassert.Fatalf(t, len(snaps[tid]) == 1, "expected one snapshot from target %s, got %v", tid, snaps)
+			snap := snaps[tid][0]
+			tassert.Errorf(t, snap.IsFinished() && !snap.IsAborted() && snap.Err == "", "target %s: prefetch failed: %+v", tid, snap)
+		}
+		// one final page per target; no retries or continuation requests
+		tassert.Errorf(t, b.calls.Load() == int64(len(pair)), "expected %d LIST calls, got %d", len(pair), b.calls.Load())
+	})
+	for _, tc := range []struct {
+		name      string
+		selection apc.ListRange
+		ids       []string
+		names     []string
+	}{
+		{"single-list", apc.ListRange{ObjNames: m.objNames}, pair[:1], m.objNames},
+		{"subset-prefix", apc.ListRange{Template: m.prefix}, pair, m.objNames},
+		{"subset-range", apc.ListRange{Template: rangeTmpl}, pair, rangeNames},
+		{"all-prefix", apc.ListRange{Template: m.prefix}, nil, m.objNames},
+		{"all-list", apc.ListRange{ObjNames: m.objNames}, nil, m.objNames},
+		{"excluded-object", apc.ListRange{ObjNames: excluded}, pair, excluded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := &apc.PrefetchMsg{ListRange: tc.selection}
+			testPrefetchTargetSelection(t, &m, msg, tc.ids, tc.names, owners)
+		})
+	}
+
+	// 5. Reject empty, duplicate, missing, and proxy IDs, including mixed valid/invalid lists;
+	// each value is one ID: no separators, no trimming.
+	for _, ids := range [][]string{
+		{""}, {pair[0], ""}, {pair[0], pair[0]}, {pair[0], "missing-" + cos.GenUUID()}, {pair[0], m.smap.Primary.ID()},
+		{pair[0], " " + pair[1]}, {pair[0] + "," + pair[1]},
+	} {
+		_, err := api.Prefetch(bp, m.bck, &apc.PrefetchMsg{ListRange: apc.ListRange{ObjNames: m.objNames}}, ids...)
+		tassert.Errorf(t, api.HTTPStatus(err) == http.StatusBadRequest, "targets %v: expected HTTP 400, got %v", ids, err)
+	}
+
+	// Reject a malformed query: it must not fall back to all targets.
+	q := url.Values{}
+	m.bck.SetQuery(q)
+	body := cos.MustMarshal(apc.ActMsg{Action: apc.ActPrefetchObjects, Value: &apc.PrefetchMsg{ListRange: apc.ListRange{ObjNames: m.objNames}}})
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+		bp.URL+apc.URLPathBuckets.Join(m.bck.Name)+"?"+q.Encode()+"&"+apc.QparamTID+"=%ZZ", bytes.NewReader(body))
+	tassert.CheckFatal(t, err)
+	req.Header.Set(cos.HdrContentType, cos.ContentJSON)
+	api.SetAuxHeaders(req, &bp)
+	resp, err := bp.Client.Do(req)
+	tassert.CheckFatal(t, err)
+	resp.Body.Close()
+	tassert.Errorf(t, resp.StatusCode == http.StatusBadRequest, "malformed query: expected HTTP 400, got %d", resp.StatusCode)
+
+	// 6. Reject a target in maintenance and restore it before removing the test objects.
+	args := &apc.ActValRmNode{DaemonID: pair[0], SkipRebalance: true}
+	_, err = startMaintenanceRetry(t, bp, args)
+	tassert.CheckFatal(t, err)
+	t.Cleanup(func() {
+		_, err := stopMaintenanceRetry(t, bp, args)
+		tassert.CheckError(t, err)
+		m.waitAndCheckCluState()
+	})
+	_, err = tools.WaitForClusterState(m.proxyURL, "prefetch target in maintenance", m.smap.Version,
+		m.smap.CountActivePs(), m.smap.CountActiveTs()-1)
+	tassert.CheckFatal(t, err)
+	_, err = api.Prefetch(bp, m.bck, &apc.PrefetchMsg{ListRange: apc.ListRange{ObjNames: m.objNames}}, pair...)
+	herr := cmn.AsErrHTTP(err)
+	tassert.Errorf(t, herr != nil && herr.Status == http.StatusBadRequest && herr.TypeCode == "ErrXactTgtInMaint",
+		"expected maintenance rejection, got %v", err)
+}
+
+func testPrefetchTargetSelection(t *testing.T, m *ioContext, msg *apc.PrefetchMsg, ids, names []string, owners cos.StrKVs) {
+	t.Helper()
+	bp := tools.BaseAPIParams(m.proxyURL)
+	tids := ids
+	if len(ids) == 0 {
+		ids = m.smap.Tmap.ActiveMap().IDs()
+	}
+	wanted := cos.NewStrSet()
+	for _, name := range names {
+		if slices.Contains(ids, owners[name]) {
+			wanted.Set(name)
+		}
+	}
+
+	// 1. Evict the test objects so the first pass is cold and the second pass is warm.
+	xid, err := api.EvictMultiObj(bp, m.bck, &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: m.objNames}})
+	tassert.CheckFatal(t, err)
+	tassert.CheckFatal(t, api.WaitForXaction(bp, &xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: tools.RebalanceTimeout}))
+	for pass := range 2 {
+		xid, err = api.Prefetch(bp, m.bck, msg, tids...)
+		tassert.CheckFatal(t, err)
+		status, err := api.WaitForXactionIC(bp, &xact.ArgsMsg{ID: xid, Kind: apc.ActPrefetchObjects, Timeout: tools.RebalanceTimeout})
+		tassert.CheckFatal(t, err)
+		tassert.Fatalf(t, status.IsFinished() && !status.AbortedX && status.ErrMsg == "", "prefetch did not finish cleanly: %+v", status)
+		snaps, err := api.QueryXactionSnaps(bp, &xact.ArgsMsg{ID: xid, Kind: apc.ActPrefetchObjects})
+		tassert.CheckFatal(t, err)
+		tassert.Fatalf(t, len(snaps) == len(ids), "expected targets %v, got %v", ids, snaps)
+		for _, id := range ids {
+			tassert.Fatalf(t, len(snaps[id]) == 1, "expected one snapshot from target %s, got %v", id, snaps)
+			snap := snaps[id][0]
+			tassert.Errorf(t, snap.Err == "" && !snap.AbortedX, "target %s: prefetch failed: %+v", id, snap)
+		}
+		count, _, _ := snaps.ObjCounts(xid)
+		want := len(wanted)
+		if pass == 1 {
+			want = 0 // already cached
+		}
+		tassert.Errorf(t, count == int64(want), "downloaded %d, expected %d", count, want)
+	}
+
+	// 2. Verify the cached object count and exclude objects assigned to other targets.
+	lsmsg := &apc.LsoMsg{Prefix: m.prefix}
+	lsmsg.SetFlag(apc.LsCached)
+	lst, err := api.ListObjects(bp, m.bck, lsmsg, api.ListArgs{})
+	tassert.CheckFatal(t, err)
+	tassert.Errorf(t, len(lst.Entries) == len(wanted), "cached %d, expected %d", len(lst.Entries), len(wanted))
+	for _, entry := range lst.Entries {
+		tassert.Errorf(t, wanted.Contains(entry.Name), "cached unexpected object: %s", entry.Name)
+	}
+}
+
 func TestDeleteList(t *testing.T) {
 	runProviderTests(t, func(t *testing.T, bck *meta.Bck) {
 		var (
@@ -755,6 +952,311 @@ func TestDeleteList(t *testing.T) {
 			t.Errorf("Incorrect number of remaining files: %d, should be 0", len(bktlst.Entries))
 		}
 	})
+}
+
+func TestRemoteAISRateLimitError(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiresRemoteCluster: true})
+	config := tools.GetClusterConfig(t)
+	bp := tools.BaseAPIParams(tools.RandomProxyURL(t))
+	remoteBP := tools.BaseAPIParams(tools.RemoteCluster.URL)
+	remoteSmap, err := api.GetClusterMap(remoteBP)
+	tassert.CheckFatal(t, err)
+	for _, tc := range []struct {
+		name  string
+		retry bool
+	}{
+		{name: "forward-429"},
+		{name: "backend-retries-429", retry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remoteBck := cmn.Bck{Name: "remais-rate-limit-" + cos.GenTie(), Provider: apc.AIS}
+			tools.CreateBucket(t, remoteBP.URL, remoteBck, nil, true)
+			names, _, err := tools.PutRandObjs(tools.PutObjectsArgs{
+				Context: t.Context(), ProxyURL: remoteBP.URL, Bck: remoteBck,
+				ObjCnt: 1, ObjSize: cos.KiB, FixedSize: true,
+			})
+			tassert.CheckFatal(t, err)
+			bck := remoteBck
+			bck.Ns.UUID = tools.RemoteCluster.UUID
+			_, err = api.HeadBucket(bp, bck, false)
+			tassert.CheckFatal(t, err)
+			t.Cleanup(func() { tassert.CheckError(t, api.EvictRemoteBucket(bp, bck, false)) })
+			_, err = api.SetBucketProps(bp, bck, &cmn.BpropsToSet{RateLimit: &cmn.RateLimitConfToSet{
+				Backend: &cmn.AdaptiveToSet{RateLimitBaseToSet: cmn.RateLimitBaseToSet{
+					Enabled: apc.Ptr(tc.retry), MaxTokens: apc.Ptr(100), Interval: apc.Ptr(cos.Duration(time.Second)),
+				}, NumRetries: apc.Ptr(1)},
+			}})
+			tassert.CheckFatal(t, err)
+			_, err = api.SetBucketProps(remoteBP, remoteBck, &cmn.BpropsToSet{RateLimit: &cmn.RateLimitConfToSet{
+				Frontend: &cmn.BurstyToSet{RateLimitBaseToSet: cmn.RateLimitBaseToSet{
+					Enabled: apc.Ptr(true), MaxTokens: apc.Ptr(4 * remoteSmap.CountActivePs()),
+					Interval: apc.Ptr(cos.Duration(time.Hour)),
+				}, Size: apc.Ptr(1)},
+			}})
+			tassert.CheckFatal(t, err)
+			tassert.CheckFatal(t, tools.WaitForCondition(func() bool {
+				_, err := api.GetObject(remoteBP, remoteBck, names[0], nil)
+				if err == nil {
+					return false
+				}
+				herr := cmn.AsErrHTTP(err)
+				tassert.Fatalf(t, herr != nil && herr.Status == http.StatusTooManyRequests, "expected remote 429, got %v", err)
+				return true
+			}, tools.WaitRetryOpts{MaxRetries: 32, Interval: time.Millisecond}))
+			_, err = api.GetObject(bp, bck, names[0], nil)
+			if !tc.retry {
+				// Wait out core.RR.Throttle's target-wide backoff before subsequent blob tests.
+				resumeAt := time.Now().Add(config.Timeout.ColdRangeBackoff())
+				t.Cleanup(func() { time.Sleep(time.Until(resumeAt)) })
+			}
+			herr := cmn.AsErrHTTP(err)
+			tassert.Fatalf(t, herr != nil, "expected HTTP error, got %v", err)
+			if tc.retry {
+				tassert.Fatalf(t, herr.TypeCode == "ErrBackendRetry", "expected exhausted backend retry, got %v", err)
+			} else {
+				tassert.Fatalf(t, herr.Status == http.StatusTooManyRequests, "expected forwarded 429, got %v", err)
+			}
+		})
+	}
+}
+
+func TestInvalidNumWorkers(t *testing.T) {
+	const errInvalid = "invalid num-workers"
+	var (
+		proxyURL = tools.RandomProxyURL(t)
+		bp       = tools.BaseAPIParams(proxyURL)
+		bck      = cmn.Bck{Name: trand.String(10), Provider: apc.AIS}
+		objName  = t.Name() + "/" + trand.String(8)
+	)
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
+	tassert.CheckFatal(t, tools.PutObjRR(bp, bck, objName, cos.KiB, cos.ChecksumNone))
+
+	checkErr := func(t *testing.T, err error) {
+		tassert.Errorf(t, err != nil && strings.Contains(err.Error(), errInvalid), "expected %q, got %v", errInvalid, err)
+	}
+
+	t.Run("delete", func(t *testing.T) {
+		evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: []string{objName}}, NumWorkers: -10}
+		_, err := api.DeleteMultiObj(bp, bck, evdMsg)
+		checkErr(t, err)
+		checkLsoCount(t, bp, bck, 1)
+	})
+
+	t.Run("tco", func(t *testing.T) {
+		bckTo := cmn.Bck{Name: trand.String(10), Provider: apc.AIS}
+		tools.CreateBucket(t, proxyURL, bckTo, nil, true /*cleanup*/)
+
+		msg := cmn.TCOMsg{ToBck: bckTo}
+		msg.ObjNames = []string{objName}
+		msg.NumWorkers = -2
+		_, err := api.CopyMultiObj(bp, bck, &msg)
+		checkErr(t, err)
+		checkLsoCount(t, bp, bck, 1)
+	})
+
+	t.Run("tcb", func(t *testing.T) {
+		bckTo := cmn.Bck{Name: trand.String(10), Provider: apc.AIS}
+		tools.CreateBucket(t, proxyURL, bckTo, nil, true /*cleanup*/)
+
+		_, err := api.CopyBucket(bp, bck, bckTo, &apc.TCBMsg{NumWorkers: -2})
+		checkErr(t, err)
+		checkLsoCount(t, bp, bck, 1)
+	})
+
+	t.Run("shard-index", func(t *testing.T) {
+		_, err := api.IndexBucketShards(bp, bck, &apc.IndexShardMsg{NumWorkers: -2})
+		checkErr(t, err)
+		checkLsoCount(t, bp, bck, 1)
+	})
+
+	// -1 (no workers) is valid
+	t.Run("delete-none", func(t *testing.T) {
+		evdMsg := &apc.EvdMsg{ListRange: apc.ListRange{ObjNames: []string{objName}}, NumWorkers: xact.NwpNone}
+		xid, err := api.DeleteMultiObj(bp, bck, evdMsg)
+		tassert.CheckFatal(t, err)
+		args := xact.ArgsMsg{ID: xid, Kind: apc.ActDeleteObjects, Timeout: tools.RebalanceTimeout}
+		tassert.CheckFatal(t, api.WaitForXaction(bp, &args))
+		checkLsoCount(t, bp, bck, 0)
+	})
+}
+
+func checkLsoCount(t *testing.T, bp api.BaseParams, bck cmn.Bck, expected int) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	lst, err := api.ListObjects(bp, bck, nil, api.ListArgs{Context: ctx})
+	tassert.CheckFatal(t, err)
+	tassert.Fatalf(t, len(lst.Entries) == expected, "expected %d object(s), got %d", expected, len(lst.Entries))
+}
+
+func TestBackendRateLimitBackoffRemoteAIS(t *testing.T) {
+	tools.CheckSkip(t, &tools.SkipTestArgs{RequiresRemoteCluster: true, Long: true})
+	bp := tools.BaseAPIParams(tools.RandomProxyURL(t))
+	remoteBP := tools.BaseAPIParams(tools.RemoteCluster.URL)
+	remoteSmap, err := api.GetClusterMap(remoteBP)
+	tassert.CheckFatal(t, err)
+	for _, tc := range []struct {
+		name                string
+		backendRateLimit    bool
+		backendMaxTokens    int
+		backendInterval     time.Duration
+		rangeRead           bool
+		remoteTokenInterval time.Duration
+		missingObject       bool
+		wantHTTPError       int
+		wantErrorType       string
+		numRetries          int
+		wantRetrySleep      time.Duration
+	}{
+		{
+			name: "cold-get-succeeds-without-429", backendRateLimit: true,
+		},
+		{
+			name: "missing-object-returns-404", backendRateLimit: true, missingObject: true,
+			wantHTTPError: http.StatusNotFound,
+		},
+		{
+			name: "disabled-backend-limiter-forwards-429", backendRateLimit: false,
+			remoteTokenInterval: 5 * time.Minute, wantHTTPError: http.StatusTooManyRequests,
+		},
+		{
+			name: "cold-get-recovers-from-429-and-clears-retry-delay", backendRateLimit: true,
+			remoteTokenInterval: 5 * time.Minute,
+		},
+		{
+			name: "range-read-recovers-from-429-and-clears-retry-delay", backendRateLimit: true, rangeRead: true,
+			remoteTokenInterval: 5 * time.Minute,
+		},
+		{
+			name: "one-retry-sleeps-20ms", backendRateLimit: true, numRetries: 1,
+			remoteTokenInterval: time.Hour, wantErrorType: "ErrBackendRetry", wantRetrySleep: 20 * time.Millisecond,
+		},
+		{
+			name: "two-retries-sleep-20ms-plus-40ms", backendRateLimit: true, numRetries: 2,
+			remoteTokenInterval: time.Hour, wantErrorType: "ErrBackendRetry", wantRetrySleep: 60 * time.Millisecond,
+		},
+		{
+			name: "three-retries-sleep-20ms-plus-40ms-plus-80ms", backendRateLimit: true, numRetries: 3,
+			remoteTokenInterval: time.Hour, wantErrorType: "ErrBackendRetry", wantRetrySleep: 140 * time.Millisecond,
+		},
+		{
+			name: "slow-backend-limit-keeps-10s-retry-interval", backendRateLimit: true, numRetries: 1,
+			backendMaxTokens: 1, backendInterval: 20 * time.Second,
+			remoteTokenInterval: time.Hour, wantErrorType: "ErrBackendRetry", wantRetrySleep: 10 * time.Second,
+		},
+		{
+			name: "persistent-429-exhausts-retry-budget", backendRateLimit: true,
+			remoteTokenInterval: time.Hour, wantErrorType: "ErrBackendRetry",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remoteBck := cmn.Bck{Name: "backend-backoff-" + cos.GenTie(), Provider: apc.AIS}
+			tools.CreateBucket(t, remoteBP.URL, remoteBck, nil, true)
+			names, _, err := tools.PutRandObjs(tools.PutObjectsArgs{
+				Context: t.Context(), ProxyURL: remoteBP.URL, Bck: remoteBck,
+				ObjCnt: 1, ObjSize: cos.KiB, FixedSize: true, CksumType: cos.ChecksumOneXxh,
+			})
+			tassert.CheckFatal(t, err)
+			bck := remoteBck
+			bck.Ns.UUID = tools.RemoteCluster.UUID
+			_, err = api.HeadBucket(bp, bck, false)
+			tassert.CheckFatal(t, err)
+			t.Cleanup(func() { tassert.CheckError(t, api.EvictRemoteBucket(bp, bck, false)) })
+			numRetries := cos.DfltRateMaxRetries
+			if tc.numRetries != 0 {
+				numRetries = tc.numRetries
+			}
+			maxTokens, interval := tc.backendMaxTokens, tc.backendInterval
+			if maxTokens == 0 {
+				maxTokens, interval = 10_000, time.Second
+			}
+			_, err = api.SetBucketProps(bp, bck, &cmn.BpropsToSet{RateLimit: &cmn.RateLimitConfToSet{
+				Backend: &cmn.AdaptiveToSet{RateLimitBaseToSet: cmn.RateLimitBaseToSet{
+					Enabled: apc.Ptr(tc.backendRateLimit), MaxTokens: apc.Ptr(maxTokens), Interval: apc.Ptr(cos.Duration(interval)),
+				}, NumRetries: apc.Ptr(numRetries)},
+			}})
+			tassert.CheckFatal(t, err)
+			if tc.remoteTokenInterval != 0 {
+				_, err = api.SetBucketProps(remoteBP, remoteBck, &cmn.BpropsToSet{RateLimit: &cmn.RateLimitConfToSet{
+					Frontend: &cmn.BurstyToSet{RateLimitBaseToSet: cmn.RateLimitBaseToSet{
+						Enabled: apc.Ptr(true), MaxTokens: apc.Ptr(8 * remoteSmap.CountActivePs()),
+						Interval: apc.Ptr(cos.Duration(tc.remoteTokenInterval)),
+					}, Size: apc.Ptr(1)},
+				}})
+				tassert.CheckFatal(t, err)
+				tassert.CheckFatal(t, tools.WaitForCondition(func() bool {
+					_, getErr := api.GetObject(remoteBP, remoteBck, names[0], nil)
+					if getErr == nil {
+						return false
+					}
+					herr := cmn.AsErrHTTP(getErr)
+					tassert.Fatalf(t, herr != nil && herr.Status == http.StatusTooManyRequests, "expected remote 429, got %v", getErr)
+					return true
+				}, tools.WaitRetryOpts{MaxRetries: 32, Interval: time.Millisecond}))
+			}
+			args := &api.GetArgs{Context: t.Context()}
+			wantSize := int64(cos.KiB)
+			if tc.rangeRead {
+				wantSize = 1
+				args.Header = http.Header{cos.HdrRange: []string{"bytes=0-0"}}
+			}
+			var (
+				owner  *meta.Snode
+				before *stats.Node
+			)
+			if tc.wantRetrySleep != 0 {
+				smap := tools.GetClusterMap(t, bp.URL)
+				smap.InitDigests()
+				owner, err = smap.HrwObjName2T(meta.CloneBck(&bck), names[0])
+				tassert.CheckFatal(t, err)
+				before, err = api.GetDaemonStats(bp, owner)
+				tassert.CheckFatal(t, err)
+			}
+			started := time.Now()
+			name := names[0]
+			if tc.missingObject {
+				name += "-missing"
+			}
+			oa, err := api.GetObject(bp, bck, name, args)
+			elapsed := time.Since(started)
+			tlog.Logfln("GET completed in %v: %v", elapsed, err)
+			if tc.wantRetrySleep != 0 {
+				after, statsErr := api.GetDaemonStats(bp, owner)
+				tassert.CheckFatal(t, statsErr)
+				retried := tools.GetNamedStatsVal(after, stats.RatelimGetRetryCount) - tools.GetNamedStatsVal(before, stats.RatelimGetRetryCount)
+				sleep := time.Duration(tools.GetNamedStatsVal(after, stats.RatelimGetRetryLatencyTotal) - tools.GetNamedStatsVal(before, stats.RatelimGetRetryLatencyTotal))
+				tassert.Fatalf(t, retried == 1 && sleep == tc.wantRetrySleep,
+					"expected one retried GET with %v total sleep, got %d with %v", tc.wantRetrySleep, retried, sleep)
+			}
+			if tc.wantHTTPError == 0 && tc.wantErrorType == "" {
+				tassert.Fatalf(t, err == nil, "GET failed: %v", err)
+				tassert.Fatalf(t, oa.Size() == wantSize, "expected %d bytes, got %d", wantSize, oa.Size())
+				if tc.remoteTokenInterval != 0 {
+					_, err = api.SetBucketProps(remoteBP, remoteBck, &cmn.BpropsToSet{RateLimit: &cmn.RateLimitConfToSet{
+						Frontend: &cmn.BurstyToSet{RateLimitBaseToSet: cmn.RateLimitBaseToSet{Enabled: apc.Ptr(false)}},
+					}})
+					tassert.CheckFatal(t, err)
+					tassert.CheckFatal(t, api.EvictObject(bp, bck, name))
+					started = time.Now()
+					oa, err = api.GetObject(bp, bck, name, args)
+					elapsed = time.Since(started)
+					tassert.CheckFatal(t, err)
+					tassert.Fatalf(t, oa.Size() == wantSize, "expected %d bytes after recovery, got %d", wantSize, oa.Size())
+					tassert.Fatalf(t, elapsed < time.Second, "successful GET retained retry delay: %v", elapsed)
+					tlog.Logfln("GET after recovery completed in %v", elapsed)
+				}
+				return
+			}
+			herr := cmn.AsErrHTTP(err)
+			tassert.Fatalf(t, herr != nil, "expected HTTP error, got %v", err)
+			if tc.wantErrorType != "" {
+				tassert.Fatalf(t, herr.TypeCode == tc.wantErrorType, "expected %s, got %v", tc.wantErrorType, err)
+				tassert.Fatalf(t, elapsed < 2*cos.DfltRateMaxWait,
+					"persistent 429 exceeded the retry wait budget: %v", elapsed)
+			} else {
+				tassert.Fatalf(t, herr.Status == tc.wantHTTPError, "expected HTTP %d, got %v", tc.wantHTTPError, err)
+			}
+		})
+	}
 }
 
 func TestPrefetchRange(t *testing.T) {

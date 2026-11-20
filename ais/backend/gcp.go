@@ -13,15 +13,18 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -30,11 +33,12 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/tracing"
 
 	"cloud.google.com/go/storage"
-	jsoniter "github.com/json-iterator/go"
+	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -49,6 +53,12 @@ const (
 	projectIDField  = "project_id"
 	projectIDEnvVar = "GOOGLE_CLOUD_PROJECT"
 	credPathEnvVar  = "GOOGLE_APPLICATION_CREDENTIALS" //nolint:gosec // false positive G101
+
+	gcpMaxCredsSize = cos.MiB
+
+	// external_account "credential_source" keys
+	credSrcFile   = "file"
+	credSrcFormat = "format"
 )
 
 const (
@@ -62,6 +72,12 @@ type (
 		dfltOnce sync.Once
 		dfltErr  error
 		base
+	}
+	// validated credentials file
+	gcpCreds struct {
+		json      []byte
+		credType  option.CredentialsType
+		projectID string // may be empty
 	}
 	gcpSess struct {
 		client     *storage.Client
@@ -103,12 +119,13 @@ func (gsbp *gsbp) initDfltSess() {
 	)
 	credPath := os.Getenv(credPathEnvVar)
 	if credPath != "" {
-		var err error
-		if credProjectID, err = gcpLoadCreds(credPath); err != nil {
+		creds, err := gcpLoadCreds(credPath)
+		if err != nil {
 			gsbp.dfltErr = fmt.Errorf("%s '%s=%s': %v", fmtErrLoadCreds, credPathEnvVar, credPath, err)
 			return
 		}
-		opts = append(opts, option.WithAuthCredentialsFile(option.ServiceAccount, credPath))
+		credProjectID = creds.projectID
+		opts = append(opts, option.WithAuthCredentialsJSON(creds.credType, creds.json))
 	}
 	if credProjectID != "" && envProjectID != "" && credProjectID != envProjectID {
 		gsbp.dfltErr = fmt.Errorf("both %q and %q env vars cannot be defined (and not equal %s)",
@@ -154,7 +171,7 @@ func (gsbp *gsbp) HeadBucket(ctx context.Context, bck *meta.Bck) (cos.StrKVs, in
 	if e != nil {
 		return nil, 0, e
 	}
-	if _, err := client.Bucket(cloudBck.Name).Attrs(ctx); err != nil {
+	if _, err := gcsBucket(ctx, client, cloudBck.Name).Attrs(ctx); err != nil {
 		ecode, err := gcpErrorToAISError(err, cloudBck)
 		return nil, ecode, err
 	}
@@ -201,7 +218,7 @@ func (gsbp *gsbp) ListObjects(ctx context.Context, bck *meta.Bck, msg *apc.LsoMs
 	}
 
 	var (
-		it    = client.Bucket(cloudBck.Name).Objects(ctx, query)
+		it    = gcsBucket(ctx, client, cloudBck.Name).Objects(ctx, query)
 		pager = iterator.NewPager(it, int(msg.PageSize), msg.ContinuationToken)
 		objs  = make([]*storage.ObjectAttrs, 0, msg.PageSize)
 	)
@@ -303,7 +320,7 @@ func (gsbp *gsbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (
 	if e != nil {
 		return nil, 0, e
 	}
-	attrs, err := client.Bucket(cloudBck.Name).Object(lom.ObjName).Attrs(ctx)
+	attrs, err := gcsBucket(ctx, client, cloudBck.Name).Object(lom.ObjName).Attrs(ctx)
 	if err != nil {
 		ecode, errV := gcpObjErr(ctx, client, err, cloudBck)
 		return nil, ecode, errV
@@ -380,7 +397,7 @@ func (gsbp *gsbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, lengt
 	dl, ctx := newRdl(ctx, &gsbp.base, lom.Bck())
 	defer dl.fini(&res)
 
-	o := client.Bucket(cloudBck.Name).Object(lom.ObjName)
+	o := gcsBucket(ctx, client, cloudBck.Name).Object(lom.ObjName)
 	if length > 0 {
 		if o, res.Err = gcpPin(o, core.RangePin(pin)); res.Err != nil {
 			return res
@@ -433,6 +450,9 @@ func (gsbp *gsbp) GetObjReader(ctx context.Context, lom *core.LOM, offset, lengt
 	// full read
 	rc, res.Err = o.NewReader(ctx)
 	if res.Err != nil {
+		if _, ok := errors.AsType[*googleapi.Error](res.Err); ok {
+			res.ErrCode, res.Err = gcpErrorToAISError(res.Err, cloudBck)
+		}
 		return res
 	}
 	// custom metadata
@@ -505,8 +525,9 @@ func (gsbp *gsbp) PutObj(ctx context.Context, r io.ReadCloser, lom *core.LOM, or
 		return 0, e
 	}
 
-	o := client.Bucket(cloudBck.Name).Object(lom.ObjName)
-	wc := o.NewWriter(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	wc := client.Bucket(cloudBck.Name).Object(lom.ObjName).Retryer(gcsWriteRetryOpts...).NewWriter(ctx)
 	wc.Metadata = map[string]string{
 		gcpChecksumType: cksumType,
 		gcpChecksumVal:  cksumVal,
@@ -524,18 +545,16 @@ func (gsbp *gsbp) PutObj(ctx context.Context, r io.ReadCloser, lom *core.LOM, or
 	cos.Close(r)
 
 	if err != nil {
+		if _, ok := errors.AsType[*googleapi.Error](err); ok {
+			return gcpErrorToAISError(err, cloudBck)
+		}
 		return 0, err
 	}
 	if err := wc.Close(); err != nil {
 		return gcpErrorToAISError(err, cloudBck)
 	}
 
-	attrs, errV := o.Attrs(ctx)
-	if errV != nil {
-		return gcpObjErr(ctx, client, errV, cloudBck)
-	}
-
-	_ = gcpSetCustom(lom, attrs)
+	_ = gcpSetCustom(lom, wc.Attrs())
 	if cmn.Rom.V(5, cos.ModBackend) {
 		nlog.Infof("[put_object] %s, size %d", lom, written)
 	}
@@ -552,7 +571,7 @@ func (gsbp *gsbp) DeleteObj(ctx context.Context, lom *core.LOM) (int, error) {
 	if e != nil {
 		return 0, e
 	}
-	o := client.Bucket(cloudBck.Name).Object(lom.ObjName)
+	o := gcsBucket(ctx, client, cloudBck.Name).Object(lom.ObjName)
 	if err := o.Delete(ctx); err != nil {
 		return gcpObjErr(ctx, client, err, cloudBck)
 	}
@@ -566,31 +585,103 @@ func (gsbp *gsbp) DeleteObj(ctx context.Context, lom *core.LOM) (int, error) {
 // session management & static helpers
 //
 
-func gcpLoadCreds(path string) (string, error) {
-	fh, e := os.Open(path)
-	if e != nil {
-		return "", e
+func gcpLoadCreds(path string) (*gcpCreds, error) {
+	// stat first: opening a FIFO would block
+	if finfo, err := os.Stat(path); err != nil {
+		return nil, err
+	} else if !finfo.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
 	}
-	b, err := cos.ReadAll(fh)
-	fh.Close()
+	fh, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer fh.Close()
+	// recheck via descriptor
+	if finfo, err := fh.Stat(); err != nil {
+		return nil, err
+	} else if !finfo.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	b, err := cos.ReadAll(io.LimitReader(fh, gcpMaxCredsSize+1)) // +1 detects overflow
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > gcpMaxCredsSize {
+		return nil, fmt.Errorf("file exceeds %d bytes", gcpMaxCredsSize)
+	}
+	return gcpParseCreds(b)
+}
+
+// Object content is user-writable and lives under mountpaths: it must never be read as credentials.
+// Returns the path with symlinks resolved.
+func gcpResolveCredPath(path string) (string, error) {
+	// follow symlinks: projected K8s Secret files are symlinks
+	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", err
 	}
-	v := jsoniter.Get(b, projectIDField).GetInterface()
-	projectID, ok := v.(string)
-	if !ok {
-		return "", fmt.Errorf("unexpected projectID type (%T)", v)
+	avail, disabled := fs.Get()
+	for _, mpis := range []fs.MPI{avail, disabled} {
+		for mpath := range mpis {
+			mp, err := filepath.EvalSymlinks(mpath)
+			if err != nil {
+				mp = mpath
+			}
+			if resolved == mp || strings.HasPrefix(resolved, mp+string(filepath.Separator)) {
+				return "", fmt.Errorf("credentials file inside mountpath %q", mpath)
+			}
+		}
 	}
-	debug.Assert(projectID != "")
-	return projectID, nil
+	return resolved, nil
+}
+
+func gcpParseCreds(b []byte) (*gcpCreds, error) {
+	var parsed struct {
+		Type             string         `json:"type"`
+		ProjectID        string         `json:"project_id"`
+		CredentialSource map[string]any `json:"credential_source"`
+	}
+	// encoding/json, not jsoniter: jsoniter errors quote the surrounding file content
+	if err := json.Unmarshal(b, &parsed); err != nil {
+		return nil, fmt.Errorf("invalid credentials JSON file: %v", err)
+	}
+	creds := &gcpCreds{json: b, credType: option.CredentialsType(parsed.Type), projectID: parsed.ProjectID}
+	if creds.credType == option.ServiceAccount {
+		return creds, nil
+	}
+	if creds.credType == option.ExternalAccount {
+		// never run executables or fetch tokens from URLs on behalf of a credentials file
+		file, _ := parsed.CredentialSource[credSrcFile].(string)
+		if file == "" {
+			return nil, fmt.Errorf("external_account: only \"credential_source.%s\" is supported", credSrcFile)
+		}
+		for k := range parsed.CredentialSource {
+			if k != credSrcFile && k != credSrcFormat {
+				return nil, fmt.Errorf("external_account: unsupported \"credential_source.%s\"", k)
+			}
+		}
+		return creds, nil
+	}
+	return nil, fmt.Errorf("unsupported credentials type %q (expecting %q or %q)",
+		parsed.Type, option.ServiceAccount, option.ExternalAccount)
+}
+
+// loads credentials from a user-supplied path (bucket property)
+func gcpLoadUserCreds(path string) (*gcpCreds, error) {
+	resolved, err := gcpResolveCredPath(path)
+	if err != nil {
+		return nil, err
+	}
+	return gcpLoadCreds(resolved)
 }
 
 // once (on demand), via bprops "extra.gcp.application_creds"
 func gcpCreateSess(ctx context.Context, credPath string, bck *cmn.Bck) (*gcpSess, error) {
 	debug.Assert(credPath != "")
 
-	projectID, err := gcpLoadCreds(credPath)
-	if projectID == "" {
+	creds, err := gcpLoadUserCreds(credPath)
+	if err != nil {
 		var s string
 		if bck != nil {
 			s = " for bucket " + bck.Cname("")
@@ -600,9 +691,9 @@ func gcpCreateSess(ctx context.Context, credPath string, bck *cmn.Bck) (*gcpSess
 
 	opts := []option.ClientOption{
 		option.WithScopes(storage.ScopeFullControl),
-		option.WithAuthCredentialsFile(option.ServiceAccount, credPath),
+		option.WithAuthCredentialsJSON(creds.credType, creds.json),
 	}
-	sess := &gcpSess{projectID: projectID}
+	sess := &gcpSess{projectID: creds.projectID}
 	return sess, sess.init(ctx, opts)
 }
 
@@ -618,7 +709,7 @@ func (sess *gcpSess) init(ctx context.Context, opts []option.ClientOption) error
 	opts = append(opts, option.WithHTTPClient(sess.httpClient))
 
 	// cloud.google.com/go/storage client
-	client, err := storage.NewClient(ctx, opts...)
+	client, err := gcsNewClient(ctx, opts)
 	if err != nil {
 		return cmn.NewErrFailedTo(nil, "gcp-backend: create", "client", err)
 	}
@@ -715,12 +806,56 @@ func _gcpErr(gcpError error) error {
 func gcpObjErr(ctx context.Context, gcpClient *storage.Client, objErr error, bck *cmn.Bck) (int, error) {
 	// TODO: consider additionally checking for `*googleapi.Error{Code:404}`
 	if !errors.Is(objErr, storage.ErrObjectNotExist) {
+		if e, ok := errors.AsType[*googleapi.Error](objErr); ok &&
+			(e.Code == http.StatusTooManyRequests || e.Code == http.StatusServiceUnavailable) {
+			return gcpErrorToAISError(objErr, bck)
+		}
 		return http.StatusBadRequest, _gcpErr(objErr)
 	}
 
 	// Object does not exist but in GCP it doesn't necessarily mean that the bucket does.
-	if _, err := gcpClient.Bucket(bck.Name).Attrs(ctx); err != nil {
+	if _, err := gcsBucket(ctx, gcpClient, bck.Name).Attrs(ctx); err != nil {
 		return gcpErrorToAISError(err, bck)
 	}
 	return http.StatusNotFound, cos.NewErrNotFound(nil, _gcpErr(objErr).Error())
+}
+
+//
+// sdkRetry => GCS retry options
+//
+
+// single attempt per API call
+var gcsNoRetryOpts = []storage.RetryOption{storage.WithPolicy(storage.RetryNever)}
+
+// pass the error predicate to the JSON upload client, including resumable chunks
+// (RetryNever leaves the chunk uploader's default retry policy in place)
+var gcsWriteRetryOpts = []storage.RetryOption{
+	storage.WithPolicy(storage.RetryAlways),
+	storage.WithErrorFunc(func(error) bool { return false }),
+}
+
+func gcsNewClient(ctx context.Context, opts []option.ClientOption) (*storage.Client, error) {
+	client, err := storage.NewClient(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	client.SetRetry(sdkRetryDflt.gcs()...)
+	return client, nil
+}
+
+// bucket handle; object handles and iterators inherit its retry settings
+func gcsBucket(ctx context.Context, client *storage.Client, name string) *storage.BucketHandle {
+	b := client.Bucket(name)
+	if cmn.IsNoRetry(ctx) {
+		b = b.Retryer(gcsNoRetryOpts...)
+	}
+	return b
+}
+
+func (sr *sdkRetry) gcs() []storage.RetryOption {
+	opts := []storage.RetryOption{storage.WithMaxAttempts(sr.maxAttempts)}
+	if sr.noBackoff {
+		opts = append(opts, storage.WithBackoff(gax.Backoff{Initial: time.Nanosecond, Max: time.Nanosecond}))
+	}
+	return opts
 }

@@ -413,14 +413,22 @@ func killProxyOrTargetK8s(bp api.BaseParams, node *meta.Snode, namespace ...stri
 // Freeze a local node (SIGSTOP): the node keeps its connections but answers no request.
 // The returned function resumes the node (SIGCONT).
 func PauseNode(node *meta.Snode) (resume func() error, err error) {
-	pid, err := getPID(node.PubNet.Port)
+	pause, resume, err := NodePauser(node)
 	if err != nil {
 		return nil, err
 	}
-	if err = syscall.Kill(pid, syscall.SIGSTOP); err != nil {
-		return nil, err
+	return resume, pause()
+}
+
+// Find the process of a local node to freeze (SIGSTOP) and resume (SIGCONT) it later.
+func NodePauser(node *meta.Snode) (pause, resume func() error, err error) {
+	pid, err := getPID(node.PubNet.Port)
+	if err != nil {
+		return nil, nil, err
 	}
-	return func() error { return syscall.Kill(pid, syscall.SIGCONT) }, nil
+	pause = func() error { return syscall.Kill(pid, syscall.SIGSTOP) }
+	resume = func() error { return syscall.Kill(pid, syscall.SIGCONT) }
+	return pause, resume, nil
 }
 
 // In Kubernetes mode, killing a pod will cause it to be automatically recreated by the StatefulSet.
@@ -484,6 +492,27 @@ func KillNode(bp api.BaseParams, node *meta.Snode) (cmd RestoreCmd, err error) {
 		}
 	}
 	return cmd, err
+}
+
+func CrashNode(node *meta.Snode) (cmd RestoreCmd, err error) {
+	restoreNodesOnce.Do(func() {
+		initNodeCmd()
+	})
+	var pid int
+	cmd.Node = node
+	if pid, cmd.Cmd, cmd.Args, err = getProcess(node.PubNet.Port); err != nil {
+		return cmd, err
+	}
+	if err = syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		return cmd, err
+	}
+	for to := time.Now().Add(processKillTimeout); time.Now().Before(to); {
+		time.Sleep(time.Second)
+		if _, _, _, errPs := getProcess(node.PubNet.Port); errPs != nil {
+			return cmd, nil
+		}
+	}
+	return cmd, fmt.Errorf("failed to 'kill -9' process (pid: %d, port: %s)", pid, node.PubNet.Port)
 }
 
 func ShutdownNode(bp api.BaseParams, node *meta.Snode) (pid int, cmd RestoreCmd, rebID string, err error) {
@@ -574,7 +603,7 @@ func startNode(cmd *RestoreCmd, asPrimary bool) (int, error) {
 	return pid, err
 }
 
-func DeployNode(t *testing.T, node *meta.Snode, conf *cmn.Config, localConf *cmn.LocalConfig) int {
+func DeployNode(t *testing.T, node *meta.Snode, conf *cmn.Config, localConf *cmn.LocalConfig, extraArgs ...string) int {
 	conf.ConfigDir = t.TempDir()
 	conf.LogDir = t.TempDir()
 	conf.TestFSP.Root = t.TempDir()
@@ -593,16 +622,15 @@ func DeployNode(t *testing.T, node *meta.Snode, conf *cmn.Config, localConf *cmn
 	tassert.CheckFatal(t, err)
 
 	configFile := filepath.Join(conf.ConfigDir, "ais.json")
-	err = jsp.SaveMeta(configFile, &conf.ClusterConfig, nil)
+	err = jsp.Save(configFile, &conf.ClusterConfig, jsp.Plain(), nil)
 	tassert.CheckFatal(t, err)
 
-	var cmd = RestoreCmd{
-		Args: []string{
-			"-role=" + node.Type(),
-			"-daemon_id=" + node.ID(),
-			"-config=" + configFile,
-			"-local_config=" + localConfFile,
-		},
+	args := []string{"-role=" + node.Type(), "-config=" + configFile, "-local_config=" + localConfFile}
+	if id := node.ID(); id != "" {
+		args = append(args, "-daemon_id="+id)
+	}
+	cmd := RestoreCmd{
+		Args: append(args, extraArgs...),
 		Node: node,
 		Cmd:  getAISNodeCmd(t),
 	}

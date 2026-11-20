@@ -97,7 +97,8 @@ $ AIS_PRIMARY_EP=ais-proxy-0.svc.cluster.local:51082
 
 | name | comment |
 | ---- | ------- |
-| `AIS_DAEMON_ID` | ais node ID |
+| `AIS_DAEMON_ID` | Node ID; `-daemon_id` takes precedence. Must match a persisted ID, if any (target mountpaths; `.ais.proxy_id` outside Kubernetes). |
+| `AIS_DAEMON_ID_SOURCE` | Derive node IDs from Kubernetes pod identity when no ID is specified (`-daemon_id`/`AIS_DAEMON_ID`) or persisted. See [pod-derived IDs](/docs/lifecycle_node.md#pod-derived-ids) for `k8s-pod` and `k8s-pod:<scope>`. |
 | `AIS_HOST_IP` | node's public IPv4 |
 | `AIS_HOST_PORT` | node's public TCP port (and note the corresponding local config: "host_net.port") |
 
@@ -199,13 +200,13 @@ AIS natively supports 3 (three) [Cloud storages](/docs/providers.md).
 
 The corresponding environment "belongs" to the internal [backend](https://github.com/NVIDIA/aistore/tree/main/ais/backend) package and includes:
 
-| name                                                                                                            | comment |
-|-----------------------------------------------------------------------------------------------------------------| ------- |
-| `S3_ENDPOINT`, `AWS_PROFILE`, `AWS_REGION`, `AIS_S3_CONFIG_DIR`                                                 | see previous section |
-| `GOOGLE_CLOUD_PROJECT`, `GOOGLE_APPLICATION_CREDENTIALS`                                                        | GCP account with permissions to access Google Cloud Storage buckets |
-| `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`                                                                    | Azure account with  permissions to access Blob Storage containers |
-| `AIS_AZURE_URL`                                                                                                 | Azure endpoint, e.g. `http://<account_name>.blob.core.windows.net` |
-| `OCI_TENANCY_OCID`, `OCI_USER_OCID`, `OCI_REGION`, `OCI_FINGERPRINT`, `OCI_PRIVATE_KEY`, `OCI_COMPARTMENT_OCID` | OCI account with permissions to access Object Storage buckets and compartments |
+| name                                                                                                            | comment                                                                                                                                     |
+|-----------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `S3_ENDPOINT`, `AWS_PROFILE`, `AWS_REGION`, `AIS_S3_CONFIG_DIR`                                                 | see previous section                                                                                                                        |
+| `GOOGLE_CLOUD_PROJECT`, `GOOGLE_APPLICATION_CREDENTIALS`                                                        | GCP account with permissions to access Google Cloud Storage buckets (see [GCP credentials](/docs/cli/gcp_creds.md#credentials-file-format)) |
+| `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`                                                                    | Azure account with  permissions to access Blob Storage containers                                                                           |
+| `AIS_AZURE_URL`                                                                                                 | Azure endpoint, e.g. `http://<account_name>.blob.core.windows.net`                                                                          |
+| `OCI_TENANCY_OCID`, `OCI_USER_OCID`, `OCI_REGION`, `OCI_FINGERPRINT`, `OCI_PRIVATE_KEY`, `OCI_COMPARTMENT_OCID` | OCI account with permissions to access Object Storage buckets and compartments                                                              |
 
 Notice in the table above that the variables `S3_ENDPOINT` and `AWS_PROFILE` are designated as _global_: cluster-wide.
 

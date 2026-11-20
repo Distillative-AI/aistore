@@ -581,11 +581,7 @@ Finally, there's also HTTPS configuration including X.509 certificates and optio
 
 ### Multiple deployment options
 
-AIStore deploys anywhere anytime supporting multiple deployment options [summarized and further referenced here](/deploy/README.md).
-
-All [containerized deployments](/deploy/README.md) have their own separate `Makefiles`. With the exception of [local playground](#local-playground), each specific build-able development (`dev/`) and production (`prod/`) option under the `deploy` folder contains a pair: {`Dockerfile`, `Makefile`}.
-
-> This separation is typically small in size and easily readable and maintainable.
+The [deployment summary](/deploy/README.md) lists the development and test setups in this repository. Use the [ais-k8s production deployment guide](https://github.com/NVIDIA/ais-k8s/blob/main/docs/README.md) for production.
 
 Also supported is the option *not* to have the [required](#prerequisites) [Go](https://go.dev) installed and configured. To still be able to build AIS binaries without [Go](https://go.dev) on your machine, make sure that you have `docker` and simply uncomment `CROSS_COMPILE` line in the top [`Makefile`](https://github.com/NVIDIA/aistore/blob/main/Makefile).
 
@@ -816,7 +812,7 @@ To that end, each AIS node at startup loads and parses [cgroup](https://www.kern
 
 Further, given the container's cgroup/memory limitation, each AIS node adjusts the amount of memory available for itself.
 
-> Memory limits may affect [dSort](/docs/dsort.md) performance forcing it to "spill" the content associated with in-progress resharding into local drives. The same is true for erasure-coding which also requires memory to rebuild objects from slices, etc.
+> Erasure coding requires memory to rebuild objects from slices; account for this when setting memory limits.
 
 > For technical details on AIS memory management, please see [this readme](/memsys/README.md).
 

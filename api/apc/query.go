@@ -26,9 +26,6 @@ const (
 	QparamETLFQN           = "etl_fqn"
 	QparamETLSecret        = "etl_secret" // secret generated during ETL init to validate directly target access from trusted ETL
 
-	QparamRegex      = "regex"       // dsort: list regex
-	QparamOnlyActive = "only_active" // dsort: list only active
-
 	// remove existing custom keys and store new custom metadata
 	// NOTE: making an s/_/-/ naming exception because of the namesake CLI usage
 	QparamNewCustom = "set-new-custom"
@@ -226,11 +223,6 @@ const (
 
 	QparamDontResilver = "dntres" // true: do not resilver data off of mountpaths that are being disabled/detached
 
-	// dsort
-	QparamTotalCompressedSize       = "tcs"
-	QparamTotalInputShardsExtracted = "tise"
-	QparamTotalUncompressedSize     = "tunc"
-
 	// 2PC transactions - control plane
 	QparamNetwTimeout  = "xnt" // [begin, start-commit] timeout
 	QparamHostTimeout  = "xht" // [begin, txn-done] timeout
@@ -248,8 +240,9 @@ const (
 	QparamNonce   = "x"
 	QparamSig     = "u"
 
-	// GetBatch
-	QparamTID   = "tid"   // designated target
+	// GetBatch: designated target
+	// Prefetch: targets to run on, one value per target (tid=t1&tid=t2)
+	QparamTID   = "tid"
 	QparamColoc = "coloc" // colocation hint: enum { 0=ColocNone, 1=ColocOne, 2=ColocTwo }
 
 	// System
@@ -279,11 +272,12 @@ const (
 	WhatMetricNames = "metrics"
 
 	// assorted
-	WhatMountpaths = "mountpaths"
-	WhatRemoteAIS  = "remote"
-	WhatSmapVote   = "smapvote"
-	WhatSysInfo    = "sysinfo"
-	WhatTargetIPs  = "target_ips" // comma-separated list of all target IPs (compare w/ GetWhatSnode)
+	WhatMountpaths  = "mountpaths"
+	WhatRemoteAIS   = "remote"
+	WhatRemaisNodes = "remote_nodes" // WhatRemoteAIS as currently seen by each node
+	WhatSmapVote    = "smapvote"
+	WhatSysInfo     = "sysinfo"
+	WhatTargetIPs   = "target_ips" // comma-separated list of all target IPs (compare w/ GetWhatSnode)
 
 	// log
 	WhatLog = "log"

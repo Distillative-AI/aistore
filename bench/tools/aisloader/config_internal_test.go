@@ -76,8 +76,8 @@ func TestLoadConfig(t *testing.T) {
 				t.Errorf("sample %s = %q, want default %q", fl.Name, got, fl.DefValue)
 			}
 		})
-		if p.duration.IsSet || p.cleanUp.IsSet {
-			t.Errorf("sample set omitted options: duration=%+v, cleanup=%+v", p.duration, p.cleanUp)
+		if p.duration.IsSet || p.cleanUp.IsSet || p.loaderID.IsSet {
+			t.Errorf("sample set omitted options: duration=%+v, cleanup=%+v, loaderid=%+v", p.duration, p.cleanUp, p.loaderID)
 		}
 	})
 }
@@ -90,6 +90,7 @@ func TestReadConfigRejectsInvalid(t *testing.T) {
 		{"nested value", "bucket: [a, b]", "line 1: bucket: config values must be scalars"},
 		{"multiple documents", configYAML("{}", "---", "ip: 127.0.0.1"), "config must contain exactly one YAML document"},
 		{"cli-only flags", "dry-run: true", "line 1: \"dry-run\" is CLI-only"},
+		{"cli-only list-out", "list-out: ais://lists/names.txt", "line 1: \"list-out\" is CLI-only"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

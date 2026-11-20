@@ -51,7 +51,7 @@ type (
 	BlobParams struct {
 		Lom     *LOM
 		Msg     *apc.BlobMsg
-		Context context.Context // optional; defaults to context.Background()
+		Context context.Context // optional; cancels range reads (client request, parent xaction)
 
 		BlobThreshold int64 // minimum remote object size (bytes); zero disables threshold selection
 
@@ -133,13 +133,14 @@ type (
 		ControlClient() *http.Client
 
 		// core object (+ PutObject above)
-		FinalizeObj(lom *LOM, workFQN string, xctn Xact, owt cmn.OWT) (ecode int, err error)
+		// rmWork: remove workFQN on error (otherwise, the caller removes it or rolls back)
+		FinalizeObj(lom *LOM, workFQN string, xctn Xact, owt cmn.OWT, rmWork bool) (ecode int, err error)
 		EvictObject(lom *LOM) (ecode int, err error)
 		DeleteObject(lom *LOM, evict bool) (ecode int, err error)
 
 		GetCold(ctx context.Context, lom *LOM, xkind string, owt cmn.OWT) (ecode int, err error)
 
-		HeadCold(lom *LOM, origReq *http.Request) (objAttrs *cmn.ObjAttrs, ecode int, err error)
+		HeadCold(ctx context.Context, lom *LOM, origReq *http.Request) (objAttrs *cmn.ObjAttrs, ecode int, err error)
 
 		Promote(params *PromoteParams) (ecode int, err error)
 		HeadObjT2T(lom *LOM, tsi *meta.Snode, reqProps ...string) (*cmn.ObjectPropsV2, error)
