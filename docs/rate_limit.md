@@ -12,7 +12,9 @@ This text explains how it all fits together.
 3. [Configuration](#3-configuration)
    - [Configuration: Summary Table](#31-configuration-summary-table)
 4. [Unified Rate-Limiting Logic](#4-unified-rate-limiting-logic)
+   - [Backend Activation Modes](#backend-activation-modes)
 5. [Handling Batch Jobs](#5-handling-batch-jobs)
+   - [Retry-Enabled Prefetch](#51-retry-enabled-prefetch)
 6. [Use Cases](#6-use-cases)
    - [Handling Backend-Imposed Limits](#61-handling-backend-imposed-limits)
    - [Limiting User Traffic](#62-limiting-user-traffic)
@@ -42,7 +44,7 @@ Not true! In reality, such integrations are always a balancing act: the goal is 
 
 **Reactive Rate Limiting** comes into play when the external service or remote storage actually enforces a limit (returning [429](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/429) or [503](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/503)).
 
-When that happens, we respond with adaptive backoff and retry logic — **but only** if the corresponding bucket has its rate-limiting policy enabled. This gives us a self-adjusting mechanism that converges on the maximum permissible speed with minimal overhead.
+When that happens, we respond with adaptive backoff and retry logic if the bucket's backend rate-limiting policy is enabled. [Retry-enabled prefetch](#51-retry-enabled-prefetch) uses a job-local backend limiter when the bucket policy enables on-demand activation.
 
 ---
 
@@ -120,11 +122,14 @@ rate_limit.frontend.per_op_max_tokens
 | Parameter | Description |
 |-----------|-------------|
 | `enabled` | Enables/disables rate limiting for frontend or backend |
+| `on_demand` | (Backend only) Delays rate limiting until the first backend `429`/`503`. Can be set while disabled; takes effect only when `enabled=true`. Defaults to `false`. |
 | `interval` | Time window for token replenishment (e.g., "1m", "10s") |
 | `max_tokens` | Maximum number of operations allowed in the interval |
 | `burst_size` | (Frontend only) Maximum burst allowed above steady rate |
 | `num_retries` | (Backend only) Maximum number of retry attempts when handling `429` or `503` |
 | `per_op_max_tokens` | Optional per-operation (GET/PUT/DELETE) token configuration |
+
+Cluster defaults apply to newly created buckets, while existing buckets retain their properties and can be configured independently.
 
 ---
 
@@ -136,7 +141,11 @@ Although frontend and backend differ in their specific mechanisms (bursty vs. sh
 
 - **Backend**: Each target enforces the configured limit for outbound calls. This is wrapped by a dedicated `ais/rlbackend` layer that shapes traffic to remote AIS clusters or external clouds (e.g., S3, GCS).
 
-Here's a simplified snippet of logic with (4) inline comments:
+### Backend Activation Modes
+
+With `rate_limit.backend.enabled=true`, the default `on_demand=false` paces requests from the start. Setting `on_demand=true` allows requests without backend-limiter pacing until the first `429`/`503` for that bucket and operation on a target. That response activates the limiter: subsequent requests are paced, and rate-limit errors receive bounded retries using the configured token budget, interval, and retry count. With `enabled=false`, neither mode applies.
+
+Here's a simplified snippet of proactive-mode logic (`on_demand=false`) with (4) inline comments:
 
 ```go
 func (bp *rlbackend) GetObj() (int, error) {
@@ -166,14 +175,15 @@ func (bp *rlbackend) GetObj() (int, error) {
 
 ### Backend Retry Waits
 
-`rlbackend` acquires a token once before each operation. After a backend `429` or `503`, retries use backoff without acquiring additional tokens; errors still contribute to the shared limiter's error statistics.
+Once active, `rlbackend` acquires a token once before each operation. After a backend `429` or `503`, retries use backoff without acquiring additional tokens; errors still contribute to the shared limiter's error statistics.
 
 - Each wait starts from the larger of the previous retry sleep and the current token-derived interval.
 - The error percentage determines the multiplier: **2x** at 30% or below, **4x** above 30%, and **8x** above 50%. With fewer than three recorded requests, the multiplier is 2x.
-- Each sleep is capped at the larger of **6 seconds** (`DfltRateMaxWait / DfltRateMaxRetries`) and the current token-derived interval. Retries remain bounded by `num_retries` (at most 10) and a one-minute retry-sleep budget.
+- Before jitter, each sleep is capped at the larger of **6 seconds** (`DfltRateMaxWait / DfltRateMaxRetries`) and the current token-derived interval. Retries remain bounded by `num_retries` (at most 10) and a one-minute retry-sleep budget.
+- Each wait applies approximately +/-3% jitter after capping, so it can slightly exceed that base cap, but never falls below the token-derived interval. The resulting sleep is carried forward to the next retry.
 - The previous sleep belongs only to the current operation. A later operation starts without that accumulated delay.
 
-For one isolated operation with a fresh limiter, a 10ms base interval, and every attempt returning `429`, ten retries sleep for **20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.28s, 2.56s, 5.12s, 6s** (16.22s total). A successful retry or a non-rate-limit error ends the retry loop.
+Ignoring jitter, for one isolated operation with a fresh limiter, a 10ms base interval, and every attempt returning `429`, ten retries sleep for **20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.28s, 2.56s, 5.12s, 6s** (16.22s total). A successful retry or a non-rate-limit error ends the retry loop.
 
 ---
 
@@ -191,7 +201,19 @@ AIStore supports numerous batch jobs that read and transform data across buckets
 At first, the permutations may seem too numerous, but in reality it is easy to state a single rule:
 
 - Frontend rate-limiting is enforced by a given running job and is _conjunctive_ (source and/or destination wise). When both limits are defined one of them will most likely "absorb" the other.
-- Backend is controlled by the corresponding `(bucket, verb)` rate limiter that keeps adjusting its runtime state based on the responses from remote storage.
+- Backend is controlled by the corresponding `(bucket, verb)` rate limiter when enabled. With on-demand activation, prefetch uses the job-local limiter described below.
+
+### 5.1 Retry-Enabled Prefetch
+
+Prefetch uses the job-local policy below when both `rate_limit.backend.enabled` and `rate_limit.backend.on_demand` are `true`. Otherwise it uses the existing bucket backend unchanged. There is no per-job retry option.
+
+With the job-local policy:
+
+1. **Before a rate-limit error:** send cold GETs and blob range reads without acquiring from the job-local limiter.
+2. **On the first rate-limit error (`429` or `503`):** atomically install an `rlbackend` wrapper and resubmit the failed call through it. Concurrent workers share the installed wrapper; already-running calls are not paused.
+3. **If errors continue:** reuse `rlbackend` pacing and [growing retry waits](#backend-retry-waits). Subsequent covered calls use the wrapper for the rest of the job, even after successful requests.
+
+The job-local limiter uses the bucket's `max_tokens`, `interval`, and `num_retries`, with the standard per-target budget calculation.
 
 ---
 
