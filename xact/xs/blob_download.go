@@ -275,10 +275,7 @@ func (p *blobFactory) Start() (err error) {
 	bck := lom.Bck()
 	r.InitBase(nil, p.Args.UUID, p.Kind(), bck) //nolint:staticcheck // no parent here
 
-	r.bp = r.args.Backend
-	if r.bp == nil {
-		r.bp = core.T.Backend(bck)
-	}
+	r.bp = core.T.Backend(bck)
 
 	// resolve (metric, vlabs) pairings once; reuse on the hot path
 	vlabs := map[string]string{stats.VlabBucket: bck.Cname("")}
@@ -1131,8 +1128,9 @@ loop:
 		}
 	}
 
-	// failed work-item has already been returned via doneCh
-	if err != nil {
+	// do not override the root cause, if exists
+	// (failed work-item has already been returned via doneCh)
+	if err != nil && w.parent.rctx.Err() == nil {
 		w.parent.AddErr(err, ecode)
 	}
 }
