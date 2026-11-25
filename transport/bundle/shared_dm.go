@@ -67,7 +67,7 @@ type (
 			drops   atomic.Int64
 			nsbrs   atomic.Int64
 			rxerr   atomic.Int64
-			lastSum int64 // hk-only
+			lastSum int64 // under ocmu
 		}
 		last atomic.Int64 // coarse mono-time in epochDuration units
 
@@ -110,21 +110,13 @@ func (sdm *sharedDM) active() bool {
 	return nowEpochs()-last < idleEpochs
 }
 
-// (same as above when rxmu locked)
-func (sdm *sharedDM) activeLocked() bool {
-	if len(sdm.receivers) > 0 {
-		return true
-	}
-
-	last := sdm.last.Load()
-	debug.Assert(last != 0) // ditto
-	return nowEpochs()-last < idleEpochs
-}
-
 func (sdm *sharedDM) String() string {
+	sdm.rxmu.RLock()
+	n := len(sdm.receivers)
+	sdm.rxmu.RUnlock()
 	last := sdm.last.Load()
 	// consider including sdm.dm.String() when verbose
-	return sdm.trname() + "[approx. num-receivers: " + strconv.Itoa(len(sdm.receivers)) + ", idle approx.: " + mono.Since(last<<epochShift).String() + "]"
+	return sdm.trname() + "[approx. num-receivers: " + strconv.Itoa(n) + ", idle approx.: " + mono.Since(last<<epochShift).String() + "]"
 }
 
 // called on-demand
@@ -133,9 +125,8 @@ func (sdm *sharedDM) Open(config *cmn.Config, selected *cmn.XactConf) error {
 	debug.Assert(epochDuration >= time.Second)
 	debug.Assert(epochDuration < sdmIdleTime/2)
 
-	sdm.touch()
-
 	sdm.ocmu.Lock()
+	sdm.touch()
 	if sdm.isOpen() {
 		sdm.ocmu.Unlock()
 		return nil
@@ -158,22 +149,24 @@ func (sdm *sharedDM) Open(config *cmn.Config, selected *cmn.XactConf) error {
 		debug.AssertNoErr(err)
 		return err
 	}
-	sdm.dm.parent = &transport.Parent{
-		TermedCB: sdm.reconnect,
-	}
+	parent := &transport.Parent{}
+	parent.TermedCB = func(dstID string, err error) { sdm.reconnect(parent, dstID, err) }
+	sdm.dm.parent = parent
 	sdm.dm.Open()
-	sdm.ocmu.Unlock()
 
 	debug.AssertFunc(func() bool { return sdm.last.Load() != 0 }) // touched above
 	hk.Reg(sdm.trname()+hk.NameSuffix, sdm.housekeep, sdmPruneIval)
+	sdm.ocmu.Unlock()
 
 	nlog.InfoDepth(1, core.T.String(), "open", sdm.trname())
 	return nil
 }
 
 // TODO: reconnect() must become common for all DM-based xactions
-func (sdm *sharedDM) reconnect(dstID string, err error) {
-	if !sdm.isOpen() {
+func (sdm *sharedDM) reconnect(parent *transport.Parent, dstID string, err error) {
+	sdm.ocmu.Lock()
+	if !sdm.isOpen() || sdm.dm.parent != parent {
+		sdm.ocmu.Unlock()
 		return
 	}
 	// same epoch? (a Smap bump that leaves targets intact - e.g., proxy join/leave - does not count)
@@ -190,27 +183,23 @@ func (sdm *sharedDM) reconnect(dstID string, err error) {
 		err = fmt.Errorf("%s: failed reconnecting to %s (%w --> %w)", sdm.trname(), dstID, err, e)
 		nlog.Errorln(core.T.String(), err, "- closing/aborting...")
 
-		// tear down entire SDM bundle
-		// safe to race with local idle close, see dm.Close() and dm.UnregRecv()
-		sdm.Close(err)
+		sdm.finishClose(err)
 		return
 	}
 
-	// ping remote peer
-	go sdm.gosend(dstID)
-}
+	// send the ping on this bundle after releasing ocmu
+	tsi := streams.Smap().GetNode(dstID)
+	sdm.touch()
+	sdm.ocmu.Unlock()
+	if tsi == nil {
+		return // (unlikely)
+	}
 
-func (sdm *sharedDM) gosend(dstID string) {
 	o := transport.AllocSend()
 	o.Hdr.Opcode = transport.OpcReconnect
 	o.Hdr.SID = core.T.SID()
-
-	smap := core.T.Sowner().Get()
-	tsi := smap.GetNode(dstID)
-	if tsi != nil && sdm.isOpen() {
-		err := sdm.Send(o, nil /*roc*/, tsi, nil)
-		nlog.Warningln(core.T.String(), "reconnect/send:", sdm.trname(), "-->", dstID, err)
-	}
+	err = streams.Send(o, nil /*roc*/, tsi)
+	nlog.Warningln(core.T.String(), "reconnect/send:", sdm.trname(), "-->", dstID, err)
 }
 
 func (sdm *sharedDM) CanSend(sid string) (err error) {
@@ -235,23 +224,20 @@ func (sdm *sharedDM) _stats() {
 }
 
 func (sdm *sharedDM) housekeep(now int64) time.Duration {
-	if !sdm.isOpen() {
-		return hk.UnregInterval
+	d := cos.Jitter(sdmPruneIval, now)
+	if !sdm.ocmu.TryLock() {
+		return d
 	}
-
-	sdm._stats()
-
-	if sdm.active() {
-		return cos.Jitter(sdmPruneIval, now)
-	}
-	// tentatively (lock and check inside)
-	if err := sdm.Close(); err != nil {
-		if cmn.Rom.V(4, cos.ModTransport) {
-			nlog.Warningln(err)
+	if sdm.isOpen() {
+		sdm._stats()
+		if !sdm.active() {
+			// hand ocmu over to teardown (serializes Open and RegRecv with close)
+			go sdm.finishClose(nil)
+			return d
 		}
-		return cos.Jitter(sdmPruneIval, now)
 	}
-	return hk.UnregInterval
+	sdm.ocmu.Unlock()
+	return d
 }
 
 // no registered receivers + sdmIdleTime inactivity
@@ -263,8 +249,6 @@ func (sdm *sharedDM) Close(errs ...error) error {
 		return nil
 	}
 
-	sdm.rxmu.Lock()
-
 	var (
 		err error
 		l   = len(errs)
@@ -272,31 +256,36 @@ func (sdm *sharedDM) Close(errs ...error) error {
 	if l > 0 {
 		err = errs[0]
 	}
-	if sdm.activeLocked() {
+	if sdm.active() {
 		if l == 0 {
-			sdm.rxmu.Unlock()
+			err = errors.New("cannot close " + sdm.String())
 			sdm.ocmu.Unlock()
-			return errors.New("cannot close " + sdm.String())
+			return err
 		}
 		nlog.Errorln("closing", sdm.String(), "with errors", errs)
 	}
 
-	// release rxmu (intended only to protect sdm.receivers) before calling dm.Close()
+	sdm.finishClose(err)
+	return nil
+}
+
+// caller holds ocmu; release it after teardown and HK unregistration
+func (sdm *sharedDM) finishClose(err error) {
+	sdm.rxmu.Lock()
 	sdm.receivers = nil
 	sdm.rxmu.Unlock()
 
 	sdm.dm.Close(err)
 	sdm.dm.UnregRecv()
 
-	sdm.ocmu.Unlock()
-
 	sdm.sbrs.mtx.Lock()
 	clear(sdm.sbrs.m)
 	sdm.sbrs.mtx.Unlock()
 
 	sdm._stats()
-	nlog.InfoDepth(1, core.T.String(), "close", sdm.trname())
-	return nil
+	hk.Unreg(sdm.trname() + hk.NameSuffix)
+	sdm.ocmu.Unlock()
+	nlog.Infoln(core.T.String(), "close", sdm.trname())
 }
 
 // demux-level RegRecv (not to confuse with transport-level namesake)

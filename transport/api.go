@@ -5,6 +5,7 @@
 package transport
 
 import (
+	"context"
 	"io"
 	ratomic "sync/atomic"
 	"time"
@@ -148,7 +149,6 @@ func NewObjStream(client Client, dstURL, dstID string, extra *Extra) (s *Stream)
 	s.workCh = make(chan *Obj, burst) // Send Queue (SQ)
 	s.cmplCh = make(chan cmpl, burst) // Send Completion Queue (SCQ)
 
-	s.wg.Add(2)
 	go s.sendLoop(extra.Config, dryrun()) // handle SQ
 	go s.cmplLoop()                       // handle SCQ
 
@@ -193,9 +193,51 @@ func (s *Stream) Send(obj *Obj) (err error) {
 	return
 }
 
-func (s *Stream) Fin() {
-	_ = s.Send(&Obj{Hdr: ObjHdr{Opcode: opcFin}})
-	s.wg.Wait()
+// finish the stream and return its terminal error, if any
+func (s *Stream) Fin() error {
+	return s.FinContext(context.Background())
+}
+
+// ctx bounds both enqueueing FIN and draining the stream
+func (s *Stream) FinContext(ctx context.Context) error {
+	if !s.IsTerminated() {
+		fin := &Obj{Hdr: ObjHdr{Opcode: opcFin}}
+		if err := s.startSend(fin); err == nil {
+			select {
+			case s.workCh <- fin:
+			case <-s.stopCh.Listen():
+			case <-ctx.Done():
+				return s.finCanceled(ctx.Err())
+			}
+		}
+	}
+	select {
+	case <-s.finCh:
+	case <-ctx.Done():
+		return s.finCanceled(ctx.Err())
+	}
+	if err := s.TermInfo(); err != errEndOfStream {
+		return err
+	}
+	return nil
+}
+
+// preserve a known failure even if cleanup outlasts the caller's deadline
+func (s *Stream) finCanceled(cause error) error {
+	perr := s.term.err.Load()
+	if perr == nil {
+		s.Stop()
+		return cause
+	}
+	if err := *perr; err != errEndOfStream {
+		return err
+	}
+	select {
+	case <-s.finCh:
+		return nil
+	default:
+		return cause
+	}
 }
 
 //////////////////////

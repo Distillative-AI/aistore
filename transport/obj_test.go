@@ -37,7 +37,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/mono"
-	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/tools"
@@ -90,18 +89,16 @@ func TestMain(t *testing.M) {
 	}
 
 	config := cmn.GCO.BeginUpdate()
+	config.Timeout.SendFile = cos.Duration(time.Minute)
 	config.Transport.MaxHeaderSize = memsys.PageSize
 	config.Transport.Burst = 256
 	config.Transport.IdleTeardown = cos.Duration(time.Second)
 	config.Transport.QuiesceTime = cos.Duration(10 * time.Second)
 	config.Log.Level = "3"
 	cmn.GCO.CommitUpdate(config)
+	mock.NewTarget(nil).SO = &sowner{}
 	sc := transport.Init(&dummyStatsTracker{}, nil, nil, false /*useIPv6*/)
 	go sc.Run()
-
-	tMock := mock.NewTarget(nil)
-	tMock.SO = &sowner{}
-	core.T = tMock
 
 	objmux = mux.NewServeMux(false /*enableTracing*/)
 	path := transport.ObjURLPath("")
@@ -532,17 +529,18 @@ func TestCompletionCount(t *testing.T) {
 		}
 		numSent++
 		if numSent > 5000 && rem == 3 {
-			stream.Stop()
 			break
 		}
 	}
-	// collect all pending completions until timeout
-	started := time.Now()
-	for numCompleted.Load() < numSent {
-		time.Sleep(time.Millisecond * 10)
-		if time.Since(started) > time.Second*10 {
-			break
+	stream.Stop()
+
+	// wait for both object completions and stream termination
+	deadline := time.Now().Add(10 * time.Second)
+	for numCompleted.Load() < numSent || !stream.IsTerminated() {
+		if time.Now().After(deadline) {
+			t.Fatalf("sent %d, completed %d, terminated %t", numSent, numCompleted.Load(), stream.IsTerminated())
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if numSent == numCompleted.Load() {
 		tlog.Logf("sent %d = %d completed, %d received\n", numSent, numCompleted.Load(), numReceived.Load())

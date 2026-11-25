@@ -13,7 +13,7 @@ import (
 	"path"
 	"runtime"
 	"strconv"
-	"sync"
+	ratomic "sync/atomic"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -42,7 +42,6 @@ const (
 
 const (
 	maxInReadRetries = 64 // Tx: lz4 stream read; Rx: partial object header
-	termErrWait      = time.Second
 )
 
 // Stream termination sentinel errors (not failure conditions).
@@ -78,6 +77,8 @@ type (
 		lastCh   cos.StopCh    // end-of-stream
 		pdu      *spdu         // PDU buffer
 		postCh   chan struct{} // to indicate that workCh has work
+		cmplDone chan struct{} // completion loop finished
+		finCh    chan struct{} // send loop finished, including cleanup
 		trname   string        // http endpoint: (trname, dstURL, dstID)
 		dstURL   string
 		dstID    string
@@ -85,18 +86,15 @@ type (
 		maxhdr   []byte // transport header buf must be large enough to accommodate max-size for this stream
 		header   []byte // object header (slice of the maxhdr with bucket/objName, etc. fields packed/serialized)
 		term     struct {
-			err  error
-			mu   sync.Mutex  // guard updating/reading (term.err)
-			done atomic.Bool // CAS to terminate only once
-			once atomic.Bool // log "dropping..." upon termination (once)
+			err  ratomic.Pointer[error] // set once upon termination: errEndOfStream, errStopped, or actual error
+			once atomic.Bool            // log "dropping..." upon termination (once)
 		}
 		time struct {
 			idleTeardown time.Duration // idle timeout
 			inSend       atomic.Bool   // true upon Send() or Read() - info for Collector to delay cleanup
 			ticks        int           // num 1s ticks until idle timeout
-			index        int           // heap stuff
+			reaping      bool          // collector received remove after the final completion was posted
 		}
-		wg       sync.WaitGroup
 		sessST   atomic.Int64 // state of the TCP/HTTP session: active (connected) | inactive (disconnected)
 		sessID   int64        // stream session ID
 		numCur   int64        // gets reset to zero upon each timeout
@@ -108,6 +106,9 @@ type (
 ////////////////
 // base //
 ////////////////
+
+// allow the caller's FIN deadline to expire first when a peer withholds its reply
+func replyTimeout(config *cmn.Config) time.Duration { return 2 * config.Timeout.SendFile.D() }
 
 func (s *Stream) initBase(client Client, dstURL, dstID string, extra *Extra) {
 	var (
@@ -126,6 +127,8 @@ func (s *Stream) initBase(client Client, dstURL, dstID string, extra *Extra) {
 	s.lastCh.Init()
 	s.stopCh.Init()
 	s.postCh = make(chan struct{}, 1)
+	s.cmplDone = make(chan struct{})
+	s.finCh = make(chan struct{})
 
 	// NOTE: PDU-based traffic - a MUST-have for "unsized" transmissions
 	if extra.UsePDU() {
@@ -175,7 +178,10 @@ func (s *base) startSend(streamable fmt.Stringer) (err error) {
 	}
 
 	if s.sessST.CAS(inactive, active) {
-		s.postCh <- struct{}{}
+		select {
+		case s.postCh <- struct{}{}:
+		default: // already posted
+		}
 		if cmn.Rom.V(5, cos.ModTransport) {
 			nlog.Infoln(s.String(), "inactive => active")
 		}
@@ -199,32 +205,18 @@ func (s *base) String() string      { return s.loghdr }
 
 func (s *base) Abort() { s.Stop() } // (DM =>) SB => s.Abort() sequence (e.g. usage see otherXreb.Abort())
 
-func (s *base) IsTerminated() bool { return s.term.done.Load() }
+func (s *base) IsTerminated() bool { return s.term.err.Load() != nil }
 
-// TermInfo() is only called on terminated screen
-// must always return an err != nil, even after a graceful termination
+// call only when terminated (see IsTerminated); returns non-nil:
 //   - errEndOfStream for normal end-of-stream (success via Fin())
 //   - errStopped for explicit stop request (via Stop())
 //   - actual error for failures
 func (s *base) TermInfo() error {
-	// to account for an unlikely delay between done.CAS() and mu.Lock - see terminate()
-	var (
-		sleep = cos.ProbingFrequency(termErrWait)
-		err   error
-	)
-	for elapsed := time.Duration(0); elapsed < termErrWait; elapsed += sleep {
-		s.term.mu.Lock()
-		err = s.term.err
-		s.term.mu.Unlock()
-		if err != nil {
-			return err
-		}
-		time.Sleep(sleep)
+	if perr := s.term.err.Load(); perr != nil {
+		return *perr
 	}
-	// (unlikely)
-	err = errors.New("terminated without term.err")
-	debug.Func(func() { debug.Assert(false, s.String(), " err: ", err) })
-	nlog.Errorln(s.String(), "err:", err)
+	err := errors.New("not terminated")
+	debug.Assert(false, s.String(), " ", err)
 	return err
 }
 
@@ -314,9 +306,10 @@ func (s *base) sendLoop(config *cmn.Config, dryrun bool) {
 	}
 
 	err = s.streamer.terminate(err)
-	s.wg.Done()
 
 	if err == errEndOfStream { // ok (via hdr.Opcode = opcFin => lastCh.Close)
+		<-s.cmplDone
+		close(s.finCh)
 		return
 	}
 
@@ -335,10 +328,11 @@ func (s *base) sendLoop(config *cmn.Config, dryrun bool) {
 	}
 
 	// wait for the SCQ/cmplCh to empty
-	s.wg.Wait()
+	<-s.cmplDone
 
-	// cleanup
+	// cleanup; signal FinContext before TermedCB (which may close the bundle)
 	s.streamer.abortPending(err, false /*completions*/)
+	close(s.finCh)
 
 	if err != errStopped {
 		if s.parent != nil && s.parent.TermedCB != nil {
