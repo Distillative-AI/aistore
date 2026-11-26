@@ -581,6 +581,98 @@ func TestAISLoaderStatsOutputObj(t *testing.T) {
 			tassert.Fatalf(t, !exists, "invalid stats path created benchmark bucket %s", runner.bck.String())
 		})
 	}
+
+	t.Run("Write Failure is not Uploaded", func(t *testing.T) {
+		const devFull = "/dev/full" // every write fails with ENOSPC
+		if _, err := os.Stat(devFull); err != nil {
+			t.Skipf("requires %s: %v", devFull, err)
+		}
+		runner := newE2ERunner(t, "stats-write-failure")
+		statsBck := cmn.Bck{Name: "aisloader-stats-" + strings.ToLower(trand.String(10)), Provider: apc.AIS}
+		tools.CreateBucket(t, runner.proxyURL, statsBck, nil, true)
+
+		object := runner.rootPrefix + "/stats.json"
+		args := append(slices.Clone(runner.baseArgs),
+			"-subdir="+runner.rootPrefix+"/data",
+			"-pctput=100", "-maxsize=64KiB", "-duration=3s", "-cleanup=false",
+			"-stats-output="+devFull,
+			"-stats-output-obj="+statsBck.Cname(object),
+		)
+		output, err := runner.exec(t, "stats-write-failure", time.Minute, args...)
+
+		var exitErr *exec.ExitError
+		tassert.Fatalf(t, errors.As(err, &exitErr) && exitErr.ExitCode() == 1, "expected exit code 1: %v\n%s", err, output)
+		const wantErr = "exited with error: failed to write statistics output"
+		tassert.Fatalf(t, strings.Contains(string(output), wantErr), "missing %q:\n%s", wantErr, output)
+		const wantTotals = "Final statistics (failed to write statistics output)"
+		tassert.Fatalf(t, strings.Contains(string(output), wantTotals), "missing %q:\n%s", wantTotals, output)
+		tassert.Fatalf(t, !strings.Contains(string(output), "Stats written to"), "reported incomplete statistics as saved:\n%s", output)
+
+		_, err = api.HeadObjectV2(tools.BaseAPIParams(runner.proxyURL), statsBck, object, apc.GetPropsName, api.HeadArgs{Silent: true})
+		tassert.Fatalf(t, cmn.IsErrHTTPNotFound(err), "expected %s to be absent: %v", statsBck.Cname(object), err)
+	})
+}
+
+func TestAISLoaderNewBucketRequires100PctPUT(t *testing.T) {
+	runner := newE2ERunner(t, "new-bucket-pctput")
+	if !runner.created {
+		t.Skip("requires a new local AIS benchmark bucket; unset BUCKET")
+	}
+	args := append(slices.Clone(runner.baseArgs), "-pctput=50", "-duration=1s", "-cleanup=false")
+	output, err := runner.exec(t, "new-bucket-pctput", time.Minute, args...)
+	tassert.Fatalf(t, strings.Contains(string(output), "new bucket, expecting 100% PUT"),
+		"expected 100%% PUT error, got err=%v\n%s", err, output)
+
+	exists, _ := tools.BucketExists(t, runner.proxyURL, runner.bck)
+	tassert.Fatalf(t, !exists, "rejected workload created bucket %s", runner.bck.String())
+}
+
+func TestAISLoaderDryRun(t *testing.T) {
+	t.Run("Missing Bucket", func(t *testing.T) {
+		runner := newE2ERunner(t, "dry-run-missing")
+		if !runner.created {
+			t.Skip("requires a new local AIS benchmark bucket; unset BUCKET")
+		}
+		args := append(slices.Clone(runner.baseArgs),
+			"-dry-run",
+			"-pctput=100",
+			"-cleanup=true",
+		)
+		output, err := runner.exec(t, "dry-run-missing", time.Minute, args...)
+		tassert.Fatalf(t, err == nil, "aisloader -dry-run failed: %v\n%s", err, output)
+		exists, _ := tools.BucketExists(t, runner.proxyURL, runner.bck)
+		tassert.Fatalf(t, !exists, "dry-run created bucket %s", runner.bck.String())
+	})
+
+	t.Run("Unchanged Existing Bucket", func(t *testing.T) {
+		runner := newE2ERunner(t, "dry-run-existing")
+		if !runner.created {
+			t.Skip("requires a new local AIS benchmark bucket; unset BUCKET")
+		}
+
+		mirrorDisabled := false // baseline bucket
+		tools.CreateBucket(t, runner.proxyURL, runner.bck, &cmn.BpropsToSet{
+			Mirror: &cmn.MirrorConfToSet{Enabled: &mirrorDisabled},
+		}, false)
+
+		args := append(slices.Clone(runner.baseArgs),
+			"-dry-run",
+			"-pctput=0",
+			"-cleanup=false",
+			`-bprops={"mirror": {"enabled": true}}`,
+		)
+		output, err := runner.exec(t, "dry-run-existing", time.Minute, args...)
+		tassert.Fatalf(t, err == nil, "aisloader -dry-run failed: %v\n%s", err, output)
+		bp := tools.BaseAPIParams(runner.proxyURL)
+		props, err := api.HeadBucket(bp, runner.bck, true /*dontAddRemote*/)
+		tassert.CheckFatal(t, err)
+		tassert.Fatalf(t, !props.Mirror.Enabled, "dry-run applied '-bprops' to %s", runner.bck.String())
+
+		snaps, err := api.QueryXactionSnaps(bp, &xact.ArgsMsg{Kind: apc.ActList, Bck: runner.bck})
+		tassert.CheckFatal(t, err)
+		ids := snaps.GetUUIDs()
+		tassert.Fatalf(t, len(ids) == 0, "dry-run listed %s (xactions %v)", runner.bck.String(), ids)
+	})
 }
 
 func configuredDuration(t *testing.T) time.Duration {

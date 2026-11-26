@@ -24,6 +24,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
@@ -55,7 +56,8 @@ func (t *target) joinCluster(action string, primaryURLs ...string) (status int, 
 	return
 }
 
-// do not receive RMD: `receiveRMD` runs extra jobs and checks specific for metasync.
+// do not receive RMD: `receiveRMD` runs extra jobs and checks specific for metasync
+// (fast rejoin: adopt the completed RMD - no rebalance)
 func (t *target) recvCluMeta(cm *cluMeta, action, sender string) error {
 	var (
 		errs []error
@@ -114,12 +116,27 @@ func (t *target) recvCluMeta(cm *cluMeta, action, sender string) error {
 	}
 	switch {
 	case errs == nil:
+		if cm.Flags.IsSet(cos.FastRejoin) && action == apc.ActSelfJoinTarget && !t.NodeStarted() {
+			t.fastRejoin(cm)
+		}
 		return nil
 	case len(errs) == 1:
 		return errs[0]
 	default:
 		return cmn.NewErrFailedTo(t, action, "clumeta", errors.Join(errs...))
 	}
+}
+
+// best-effort: when invalid, ignore and keep "restarted" state (marker, flag)
+// - metasync PUT is rejected until node-started
+func (t *target) fastRejoin(cm *cluMeta) {
+	if cm.RMD == nil || cm.Smap == nil || cm.RMD.CluID != cm.Smap.UUID || cm.RMD.Version <= 0 {
+		nlog.Warningln(t.String(), "ignoring invalid fast-rejoin response:", cm.RMD, cm.Smap)
+		return
+	}
+	t.owner.rmd.put(cm.RMD)
+	fs.RemoveMarker(fname.NodeRestartedPrev, t.statsT, false /*stopping*/)
+	nlog.Infoln(t.String(), "fast rejoin:", cm.RMD.String(), cm.Smap.StringEx())
 }
 
 //
@@ -971,7 +988,8 @@ func (t *target) receiveRMD(newRMD *rebMD, msg *actMsgExt) error {
 	if err := smap.validate(); err != nil {
 		return err
 	}
-	if smap.GetNode(t.SID()) == nil {
+	self := smap.GetTarget(t.SID())
+	if self == nil {
 		return fmt.Errorf(fmtSelfNotPresent, t, smap.StringEx())
 	}
 	for _, tsi := range rmd.TargetIDs {
@@ -981,6 +999,11 @@ func (t *target) receiveRMD(newRMD *rebMD, msg *actMsgExt) error {
 		}
 	}
 	if !t.regstate.disabled.Load() {
+		if self.InMaintPostReb() {
+			// already evacuated; record the generation without starting it
+			t.owner.rmd.put(newRMD)
+			return nil
+		}
 		oxid := xact.RebID2S(rmd.Version)
 		t._runRe(newRMD, msg, smap, oxid)
 		return nil
@@ -1268,7 +1291,8 @@ func (t *target) metasyncPut(w http.ResponseWriter, r *http.Request) {
 	if errBMD == nil && newBMD != nil {
 		errBMD = t.receiveBMD(newBMD, msgBMD, payload, bmdRecv, sender, false /*silent*/)
 	}
-	if errRMD == nil && newRMD != nil {
+	// skip RMD when Smap from the same payload failed to apply (metasync will retry both)
+	if errRMD == nil && newRMD != nil && (errSmap == nil || isErrDowngrade(errSmap)) {
 		t.owner.rmd.Lock()
 		errRMD = t.receiveRMD(newRMD, msgRMD)
 		t.owner.rmd.Unlock()

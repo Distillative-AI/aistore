@@ -55,21 +55,9 @@ func TestListChunkedArchives(t *testing.T) {
 			tools.CreateBucket(t, proxyURL, bck, &cmn.BpropsToSet{
 				Chunks: &cmn.ChunksConfToSet{ObjSizeLimit: apc.Ptr(cos.SizeIEC(0))},
 			}, true /*cleanup*/)
-			const fileSize = 8 * cos.KiB
-			names := []string{"a.txt", "nested/b.txt", "z.txt"}
+			names := []string{"a.txt", "nested/b.txt", "./z.txt"}
 			objName := "archive" + test.ext
-			reader, err := readers.New(&readers.Arg{
-				Type: readers.File, Path: t.TempDir(), Name: objName,
-				Arch: &readers.Arch{Mime: test.ext, Names: names, Num: len(names), MinSize: fileSize},
-			})
-			tassert.CheckFatal(t, err)
-			t.Cleanup(func() { reader.Close() })
-			size, err := reader.Seek(0, io.SeekEnd)
-			tassert.CheckFatal(t, err)
-			reader.Reset()
-			errCh := make(chan error, 1)
-			tools.Put(proxyURL, bck, objName, reader, uint64(size), test.numChunks, errCh)
-			tassert.SelectErr(t, errCh, "put archive", true)
+			putListArch(t, proxyURL, bck, objName, test.ext, names, test.numChunks)
 
 			props, err := api.HeadObjectV2(bp, bck, objName, apc.GetPropsChunked, api.HeadArgs{})
 			tassert.CheckFatal(t, err)
@@ -85,10 +73,121 @@ func TestListChunkedArchives(t *testing.T) {
 				"expected parent archive %s, got %+v", objName, lst.Entries[0])
 			for i, name := range names {
 				entry := lst.Entries[i+1]
-				tassert.Errorf(t, entry.Name == path.Join(objName, name) && entry.Size == fileSize && entry.IsAnyFlagSet(apc.EntryInArch),
-					"expected archived file %s (%d bytes), got %+v", name, fileSize, entry)
+				tassert.Errorf(t, entry.Name == path.Join(objName, name) && entry.Size == listArchFileSize && entry.IsAnyFlagSet(apc.EntryInArch),
+					"expected archived file %s (%d bytes), got %+v", name, listArchFileSize, entry)
 			}
+
+			// an archive and an object that sort between an archive and its files on the same target
+			smap, err := api.GetClusterMap(bp)
+			tassert.CheckFatal(t, err)
+			sibling := tools.GenerateObjectNameForTargetExt(objName, objName+"-", test.ext, bck, smap, true /*same target*/)
+			putListArch(t, proxyURL, bck, sibling, test.ext, names, test.numChunks)
+			archs := []string{objName, sibling}
+			other := tools.GenerateObjectNameForTargetExt(objName, objName+".", ".txt", bck, smap, true /*same target*/)
+			tassert.CheckFatal(t, tools.PutObjRR(bp, bck, other, cos.KiB, cos.ChecksumNone))
+			inArch := make([]string, 0, len(archs)*len(names))
+			for _, arch := range archs {
+				for _, name := range names {
+					inArch = append(inArch, path.Join(arch, name))
+				}
+			}
+			slices.Sort(inArch)
+			all := slices.Concat(archs, []string{other}, inArch)
+			slices.Sort(all)
+
+			lst, err = api.ListObjects(bp, bck, &apc.LsoMsg{Flags: apc.LsInArchOnly, PageSize: 1}, api.ListArgs{})
+			tassert.CheckFatal(t, err)
+			checkLsoNames(t, lst.Entries, inArch, true /*in-arch only*/)
+
+			lst, err = api.ListObjects(bp, bck, &apc.LsoMsg{Flags: apc.LsArchDir, PageSize: 1}, api.ListArgs{})
+			tassert.CheckFatal(t, err)
+			checkLsoNames(t, lst.Entries, all, false)
+
+			for _, token := range []string{objName, path.Join(objName, names[0]), path.Join(sibling, names[len(names)-1])} {
+				lst, err = api.ListObjectsPage(bp, bck, &apc.LsoMsg{Flags: apc.LsInArchOnly, ContinuationToken: token}, api.ListArgs{})
+				tassert.CheckFatal(t, err)
+				checkLsoNames(t, lst.Entries, namesAfter(inArch, token), true)
+
+				lst, err = api.ListObjectsPage(bp, bck, &apc.LsoMsg{Flags: apc.LsArchDir, ContinuationToken: token}, api.ListArgs{})
+				tassert.CheckFatal(t, err)
+				checkLsoNames(t, lst.Entries, namesAfter(all, token), false)
+
+				lst, err = api.ListObjects(bp, bck, &apc.LsoMsg{Flags: apc.LsInArchOnly, StartAfter: token}, api.ListArgs{})
+				tassert.CheckFatal(t, err)
+				checkLsoNames(t, lst.Entries, namesAfter(inArch, token), true)
+
+				lst, err = api.ListObjects(bp, bck, &apc.LsoMsg{Flags: apc.LsArchDir, StartAfter: token}, api.ListArgs{})
+				tassert.CheckFatal(t, err)
+				checkLsoNames(t, lst.Entries, namesAfter(all, token), false)
+			}
+
+			putListArch(t, proxyURL, bck, path.Join("dir", objName), test.ext, names, test.numChunks)
+			lst, err = api.ListObjects(bp, bck, &apc.LsoMsg{Flags: apc.LsInArchOnly | apc.LsNoRecursion}, api.ListArgs{})
+			tassert.CheckFatal(t, err)
+			checkLsoNames(t, lst.Entries, inArch, true)
+
+			lst, err = api.ListObjects(bp, bck, &apc.LsoMsg{Flags: apc.LsArchDir | apc.LsNoRecursion, PageSize: 1}, api.ListArgs{})
+			tassert.CheckFatal(t, err)
+			checkLsoNames(t, lst.Entries, append(all, "dir/"), false)
 		})
+	}
+}
+
+func TestListInArchOnlyRemote(t *testing.T) {
+	bck := cliBck
+	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: bck})
+	var (
+		proxyURL = tools.RandomProxyURL(t)
+		bp       = tools.BaseAPIParams(proxyURL)
+		prefix   = "in-arch-only-" + trand.String(8) + "/"
+		names    = []string{"a.txt", "b.txt"}
+		cached   = prefix + "cached" + archive.ExtTar
+		evicted  = prefix + "evicted" + archive.ExtTar
+		plain    = prefix + "plain.txt"
+	)
+	for _, arch := range []string{cached, evicted} {
+		putListArch(t, proxyURL, bck, arch, archive.ExtTar, names, 0)
+		t.Cleanup(func() { api.DeleteObject(bp, bck, arch) })
+	}
+	tassert.CheckFatal(t, tools.PutObjRR(bp, bck, plain, cos.KiB, cos.ChecksumNone))
+	t.Cleanup(func() { api.DeleteObject(bp, bck, plain) })
+	tassert.CheckFatal(t, api.EvictObject(bp, bck, evicted))
+
+	lst, err := api.ListObjects(bp, bck, &apc.LsoMsg{Prefix: prefix, Flags: apc.LsInArchOnly}, api.ListArgs{})
+	tassert.CheckFatal(t, err)
+	checkLsoNames(t, lst.Entries, []string{path.Join(cached, names[0]), path.Join(cached, names[1])}, true)
+}
+
+const listArchFileSize = 8 * cos.KiB
+
+func putListArch(t *testing.T, proxyURL string, bck cmn.Bck, objName, ext string, names []string, numChunks int) {
+	reader, err := readers.New(&readers.Arg{
+		Type: readers.File, Path: t.TempDir(), Name: path.Base(objName),
+		Arch: &readers.Arch{Mime: ext, Names: names, Num: len(names), MinSize: listArchFileSize},
+	})
+	tassert.CheckFatal(t, err)
+	t.Cleanup(func() { reader.Close() })
+	size, err := reader.Seek(0, io.SeekEnd)
+	tassert.CheckFatal(t, err)
+	reader.Reset()
+	errCh := make(chan error, 1)
+	tools.Put(proxyURL, bck, objName, reader, uint64(size), numChunks, errCh)
+	tassert.SelectErr(t, errCh, "put archive", true)
+}
+
+func namesAfter(names []string, token string) []string {
+	i, found := slices.BinarySearch(names, token)
+	if found {
+		i++
+	}
+	return names[i:]
+}
+
+func checkLsoNames(t *testing.T, entries cmn.LsoEntries, exp []string, inArch bool) {
+	tassert.Fatalf(t, len(entries) == len(exp), "expected %d entries, got %d", len(exp), len(entries))
+	for i, name := range exp {
+		tassert.Errorf(t, entries[i].Name == name, "entry %d: expected %s, got %+v", i, name, entries[i])
+		tassert.Errorf(t, !inArch || entries[i].IsAnyFlagSet(apc.EntryInArch), "expected archived file, got %+v", entries[i])
 	}
 }
 
@@ -507,17 +606,11 @@ func (a *archLarge) arch(t *testing.T, archName string, objNames []string, appen
 	return xact.ArgsMsg{ID: xid, Kind: apc.ActArchive}
 }
 
-func (a *archLarge) countInArch(t *testing.T, archName string) (n int) {
-	lsmsg := &apc.LsoMsg{Prefix: archName}
-	lsmsg.SetFlag(apc.LsArchDir)
+func (a *archLarge) countInArch(t *testing.T, archName string) int {
+	lsmsg := &apc.LsoMsg{Prefix: archName, Flags: apc.LsInArchOnly}
 	lst, err := api.ListObjects(tools.BaseAPIParams(), a.bckTo, lsmsg, api.ListArgs{})
 	tassert.CheckFatal(t, err)
-	for _, en := range lst.Entries {
-		if en.IsAnyFlagSet(apc.EntryInArch) {
-			n++
-		}
-	}
-	return n
+	return len(lst.Entries)
 }
 
 func TestArchLargeLast(t *testing.T) {
@@ -668,7 +761,7 @@ func (a *archLarge) putOnPeer(t *testing.T, num int) []string {
 
 // archive objNames, then freeze the peer (the only sender)
 func (a *archLarge) archFreeze(t *testing.T, archName string, objNames []string, dt *meta.Snode,
-	allDone, appendIfExists bool) (dflt xact.ArgsMsg, resume func() error, notDone bool) {
+	appendIfExists bool) (dflt xact.ArgsMsg, resume func() error) {
 	pause, resume, err := tools.NodePauser(a.peer)
 	tassert.CheckFatal(t, err)
 	flt := a.arch(t, archName, objNames, appendIfExists)
@@ -678,24 +771,46 @@ func (a *archLarge) archFreeze(t *testing.T, archName string, objNames []string,
 	dflt = flt
 	dflt.DaemonID = dt.ID()
 	tassert.CheckFatal(t, pause())
-	if !allDone {
-		time.Sleep(2 * time.Second) // (while frozen, the 'done' of the other peers arrives)
-	}
 	snap := archSnap(t, &dflt)
 	deadline := time.Now().Add(5 * time.Second)
-	for allDone && strings.Contains(snap.CtlMsg, "peers-not-done:") && time.Now().Before(deadline) {
+	for strings.Contains(snap.CtlMsg, "peers-not-done:") && time.Now().Before(deadline) {
 		tassert.CheckFatal(t, resume())
 		time.Sleep(time.Millisecond) // (a 128 MiB object takes many steps)
 		tassert.CheckFatal(t, pause())
 		snap = archSnap(t, &dflt)
 	}
 	tlog.Logfln("froze %s: %s", a.peer.StringEx(), snap.CtlMsg)
-	notDone = strings.Contains(snap.CtlMsg, "peers-not-done:1,")
-	if allDone {
-		tassert.Fatalf(t, strings.Contains(snap.CtlMsg, "from-peers:"),
-			"%s: no object in transit at the freeze, have %q", a.bckTo.Cname(archName), snap.CtlMsg)
-	}
-	return dflt, resume, notDone
+	tassert.Fatalf(t, strings.Contains(snap.CtlMsg, "from-peers:"),
+		"%s: no object in transit at the freeze, have %q", a.bckTo.Cname(archName), snap.CtlMsg)
+	return dflt, resume
+}
+
+// the designated target waits for a 'done' from a slow peer
+func (a *archLarge) archSlowPeer(t *testing.T, archName string, dt *meta.Snode, appendIfExists bool) (dflt xact.ArgsMsg) {
+	const (
+		numPeer = 10
+		perObj  = 10 * time.Second
+	)
+	var (
+		baseParams = tools.BaseAPIParams()
+		_, rl      = frontendRateLim(a.smap, perObj)
+		objNames   = a.putOnPeer(t, numPeer) // (before the rate limit)
+	)
+	_, err := api.SetBucketProps(baseParams, a.small.bck, &cmn.BpropsToSet{RateLimit: rl})
+	tassert.CheckFatal(t, err)
+
+	flt := a.arch(t, archName, objNames, appendIfExists)
+	t.Cleanup(func() { _ = api.AbortXaction(baseParams, &flt) })
+
+	dflt = flt
+	dflt.DaemonID = dt.ID()
+	args := dflt
+	args.Timeout = 10 * time.Second
+	_, err = api.WaitForSnaps(baseParams, &args, peerNotDone)
+	snap := archSnap(t, &dflt)
+	tassert.Fatalf(t, err == nil, "%s: expected only %s not done, have %q (%v)", a.bckTo.Cname(archName), a.peer.StringEx(), snap.CtlMsg, err)
+	tlog.Logfln("slow %s: %s", a.peer.StringEx(), snap.CtlMsg)
+	return dflt
 }
 
 // TAR append in place, the peer freezes after its 'done' w/ the large object in transit
@@ -723,7 +838,7 @@ func TestArchAppendFrozenPeer(t *testing.T) {
 
 	orig := a.makeOrig(t, archName, a.small.objNames[:half])
 
-	dflt, resume, _ := a.archFreeze(t, archName, []string{a.large}, dt, true /*all done*/, true /*append*/)
+	dflt, resume := a.archFreeze(t, archName, []string{a.large}, dt, true /*append*/)
 
 	// after send_file_time with no progress, the designated target times out or gives up
 	dflt.Timeout = sendFile + 30*time.Second // (timeout for the quiesce checks and the API calls)
@@ -739,6 +854,18 @@ func TestArchAppendFrozenPeer(t *testing.T) {
 
 	tassert.CheckFatal(t, resume())
 	a.checkOrig(t, archName, orig, half)
+}
+
+// the designated target waits only for one peer
+func peerNotDone(snaps xact.MultiSnap) (done, reset bool, err error) {
+	for _, tsnaps := range snaps {
+		for _, snap := range tsnaps {
+			if strings.Contains(snap.CtlMsg, "peers-not-done:1,") {
+				return true, false, nil
+			}
+		}
+	}
+	return false, false, nil
 }
 
 // the designated target does not wait for objects from peers
@@ -777,12 +904,8 @@ func TestArchKilledPeer(t *testing.T) {
 }
 
 func testArchKilledPeer(t *testing.T, ext string, allDone, waitRm bool) {
-	const (
-		half    = archNumSmall / 2
-		numPeer = 200
-	)
-	numTries := cos.Ternary(allDone, 1, 5)
-	a, archNames := newArchLarge(t, numTries, ext)
+	const half = archNumSmall / 2
+	a, archNames := newArchLarge(t, 1 /*num shards*/, ext)
 	if !waitRm {
 		// keep the peer in the Smap until it restarts
 		config := tools.GetClusterConfig(t)
@@ -794,44 +917,24 @@ func testArchKilledPeer(t *testing.T, ext string, allDone, waitRm bool) {
 		baseParams     = tools.BaseAPIParams(proxyURL)
 		smap           = tools.GetClusterMap(t, proxyURL)
 		appendIfExists = ext == archive.ExtTar
-		archName       string
-		dt             *meta.Snode
+		archName       = archNames[0]
+		cname          = a.bckTo.Cname(archName)
 		orig           []byte
 		dflt           xact.ArgsMsg
-		resume         func() error
-		notDone        bool
-		peerNames      []string
-		err            error
 	)
-	if !allDone {
-		peerNames = a.putOnPeer(t, numPeer)
-	}
-	for i := range numTries {
-		archName = archNames[i]
-		dt, err = smap.HrwObjName2T(meta.CloneBck(&a.bckTo), archName)
-		tassert.CheckFatal(t, err)
+	dt, err := smap.HrwObjName2T(meta.CloneBck(&a.bckTo), archName)
+	tassert.CheckFatal(t, err)
 
-		// 1. the original shard (TAR only)
-		if appendIfExists {
-			orig = a.makeOrig(t, archName, a.small.objNames[:half])
-		}
-		// 2. archive, then freeze the peer
-		objNames := peerNames
-		if allDone {
-			objNames = a.dtNames(t, half, dt)
-		}
-		dflt, resume, notDone = a.archFreeze(t, archName, objNames, dt, allDone, appendIfExists)
-		if allDone || notDone {
-			break
-		}
-		tlog.Logfln("the peer was done at the freeze, try again w/ the next shard")
-		tassert.CheckFatal(t, resume())
-		flt := dflt
-		flt.DaemonID = ""
-		tassert.CheckFatal(t, api.WaitForSnapsIdle(baseParams, &flt))
+	// 1. the original shard (TAR only)
+	if appendIfExists {
+		orig = a.makeOrig(t, archName, a.small.objNames[:half])
 	}
-	cname := a.bckTo.Cname(archName)
-	tassert.Fatalf(t, allDone || notDone, "%s: the peer was done at each freeze (%d tries)", cname, numTries)
+	// 2. archive: the peer is not done (rate-limited) or frozen after its 'done'
+	if allDone {
+		dflt, _ = a.archFreeze(t, archName, a.dtNames(t, half, dt), dt, appendIfExists)
+	} else {
+		dflt = a.archSlowPeer(t, archName, dt, appendIfExists)
+	}
 
 	// 3. crash the peer and restart it
 	cmd, err := tools.CrashNode(a.peer)

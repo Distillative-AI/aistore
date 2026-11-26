@@ -194,6 +194,7 @@ func Start(version, buildtime string) (err error) {
 		printArguments(f)
 	}
 
+	// TODO: Make -getloaderid and -dry-run mutually exclusive.
 	if runParams.getLoaderID {
 		fmt.Printf("0x%x\n", suffixID)
 		if useRandomObjName {
@@ -218,10 +219,8 @@ func Start(version, buildtime string) (err error) {
 	runParams.bp.UA = ua
 
 	if runParams.listOut != "" {
-		if !runParams.dryRun {
-			if err := runParams.checkListOut(); err != nil {
-				return err
-			}
+		if err := runParams.checkListOut(); err != nil {
+			return err
 		}
 		names, _, _, err := listObjects()
 		if err != nil {
@@ -277,12 +276,14 @@ func Start(version, buildtime string) (err error) {
 		}
 	}
 
+	if runParams.dryRun {
+		printRunParams(runParams)
+		return nil
+	}
+
 	// list objects, or maybe not
 	switch {
 	case created:
-		if runParams.putPct < 100 {
-			return errors.New("new bucket, expecting 100% PUT")
-		}
 		objnameGetter = &namegetter.Random{}
 		objnameGetter.Init([]string{}, rnd)
 
@@ -338,9 +339,6 @@ func Start(version, buildtime string) (err error) {
 	}
 
 	printRunParams(runParams)
-	if runParams.dryRun { // dry-run so just print the configurations and exit
-		return nil
-	}
 
 	if runParams.cleanUp.Val {
 		if created {
@@ -431,6 +429,9 @@ func Start(version, buildtime string) (err error) {
 	}
 
 	preWriteStats(statsWriter, runParams.jsonFormat)
+	if err := statsWriter.Flush(); err != nil {
+		goto Done
+	}
 
 	// Get the workers started
 	for range runParams.numWorkers {
@@ -451,10 +452,10 @@ MainLoop:
 		// Prioritize showing stats otherwise we will dropping the stats intervals.
 		select {
 		case <-statsTicker.C:
-			accumulatedStats.aggregate(&intervalStats)
-			writeStats(statsWriter, runParams.jsonFormat, false /* final */, &intervalStats, &accumulatedStats)
-			sendStatsdStats(&intervalStats)
-			intervalStats = newStats(time.Now())
+			showIntervalStats(statsWriter)
+			if err := statsWriter.Flush(); err != nil {
+				break MainLoop
+			}
 		default:
 		}
 
@@ -473,10 +474,10 @@ MainLoop:
 				break MainLoop
 			}
 		case <-statsTicker.C:
-			accumulatedStats.aggregate(&intervalStats)
-			writeStats(statsWriter, runParams.jsonFormat, false /* final */, &intervalStats, &accumulatedStats)
-			sendStatsdStats(&intervalStats)
-			intervalStats = newStats(time.Now())
+			showIntervalStats(statsWriter)
+			if err := statsWriter.Flush(); err != nil {
+				break MainLoop
+			}
 		case sig := <-osSigChan:
 			switch sig {
 			case syscall.SIGHUP:
@@ -508,7 +509,14 @@ Done:
 	}
 
 	finalizeStats(statsWriter)
-	err = errors.Join(err, output.closeAndUpload(runParams.bp))
+	if errFlush := statsWriter.Flush(); errFlush != nil {
+		fmt.Fprintln(os.Stderr, "\nFinal statistics (failed to write statistics output):")
+		writeFinalStats(os.Stderr, runParams.jsonFormat, &accumulatedStats)
+		fmt.Fprintln(os.Stderr)
+		err = errors.Join(err, output.closeAndRetain(errFlush))
+	} else {
+		err = errors.Join(err, output.closeAndUpload(runParams.bp))
+	}
 
 	if runParams.cleanUp.Val {
 		cleanup(created)
@@ -521,6 +529,13 @@ Done:
 
 func epochLimitReached() bool {
 	return epochReadsPosted >= runParams.epochReadLimit
+}
+
+func showIntervalStats(to io.Writer) {
+	accumulatedStats.aggregate(&intervalStats)
+	writeStats(to, runParams.jsonFormat, false /* final */, &intervalStats, &accumulatedStats)
+	sendStatsdStats(&intervalStats)
+	intervalStats = newStats(time.Now())
 }
 
 func isDirectS3() bool {
@@ -605,37 +620,34 @@ func setupBucket(runParams *params, created *bool) error {
 	//
 	// ais:// or ais://@remais
 	//
-	if runParams.bck.Name == "" {
-		runParams.bck.Name = cos.CryptoRandS(8)
-		fmt.Printf("New bucket name %q\n", runParams.bck.Name)
-	}
-	exists, err := api.QueryBuckets(runParams.bp, cmn.QueryBcks(runParams.bck), apc.FltPresent)
-	if err != nil {
-		if herr := cmn.AsErrHTTP(err); herr != nil {
-			return herr
+	var exists bool
+	if runParams.bck.Name != "" {
+		_, err = api.HeadBucket(runParams.bp, runParams.bck, true /*dontAddRemote*/)
+		if err != nil && !cmn.IsErrHTTPNotFound(err) {
+			if herr := cmn.AsErrHTTP(err); herr != nil {
+				return herr
+			}
+			return fmt.Errorf("%v (bucket %s)", err, runParams.bck.String())
 		}
-		return fmt.Errorf("%v (bucket %s)", err, runParams.bck.String())
+		exists = err == nil
 	}
+	if !exists && runParams.putPct < 100 {
+		return errors.New("new bucket, expecting 100% PUT")
+	}
+	*created = !exists
+	if runParams.dryRun {
+		return nil
+	}
+
 	if !exists {
+		if runParams.bck.Name == "" {
+			runParams.bck.Name = cos.CryptoRandS(8)
+		}
 		if err := api.CreateBucket(runParams.bp, runParams.bck, nil); err != nil {
-			// e.g. sequence:
-			// - attach remais
-			// - ais create ais://@remais/BUCKET
-			// - api.QueryBuckets(apc.FltPresent) won't see it in the local BMD
-			// - api.CreateBucket will fail then with:
-			if runParams.bck.IsRemoteAIS() {
-				herr := cmn.AsErrHTTP(err)
-				if herr != nil && herr.TypeCode == "ErrBucketAlreadyExists" {
-					err = nil
-				}
-			}
-			if err != nil {
-				return fmt.Errorf("failed to create %s: %v", runParams.bck.String(), err)
-			}
-		} else {
-			*created = true
+			return fmt.Errorf("failed to create %s: %v", runParams.bck.String(), err)
 		}
 	}
+
 	if runParams.bPropsStr == "" {
 		return nil
 	}
@@ -850,16 +862,13 @@ func objNamesFromObj(p *params) ([]string, error) {
 
 func newNameGetter(names []string) (ng namegetter.Basic, isPermBased bool) {
 	var (
-		readOnly  = runParams.putPct == 0
-		epoching  = runParams.numEpochs > 0
+		addsNames = runParams.putPct > 0 // new PUTs add names at runtime ('-pctupdate' only overwrites existing ones)
 		threshold = runParams.permShuffleMax
 		n         = len(names)
 	)
 	switch {
-	case !readOnly && !epoching:
+	case addsNames:
 		ng = &namegetter.Random{}
-	case !readOnly && epoching:
-		ng = &namegetter.RandomUnique{}
 	case n > int(threshold) && n > namegetter.AffineMinN:
 		// O(1) memory, strict per-epoch
 		ng = &namegetter.PermAffinePrime{}

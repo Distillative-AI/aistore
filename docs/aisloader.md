@@ -408,7 +408,7 @@ $ aisloader -config=get.yaml -list-out=ais://lists/run-1.txt
 
 * The destination bucket must already exist. An existing list is overwritten with a warning. Writing to the benchmark bucket, or an empty listing, also prints a warning.
 * With `-arch.list`, each file inside an archive is a separate entry (the archive name and the file's path, separated by a NUL byte), and archives themselves are not listed. The first GET of any file in an archive that is not yet in the cluster brings in the whole archive, so turn `-arch.list` off for cold-GET benchmarks.
-* `-list-out` is CLI-only and cannot be combined with `-filelist`, `-filelist-obj`, `-getloaderid`, or `-s3endpoint`.
+* `-list-out` is CLI-only and cannot be combined with `-dry-run`, `-filelist`, `-filelist-obj`, `-getloaderid`, or `-s3endpoint`.
 
 ### Splitting reads across loaders
 
@@ -709,11 +709,11 @@ The `--epochs N` flag enables full-dataset read passes in read-only workloads (`
 
 | Workload | Dataset Size | Selected Algorithm |
 |---|---:|---|
-| Mixed read/write or non-epoched workloads | any | Random / RandomUnique |
-| Read-only | <= `100k` objects (default) | PermShuffle |
-| Read-only | >  `100k` objects (--/--) | PermAffinePrime |
+| `-pctput > 0` | any | Random |
+| `-pctput=0` | <= `100k` objects (default) | PermShuffle |
+| `-pctput=0` | > `100k` objects (default) | PermAffinePrime |
 
-> Command-line override to set the size threshold (instead of default `100k`): `--perm-shuffle-max` flag.
+> Use `--perm-shuffle-max` to adjust the threshold for `PermShuffle`. However, datasets with 10 or fewer names always use `PermShuffle` when `-pctput=0`.
 
 ## Examples
 
@@ -907,7 +907,8 @@ $ aisloader -bucket=ais://images -pctput=0 -duration=10s -cleanup=false -json -s
 * The two options can be combined, saving identical statistics to both destinations.
 * `-stats-output-obj` cannot be combined with `-s3endpoint`.
 * `-cleanup=true` is rejected when the destination is the benchmark bucket.
-* Without `-stats-output`, object uploads use a temporary file while statistics also print to standard output. If closing the file or uploading it fails, aisloader keeps it and reports its path.
+* Without `-stats-output`, object uploads use a temporary file while statistics also print to standard output. If writing, closing, or uploading the file fails, aisloader keeps it and reports its path along with the errors.
+* If writing statistics fails, aisloader stops the run, exits with an error, and prints the final totals to standard error.
 
 ### StatsD
 
