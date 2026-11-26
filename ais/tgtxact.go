@@ -173,9 +173,8 @@ func (t *target) httpxput(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		err := cos.Ternary(msg.Name == cmn.ErrXactICNotifAbort.Error(), cmn.ErrXactICNotifAbort, cmn.ErrXactUserAbort)
 		flt := xreg.Flt{ID: xargs.ID, Kind: xargs.Kind, Bck: bck}
-		xreg.DoAbort(&flt, err)
+		xreg.DoAbort(&flt, cmn.ErrXactUserAbort)
 	default:
 		t.writeErrAct(w, r, msg.Action)
 	}
@@ -396,13 +395,13 @@ func (t *target) continueTCO(w http.ResponseWriter, r *http.Request) {
 	xtco.ContMsg(&tcomsg)
 }
 
-// client: target running the same xaction ID
-// TODO: transition transport.OpcDone to this out-of-band path
+// client: target running the same xaction ID or primary
+// TODO: move archive transport.OpcDone here
 func (t *target) xactCtrl(w http.ResponseWriter, r *http.Request, kind, xid, wid, opcode string) {
 	xctn, err := xreg.GetXact(xid)
 	if err != nil || xctn == nil {
 		xname := xact.Cname(kind, xid)
-		t.writeErr(w, r, cos.NewErrNotFound(t, xname), http.StatusNotFound)
+		t.writeErr(w, r, cos.NewErrNotFound(t, xname), http.StatusNotFound, Silent)
 		return
 	}
 
@@ -417,21 +416,24 @@ func (t *target) xactCtrl(w http.ResponseWriter, r *http.Request, kind, xid, wid
 		return
 	}
 	sid := r.Header.Get(apc.HdrSenderID)
-	switch {
-	case opcode == xact.OpcodeStatus: // all kinds (x-moss included)
+
+	// status and abort are generic; other opcodes are kind-specific
+
+	switch opcode {
+	case xact.OpcodeStatus: // all kinds (x-moss included)
 		w.Header().Set(cos.HdrContentType, cos.ContentBinary)
-		if _, err := w.Write(xctn.RunState().Bytes()); err != nil {
+		if _, err := w.Write(xact.StatusReply(xctn)); err != nil {
 			nlog.Warningln(t.String(), xctn.Name(), opcode, err)
 		}
 		return
-	case kind == apc.ActGetBatch:
-		xmoss, ok := xctn.(*xs.XactMoss)
-		debug.Assert(ok)
-		err = xmoss.RecvCtrl(wid, sid, opcode, body)
-	case opcode == xact.OpcodeAbortXact:
-		xact.RecvAbortXact(xctn, sid, string(body))
-	default:
-		err = fmt.Errorf("%s: unsupported T2T control [%q, %q]", xctn.Name(), wid, opcode)
+	case xact.OpcodeAbortXact: // all kinds
+		xact.RecvAbortXact(xctn, string(body))
+	default: // kind-specific
+		if p, ok := xctn.(xact.Peer); ok {
+			err = p.RecvCtrl(wid, sid, opcode, body)
+		} else {
+			err = fmt.Errorf("%s: unsupported T2T control [%q, %q]", xctn.Name(), wid, opcode)
+		}
 	}
 	if err != nil {
 		t.writeErr(w, r, err)
