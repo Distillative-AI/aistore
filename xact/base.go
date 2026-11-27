@@ -28,6 +28,7 @@ import (
 // - IsRunning: accepting work
 // - IsDone:    not accepting work (stopping OR finished)
 // - EndTime:   non-zero iff fully finished
+// - see "Finishing and aborting" in README.md in this package
 const finishSentinel = uint64(1)
 
 type (
@@ -146,6 +147,7 @@ func (*Base) FromTo() (*meta.Bck, *meta.Bck) { return nil, nil }
 
 //
 // aborting
+// - outside callers vs owner path: see "Ownership" in README.md in this package
 //
 
 func (xctn *Base) ChanAbort() <-chan error { return xctn.abort.ch }
@@ -186,7 +188,25 @@ func (xctn *Base) AbortedAfter(d time.Duration) (err error) {
 }
 
 func (xctn *Base) Abort(err error) bool {
-	if xctn.IsDone() || !xctn.abort.done.CAS(false, true) {
+	if xctn.IsDone() {
+		return false
+	}
+	return xctn._abort(err)
+}
+
+// record abort on behalf of the path responsible for calling Finish
+// - includes helpers joined by that path; does not perform teardown
+// - accepted while running or stopping, rejected once finishing
+// - outside callers must use Abort
+func (xctn *Base) AbortByOwner(err error) bool {
+	if end := xctn.eutime.Load(); end != 0 && end != cos.MSB64 {
+		return false
+	}
+	return xctn._abort(err)
+}
+
+func (xctn *Base) _abort(err error) bool {
+	if !xctn.abort.done.CAS(false, true) {
 		return false
 	}
 	xctn.SetStopping()
